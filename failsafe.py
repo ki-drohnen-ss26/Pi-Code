@@ -5,7 +5,7 @@ Safety monitor. Deliberately separates the safety logic from the mission logic.
 On a problem the monitor returns a reason string; the state machine then decides
 to switch to ABORT/RTL.
 
-Note: this is YOUR own abort logic on the companion side. It is independent of
+Note: this is it's own abort logic on the companion side. It is independent of
 ArduPilot's internal failsafes (BATT_LOW_VOLT, FS_*). Both can - and should -
 coexist.
 """

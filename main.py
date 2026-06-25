@@ -22,7 +22,8 @@ from mission import DeliveryMission
 
 def main() -> None:
     # --- choose configuration ---
-    config = Config.sitl(port=14551)      # NOTE: Since QGroundControl takes 14550, we need to add 14551 at runtime
+    # config = Config.sitl(port=14551)    # NOTE: Since QGroundControl takes 14550, we need to add 14551 at runtime
+    config = Config.sitl()                # NOTE: This binds to 14550, therefore QGroundControl cant be used
     # config = Config.pi_serial()         # real Pi on the flight controller (UART)
 
     # --- open the connection ---

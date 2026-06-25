@@ -1,9 +1,9 @@
-# Delivery Drone – Companion Code
+# Delivery Drone – Pi-Code
 
-Control code for the automated delivery of objects with an FPV drone. It runs in
-testing against **SITL** (simulated flight controller) and later, unchanged, on
-the **Raspberry Pi** connected to the real flight controller. The only difference
-is the `connection_string` in `config.py`.
+Companion-computer control code for the automated delivery of objects with an FPV
+drone. It runs in testing against **SITL** (simulated flight controller) and
+later, unchanged, on the **Raspberry Pi** connected to the real flight controller.
+The only difference is the `connection_string` in `config.py`.
 
 ## Project structure
 
@@ -16,57 +16,48 @@ is the `connection_string` in `config.py`.
 | `mission.py`   | State machine IDLE→TAKEOFF→ENROUTE→OVER_TARGET→DROP→RTL      |
 | `main.py`      | Entry point, wires everything together                      |
 
-## Installation
+## Prerequisites
 
-```bash
-conda activate ardupilot
-pip install pymavlink
-```
+1. **A working SITL simulation.** Setting it up is documented in the **ProjectDocs**
+   repo under `docs/software/SetupSimulation.md`
+   ([link](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/software/SetupSimulation.md)).
+   That guide is written for Windows/WSL; on macOS or Linux you can run SITL
+   natively and skip the WSL section – the `sim_vehicle.py` commands are the same.
+2. **Python with pymavlink.** The project uses a conda env named `ardupilot`, but
+   any environment works:
+   ```bash
+   pip install pymavlink
+   ```
 
 ## Workflow: testing against SITL
 
-You need **two terminals**, both with the conda environment activated. Gazebo is
-not required for any of these steps – SITL alone covers the entire logic.
+You need **two terminals**, both with your Python environment activated. Gazebo is
+not required – SITL alone covers the entire logic.
 
 ### 1. Start SITL (Terminal 1)
 
-```bash
-conda activate ardupilot
-cd "Studium/Drohnen-mit-KI/Simulation/ardupilot"
-Tools/autotest/sim_vehicle.py -v ArduCopter --console
-```
+Start SITL as described in `SetupSimulation.md`, for example:
 
-The first start compiles the SITL binary (takes a few minutes). `--map` is
-deliberately omitted – the MAVProxy map module is not installed under macOS and
-would only throw an error. We use QGroundControl for the map instead (see below).
+```bash
+sim_vehicle.py -v ArduCopter --console
+```
 
 Wait until the console shows something like "EKF3 IMU0 is using GPS" / "Ready to
 Fly". Only then are the pre-arm checks (GPS/EKF position) satisfied.
 
-### 2. Add a second output port (Terminal 1, MAVProxy console)
+> **macOS tip:** if `--map` throws `No module named 'map'`, the MAVProxy map
+> module isn't installed. Just leave `--map` off and use a ground station for the
+> map (see "Live map" below).
 
-`sim_vehicle.py` outputs MAVLink only on **14550** by default. So that
-QGroundControl (14550) and our script (14551) can run at the same time, add a
-second port at the `STABILIZE>` prompt:
-
-```
-output add 127.0.0.1:14551
-```
-
-### 3. Open QGroundControl
-
-QGC connects automatically on port 14550 to the running SITL and shows the map,
-artificial horizon and status messages.
-
-### 4. Start the script (Terminal 2)
+### 2. Run the Pi-Code (Terminal 2)
 
 ```bash
-conda activate ardupilot
-cd <path>/delivery_drone
+cd Pi-Code
 python main.py
 ```
 
-`main.py` is configured for port 14551 (`Config.sitl(port=14551)`).
+By default `main.py` connects on port 14550 (`Config.sitl()`), which is the port
+`sim_vehicle.py` outputs to.
 
 ### Expected output
 
@@ -83,7 +74,23 @@ python main.py
 [RTL] Landed and disarmed
 ```
 
-In QGC you see the drone take off, fly to the target and return, all live.
+## Live map with a ground station (optional)
+
+To watch the drone on a map, use a ground station (QGroundControl or Mission
+Planner). It connects automatically on port 14550 – the same port the script uses
+by default. To run both at once, give the script its own port:
+
+1. In the MAVProxy console (Terminal 1, `STABILIZE>` prompt), add a second output:
+   ```
+   output add 127.0.0.1:14551
+   ```
+2. Point the script at it – in `main.py`:
+   ```python
+   config = Config.sitl(port=14551)
+   ```
+
+Now the ground station (14550) shows the live map while the script (14551) flies
+the mission.
 
 ## Just checking the link
 
@@ -117,7 +124,7 @@ connects to.
 flight controller's TELEM port – TX↔RX crossed, common ground (GND).
 Alternatively a USB-UART adapter to the FC.
 
-**On the flight controller** (once, e.g. via QGroundControl):
+**On the flight controller** (once, e.g. via a ground station):
 - `SERIALx_PROTOCOL = 2` (MAVLink2) for the port the Pi is on
 - `SERIALx_BAUD` matching the Pi side (e.g. 921 = 921600)
 
