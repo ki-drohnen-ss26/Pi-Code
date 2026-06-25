@@ -143,8 +143,9 @@ config = Config.pi_serial("/dev/serial0", baud=921600)
 - **Indoors without GPS:** `goto()` uses global coordinates and needs GPS.
   Indoors the MTF-01P provides the position via optical flow + LiDAR. Then you
   fly via `SET_POSITION_TARGET_LOCAL_NED` in the local NED frame instead of
-  lat/lon, and `wait_ready_to_arm()` checks EKF readiness instead of the GPS fix.
-  This is the later adaptation tied to Task 4.
+  lat/lon, and `wait_ready_to_arm()` waits for the relative EKF position flag
+  (`EKF_POS_HORIZ_REL`, from optical flow) instead of the absolute one
+  (`EKF_POS_HORIZ_ABS`, from GPS). This is the later adaptation tied to Task 4.
 - **Data rates:** over the serial link telemetry streams are often slower;
   `request_data_streams()` therefore sets a fixed rate.
 

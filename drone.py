@@ -186,25 +186,28 @@ class Drone:
 
     def wait_ready_to_arm(self, timeout: float = 60.0) -> bool:
         """
-        Wait for a valid position estimate (GPS 3D fix) BEFORE arming.
-        Prevents the pre-arm error 'need position estimate' that occurs e.g. with
-        an active geofence while the EKF position is not yet available.
+        Wait until the EKF has a valid absolute horizontal position estimate BEFORE
+        arming. A GPS fix alone is NOT enough - the EKF needs a few more seconds to
+        converge, and arming earlier is rejected with 'Need position estimate'
+        (made worse by an active geofence). We therefore wait for the
+        EKF_POS_HORIZ_ABS flag in EKF_STATUS_REPORT, which is exactly what the
+        autopilot means by 'position estimate'.
+
+        Indoors without GPS the relevant flag is EKF_POS_HORIZ_REL instead (the
+        position then comes from optical flow); swap 0x10 for 0x08 there.
         """
-        print("[PREARM] Waiting for position estimate (GPS fix) ...")
+        EKF_POS_HORIZ_ABS = 0x10  # bit 4 of EKF_STATUS_FLAGS = absolute horizontal position
+        print("[PREARM] Waiting for EKF position estimate ...")
         deadline = time.time() + timeout
         while time.time() < deadline:
-            msg = self.master.recv_match(type="GPS_RAW_INT", blocking=True, timeout=1.0)
-            if msg and msg.fix_type >= 3:
-                print(
-                    f"[PREARM] Position ready (fix_type={msg.fix_type}, "
-                    f"sats={msg.satellites_visible})"
-                )
-                time.sleep(2.0)  # brief settle so the EKF position locks in
+            msg = self.master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1.0)
+            if msg and (msg.flags & EKF_POS_HORIZ_ABS):
+                print("[PREARM] EKF position estimate ready")
                 return True
-        print("[PREARM] Timeout: no position estimate")
+        print("[PREARM] Timeout: no EKF position estimate")
         return False
 
-    def arm(self, timeout: float = 10.0, attempts: int = 3) -> bool:
+    def arm(self, timeout: float = 10.0, attempts: int = 5) -> bool:
         """
         Arm the motors. On real hardware, pre-arm checks (GPS, EKF, compass) can
         delay arming - hence several attempts with a pause, instead of giving up
