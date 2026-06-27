@@ -14,6 +14,7 @@ Important: this class does NOT know whether SITL or a real flight controller is
 on the other end. That is by design.
 """
 
+import logging
 import math
 import time
 from typing import Optional
@@ -21,6 +22,8 @@ from typing import Optional
 from pymavlink import mavutil
 
 from config import Config
+
+log = logging.getLogger(__name__)
 
 
 class Drone:
@@ -33,7 +36,7 @@ class Drone:
     # ==================================================================
     def connect(self) -> None:
         """Open the MAVLink connection and wait for the first heartbeat."""
-        print(f"[CONNECT] Connecting to {self.config.connection_string} ...")
+        log.info(f"[CONNECT] Connecting to {self.config.connection_string} ...")
         self.master = mavutil.mavlink_connection(
             self.config.connection_string,
             baud=self.config.baud,
@@ -45,7 +48,7 @@ class Drone:
     def wait_heartbeat(self) -> None:
         """Block until a HEARTBEAT is received. Proves the link is up."""
         self.master.wait_heartbeat()
-        print(
+        log.info(
             f"[HEARTBEAT] Connected to system {self.master.target_system}, "
             f"component {self.master.target_component}"
         )
@@ -107,7 +110,7 @@ class Drone:
         while time.time() < deadline:
             msg = self.master.recv_match(type="PARAM_VALUE", blocking=True, timeout=timeout)
             if msg and msg.param_id == name:
-                print(f"[PARAM] {name} = {msg.param_value}")
+                log.info(f"[PARAM] {name} = {msg.param_value}")
                 return msg.param_value
         raise TimeoutError(f"No confirmation for parameter {name}")
 
@@ -157,7 +160,7 @@ class Drone:
             mode = self.get_mode()
             armed = "ARMED" if self.is_armed() else "DISARMED"
             if pos and batt:
-                print(
+                log.info(
                     f"[TELE] {mode:<8} {armed:<8} "
                     f"alt={pos['rel_alt']:5.1f}m  "
                     f"lat={pos['lat']:.6f} lon={pos['lon']:.6f}  "
@@ -179,9 +182,9 @@ class Drone:
         while time.time() < deadline:
             msg = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=timeout)
             if msg and self.master.flightmode == mode_name:
-                print(f"[MODE] Mode is now {mode_name}")
+                log.info(f"[MODE] Mode is now {mode_name}")
                 return True
-        print(f"[MODE] WARNING: mode {mode_name} not confirmed")
+        log.warning(f"[MODE] mode {mode_name} not confirmed")
         return False
 
     def wait_ready_to_arm(self, timeout: float = 60.0) -> bool:
@@ -197,14 +200,14 @@ class Drone:
         position then comes from optical flow); swap 0x10 for 0x08 there.
         """
         EKF_POS_HORIZ_ABS = 0x10  # bit 4 of EKF_STATUS_FLAGS = absolute horizontal position
-        print("[PREARM] Waiting for EKF position estimate ...")
+        log.info("[PREARM] Waiting for EKF position estimate ...")
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1.0)
             if msg and (msg.flags & EKF_POS_HORIZ_ABS):
-                print("[PREARM] EKF position estimate ready")
+                log.info("[PREARM] EKF position estimate ready")
                 return True
-        print("[PREARM] Timeout: no EKF position estimate")
+        log.warning("[PREARM] Timeout: no EKF position estimate")
         return False
 
     def arm(self, timeout: float = 10.0, attempts: int = 5) -> bool:
@@ -222,18 +225,18 @@ class Drone:
                 while time.time() < deadline:
                     self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=timeout)
                     if self.is_armed():
-                        print("[ARM] Motors are armed")
+                        log.info("[ARM] Motors are armed")
                         return True
             else:
-                print(f"[ARM] Attempt {attempt}/{attempts} rejected (result={result}); waiting ...")
+                log.warning(f"[ARM] Attempt {attempt}/{attempts} rejected (result={result}); waiting ...")
                 time.sleep(2.0)
-        print("[ARM] Arming failed (pre-arm check?)")
+        log.warning("[ARM] Arming failed (pre-arm check?)")
         return False
 
     def disarm(self) -> None:
         """Disarm the motors."""
         self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0)
-        print("[ARM] Disarm sent")
+        log.info("[ARM] Disarm sent")
 
     def takeoff(self, altitude: float, timeout: float = 30.0) -> bool:
         """
@@ -241,15 +244,15 @@ class Drone:
         Requires GUIDED + armed. Waits until ~95 % of the altitude is reached.
         """
         self._command_long(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, altitude)
-        print(f"[TAKEOFF] Climbing to {altitude} m ...")
+        log.info(f"[TAKEOFF] Climbing to {altitude} m ...")
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             pos = self.get_position()
             if pos and pos["rel_alt"] >= altitude * 0.95:
-                print(f"[TAKEOFF] Altitude reached ({pos['rel_alt']:.1f} m)")
+                log.info(f"[TAKEOFF] Altitude reached ({pos['rel_alt']:.1f} m)")
                 return True
-        print("[TAKEOFF] Timeout while climbing")
+        log.warning("[TAKEOFF] Timeout while climbing")
         return False
 
     def goto(self, lat: float, lon: float, alt: float) -> None:
@@ -275,7 +278,7 @@ class Drone:
             0, 0, 0,   # afx, afy, afz
             0, 0,      # yaw, yaw_rate
         )
-        print(f"[GOTO] Target set: lat={lat:.6f} lon={lon:.6f} alt={alt} m")
+        log.info(f"[GOTO] Target set: lat={lat:.6f} lon={lon:.6f} alt={alt} m")
 
     def wait_arrival(self, lat: float, lon: float, radius_m: float, timeout: float = 60.0) -> bool:
         """Wait until the drone is within 'radius_m' of the target."""
@@ -285,9 +288,9 @@ class Drone:
             if pos:
                 dist = self._haversine(pos["lat"], pos["lon"], lat, lon)
                 if dist <= radius_m:
-                    print(f"[GOTO] Target reached (distance {dist:.1f} m)")
+                    log.info(f"[GOTO] Target reached (distance {dist:.1f} m)")
                     return True
-        print("[GOTO] Timeout before arrival")
+        log.warning("[GOTO] Timeout before arrival")
         return False
 
     def land(self) -> None:
@@ -295,6 +298,21 @@ class Drone:
 
     def return_to_launch(self) -> None:
         self.set_mode("RTL")
+
+    def wait_disarmed(self, timeout: float = 60.0) -> bool:
+        """
+        Block until the motors report disarmed, pumping HEARTBEATs so the armed
+        state stays current. Returns True if disarmed within 'timeout', else
+        False (the caller then forces a disarm). Kept on Drone - rather than
+        reading master directly in the mission - so the mission logic can be
+        tested against a fake drone without a real MAVLink link.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=2.0)
+            if not self.is_armed():
+                return True
+        return False
 
     @staticmethod
     def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -324,7 +342,7 @@ class Drone:
             self.config.drop_servo,
             self.config.drop_pwm,
         )
-        print(f"[DROP] Servo {self.config.drop_servo} -> {self.config.drop_pwm} PWM")
+        log.info(f"[DROP] Servo {self.config.drop_servo} -> {self.config.drop_pwm} PWM")
 
     def reset_servo(self) -> None:
         """Return the servo to its neutral position (hatch closed)."""
@@ -349,5 +367,5 @@ class Drone:
                 latest = getattr(msg, f"servo{self.config.drop_servo}_raw", None)
                 if expected is not None and latest is not None and abs(latest - expected) <= 50:
                     break
-        print(f"[DROP] Read-back servo value: {latest} PWM")
+        log.info(f"[DROP] Read-back servo value: {latest} PWM")
         return latest

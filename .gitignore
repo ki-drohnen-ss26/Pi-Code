@@ -10,6 +10,7 @@ build/
 dist/
 .installed.cfg
 *.egg
+.pytest_cache
 
 # Virtual environments (the conda env "ardupilot" lives outside the repo anyway)
 .venv/

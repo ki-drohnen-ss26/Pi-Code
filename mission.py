@@ -12,6 +12,7 @@ checked before every step - if it fires, the machine jumps to ABORT (and from
 there in a controlled way to RTL/DONE).
 """
 
+import logging
 import time
 from enum import Enum, auto
 
@@ -19,6 +20,8 @@ from camera import Camera
 from config import Config
 from drone import Drone
 from failsafe import FailsafeMonitor
+
+log = logging.getLogger(__name__)
 
 
 class State(Enum):
@@ -45,7 +48,7 @@ class DeliveryMission:
     # Main loop
     # ------------------------------------------------------------------
     def run(self) -> None:
-        print("\n=== MISSION START ===")
+        log.info("\n=== MISSION START ===")
         dispatch = {
             State.IDLE: self._idle,
             State.TAKEOFF: self._takeoff,
@@ -62,14 +65,14 @@ class DeliveryMission:
                 reason = self.failsafe.check()
                 if reason:
                     self.abort_reason = reason
-                    print(f"\n[FAILSAFE] ABORT due to: {reason}")
+                    log.info(f"\n[FAILSAFE] ABORT due to: {reason}")
                     self.state = State.ABORT
                     continue
 
-            print(f"\n--- State: {self.state.name} ---")
+            log.info(f"\n--- State: {self.state.name} ---")
             self.state = dispatch[self.state]()
 
-        print("\n=== MISSION END ===")
+        log.info("\n=== MISSION END ===")
 
     # ------------------------------------------------------------------
     # States (each returns the next state)
@@ -122,21 +125,21 @@ class DeliveryMission:
         while time.time() < deadline:
             offset = self.camera.get_target_offset()
             if not offset["detected"]:
-                print("[CAM] No target detected, waiting ...")
+                log.info("[CAM] No target detected, waiting ...")
                 time.sleep(0.5)
                 continue
 
             if abs(offset["dx"]) <= tol and abs(offset["dy"]) <= tol:
-                print(f"[CAM] Centred (dx={offset['dx']}, dy={offset['dy']})")
+                log.info(f"[CAM] Centred (dx={offset['dx']}, dy={offset['dy']})")
                 return State.DROP
 
             # --- placeholder for the real correction ---
             # Here one would nudge the drone based on dx/dy, e.g. via
             # SET_POSITION_TARGET_LOCAL_NED in the body frame. Never hit with mock.
-            print(f"[CAM] Correcting position (dx={offset['dx']}, dy={offset['dy']})")
+            log.info(f"[CAM] Correcting position (dx={offset['dx']}, dy={offset['dy']})")
             time.sleep(0.5)
 
-        print("[CAM] Timeout during target alignment")
+        log.warning("[CAM] Timeout during target alignment")
         return State.ABORT
 
     def _drop(self) -> State:
@@ -145,9 +148,9 @@ class DeliveryMission:
         time.sleep(0.5)  # brief wait so the new value reaches the telemetry
         value = self.drone.read_servo(expected=self.config.drop_pwm)
         if value is not None and abs(value - self.config.drop_pwm) <= 50:
-            print("[DROP] Release confirmed")
+            log.info("[DROP] Release confirmed")
         else:
-            print("[DROP] WARNING: servo value not as expected")
+            log.warning("[DROP] servo value not as expected")
         time.sleep(1.0)
         self.drone.reset_servo()
         self.failsafe.start_phase("RTL")
@@ -156,18 +159,15 @@ class DeliveryMission:
     def _rtl(self) -> State:
         """Return to launch. Waits until the drone has landed and disarmed."""
         self.drone.return_to_launch()
-        deadline = time.time() + self.config.phase_timeout_s
-        while time.time() < deadline:
-            self.drone.master.recv_match(type="HEARTBEAT", blocking=True, timeout=2.0)
-            if not self.drone.is_armed():
-                print("[RTL] Landed and disarmed")
-                return State.DONE
-        print("[RTL] Timeout - forcing disarm")
-        self.drone.disarm()
+        if self.drone.wait_disarmed(self.config.phase_timeout_s):
+            log.info("[RTL] Landed and disarmed")
+        else:
+            log.warning("[RTL] Timeout - forcing disarm")
+            self.drone.disarm()
         return State.DONE
 
     def _abort(self) -> State:
         """Controlled abort: return to launch (RTL)."""
-        print(f"[ABORT] Reason: {self.abort_reason} -> RTL")
+        log.info(f"[ABORT] Reason: {self.abort_reason} -> RTL")
         self.failsafe.start_phase("RTL")
         return State.RTL

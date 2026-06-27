@@ -7,14 +7,22 @@ The only difference is the `connection_string` in `config.py`.
 
 ## Project structure
 
-| File           | Task                                                        |
-|----------------|-------------------------------------------------------------|
-| `config.py`    | Connection + all parameters (SITL vs. Pi in one place)      |
-| `drone.py`     | Heartbeat, telemetry, basic commands, payload release       |
-| `camera.py`    | Camera interface as a mock (`get_target_offset()`)          |
-| `failsafe.py`  | Battery threshold, phase timeout, geofence                  |
-| `mission.py`   | State machine IDLE→TAKEOFF→ENROUTE→OVER_TARGET→DROP→RTL      |
-| `main.py`      | Entry point, wires everything together                      |
+| File             | Task                                                        |
+|------------------|-------------------------------------------------------------|
+| `config.py`      | Connection + all parameters (SITL vs. Pi in one place)      |
+| `drone.py`       | Heartbeat, telemetry, basic commands, payload release       |
+| `camera.py`      | Camera interface as a mock (`get_target_offset()`)          |
+| `failsafe.py`    | Battery threshold, phase timeout, geofence                  |
+| `mission.py`     | State machine IDLE→TAKEOFF→ENROUTE→OVER_TARGET→DROP→RTL      |
+| `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
+| `main.py`        | Entry point, wires everything together                      |
+| `tests/`         | `pytest` unit tests for the mission logic (no SITL needed)  |
+| `requirements.txt` | Pinned dependencies (pymavlink, pytest)                   |
+| `ROADMAP.md`     | Phased development plan toward the real Pi + flight tests   |
+
+> The indoor target is found by search (the pad position is not known in advance), so
+> the state machine will grow `SEARCH` and `APPROACH` stages in Phase 2 — see
+> `ROADMAP.md`. The `Camera` interface already supports this (`detected`/`dx`/`dy`).
 
 ## Prerequisites
 
@@ -23,11 +31,31 @@ The only difference is the `connection_string` in `config.py`.
    ([link](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/software/SetupSimulation.md)).
    That guide is written for Windows/WSL; on macOS or Linux you can run SITL
    natively and skip the WSL section – the `sim_vehicle.py` commands are the same.
-2. **Python with pymavlink.** The project uses a conda env named `ardupilot`, but
-   any environment works:
+2. **Python with pymavlink.** Pi-Code has its own lightweight environment, separate
+   from the heavier `ardupilot` (SITL) env. It mirrors the real Pi runtime — the Pi
+   later uses the same `requirements.txt` with plain `pip` (no conda):
    ```bash
-   pip install pymavlink
+   conda create -n ki_drohnen_pi python=3.11 -y
+   conda activate ki_drohnen_pi
+   pip install -r requirements.txt
    ```
+   Any environment with `pymavlink` works, but keeping Pi-Code's deps minimal and
+   explicit is the point. Run SITL from the `ardupilot` env (Terminal 1) and the
+   Pi-Code from `ki_drohnen_pi` (Terminal 2) — they are separate processes.
+
+## Running the unit tests (no SITL, no hardware)
+
+The mission logic is covered by `pytest` tests that run in well under a second using a
+`FakeDrone` stand-in — no SITL and no flight controller required. Run them from this
+folder:
+
+```bash
+pip install -r requirements.txt   # once
+pytest
+```
+
+They drive the full state machine through the happy path and through failsafe/arming
+aborts, so they catch regressions before any simulator or hardware is involved.
 
 ## Workflow: testing against SITL
 

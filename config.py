@@ -58,6 +58,11 @@ class Config:
     geofence_enable: bool = True        # set FENCE_ENABLE?
 
     # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
+    log_dir: str = "logs"          # directory for timestamped mission log files
+
+    # ------------------------------------------------------------------
     # Convenience constructors
     # ------------------------------------------------------------------
     @classmethod

@@ -10,11 +10,14 @@ ArduPilot's internal failsafes (BATT_LOW_VOLT, FS_*). Both can - and should -
 coexist.
 """
 
+import logging
 import time
 from typing import Optional
 
 from config import Config
 from drone import Drone
+
+log = logging.getLogger(__name__)
 
 
 class FailsafeMonitor:
@@ -30,7 +33,7 @@ class FailsafeMonitor:
     def setup_geofence(self) -> None:
         if self.config.geofence_enable:
             self.drone.set_param("FENCE_ENABLE", 1)
-            print("[FAILSAFE] Geofence enabled (FENCE_ENABLE=1)")
+            log.info("[FAILSAFE] Geofence enabled (FENCE_ENABLE=1)")
 
     # ------------------------------------------------------------------
     # Phase timeout
