@@ -19,13 +19,13 @@ The only difference is the `connection_string` in `config.py`.
 | `tests/`         | `pytest` unit tests for the mission logic (no SITL needed)  |
 | `params/`        | FC parameter baseline (capture/restore) — see `params/README.md` |
 | `requirements.txt` | Pinned dependencies (pymavlink, pytest)                   |
-| `ARCHITECTURE.md`| Components, relationships & mission flow (Mermaid diagrams) |
-| `SIM_TO_REAL.md` | Concrete SITL→hardware transition guide + safety checklist |
-| `ROADMAP.md`     | Phased development plan toward the real Pi + flight tests   |
+| `docs/ARCHITECTURE.md` | Components, relationships & mission flow (Mermaid diagrams) |
+| `docs/SIM_TO_REAL.md`  | Concrete SITL→hardware transition guide + safety checklist |
+| `docs/ROADMAP.md`      | Phased development plan toward the real Pi + flight tests   |
 
 > The indoor target is found by search (the pad position is not known in advance), so
 > the state machine will grow `SEARCH` and `APPROACH` stages in Phase 2 — see
-> `ROADMAP.md`. The `Camera` interface already supports this (`detected`/`dx`/`dy`).
+> `docs/ROADMAP.md`. The `Camera` interface already supports this (`detected`/`dx`/`dy`).
 
 ## Prerequisites
 
@@ -156,5 +156,5 @@ config = Config.pi_serial("/dev/serial0", baud=921600)
 
 The full transition — wiring, FC params, EKF/pre-arm differences, **camera axis
 mapping**, drop-servo calibration, link-loss / `FS_GCS`, and the safety checklist — is
-documented in **[SIM_TO_REAL.md](SIM_TO_REAL.md)**. For how the components fit together
-and the mission flow (with diagrams), see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+documented in **[docs/SIM_TO_REAL.md](docs/SIM_TO_REAL.md)**. For how the components fit
+together and the mission flow (with diagrams), see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.

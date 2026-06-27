@@ -91,7 +91,7 @@ Over a serial link telemetry is slower than SITL's local UDP;
 
 ## 7. Sensors (Phase 4)
 MTF-01P configured via the CP2102 USB-UART adapter; FC params for the rangefinder +
-optical-flow serial protocol. See `params/README.md` and the project sensor docs.
+optical-flow serial protocol. See `../params/README.md` and the project sensor docs.
 
 ## Safety checklist (real hardware)
 - [ ] First flights **without propellers**.
@@ -99,6 +99,6 @@ optical-flow serial protocol. See `params/README.md` and the project sensor docs
       failsafe does **not** replace it.
 - [ ] ArduPilot's own failsafes set: `BATT_LOW_VOLT`, `BATT_FS_LOW_ACT`,
       `FS_GCS_ENABLE`, radio failsafe.
-- [ ] Baseline params loaded (`params/default.parm`) and known-good.
+- [ ] Baseline params loaded (`../params/default.parm`) and known-good.
 - [ ] Camera **axis mapping** verified on the real camera (§3).
 - [ ] Drop servo PWM verified on the bench (§4).
