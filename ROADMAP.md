@@ -39,7 +39,7 @@ is the real target.
 
 ## Phases
 
-### Phase 0 — Foundation & hygiene *(Mac, now)*
+### Phase 0 — Foundation & hygiene
 **Goal:** make the codebase safe to refactor and self-documenting before we add complexity.
 - Remove `__pycache__/` from version control; add a `requirements.txt` for `Pi-Code`
   with a pinned `pymavlink` version.
