@@ -280,6 +280,39 @@ class Drone:
         )
         log.info(f"[GOTO] Target set: lat={lat:.6f} lon={lon:.6f} alt={alt} m")
 
+    def move_body_offset(self, forward: float, right: float, down: float = 0.0) -> None:
+        """
+        Nudge the vehicle by a small offset relative to its CURRENT position, in
+        the body frame (x=forward, y=right, z=down [NED, so down is positive]),
+        via SET_POSITION_TARGET_LOCAL_NED with MAV_FRAME_BODY_OFFSET_NED.
+
+        This is the building block for visual servoing over the target in GUIDED:
+        the mission converts the camera's image offset into a step and lets the FC
+        fly it. Only the position fields are used; velocity/accel/yaw are ignored.
+        """
+        type_mask = 0b0000111111111000  # position only
+        self.master.mav.set_position_target_local_ned_send(
+            0,  # time_boot_ms
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
+            type_mask,
+            forward, right, down,
+            0, 0, 0,   # vx, vy, vz
+            0, 0, 0,   # afx, afy, afz
+            0, 0,      # yaw, yaw_rate
+        )
+        log.info(f"[ALIGN] Body nudge forward={forward:+.2f} right={right:+.2f} m")
+
+    def link_alive(self, timeout: float = 3.0) -> bool:
+        """
+        True if a HEARTBEAT from the FC arrives within 'timeout'. Returns quickly
+        when the link is healthy (heartbeats stream at a few Hz); it only blocks up
+        to 'timeout' when the link is actually down. Used by the failsafe to detect
+        a lost companion<->FC link.
+        """
+        return self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=timeout) is not None
+
     def wait_arrival(self, lat: float, lon: float, radius_m: float, timeout: float = 60.0) -> bool:
         """Wait until the drone is within 'radius_m' of the target."""
         deadline = time.time() + timeout

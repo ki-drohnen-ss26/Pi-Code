@@ -58,6 +58,10 @@ eeprom.bin
 *.elf
 mav.tlog*
 
+# ...but DO track the intentional FC parameter baseline under params/
+!params/
+!params/*.parm
+
 # Do NOT commit the ArduPilot repos themselves (kept separately / as submodules)
 ardupilot/
 ardupilot_gazebo/

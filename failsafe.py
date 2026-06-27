@@ -26,6 +26,7 @@ class FailsafeMonitor:
         self.config = config
         self._phase_start: Optional[float] = None
         self._phase_name: str = ""
+        self._telemetry_misses: int = 0  # consecutive reads with no telemetry
 
     # ------------------------------------------------------------------
     # Geofence (set once before the mission)
@@ -49,12 +50,19 @@ class FailsafeMonitor:
         return (time.time() - self._phase_start) > self.config.phase_timeout_s
 
     # ------------------------------------------------------------------
+    # Link health
+    # ------------------------------------------------------------------
+    def link_lost(self) -> bool:
+        """True if no FC heartbeat arrives within the configured timeout."""
+        return not self.drone.link_alive(self.config.heartbeat_timeout_s)
+
+    # ------------------------------------------------------------------
     # Battery check
     # ------------------------------------------------------------------
-    def battery_critical(self) -> bool:
-        batt = self.drone.get_battery()
-        if not batt:
-            return False  # no data -> don't abort here (handle separately)
+    def battery_critical(self, batt: dict) -> bool:
+        """True if voltage or remaining capacity is at/below the abort threshold.
+        Expects a valid battery dict (the None / missing-data case is handled in
+        check() via the telemetry-miss counter)."""
         if batt["voltage"] <= self.config.battery_min_voltage:
             return True
         if 0 <= batt["remaining"] <= self.config.battery_min_percent:
@@ -66,10 +74,26 @@ class FailsafeMonitor:
     # ------------------------------------------------------------------
     def check(self) -> Optional[str]:
         """
-        Returns: a reason string if an abort is required, otherwise None.
+        Returns a reason string if an abort is required, otherwise None.
+
+        Order: link first (cheapest signal of a dead connection), then telemetry
+        health, then battery, then the phase timeout. A SINGLE missing telemetry
+        read is tolerated (streams hiccup); only a run of them aborts - this closes
+        the old blind spot where missing data silently meant "all good".
         """
-        if self.battery_critical():
-            return "LOW_BATTERY"
+        if self.link_lost():
+            return "LINK_LOSS"
+
+        batt = self.drone.get_battery()
+        if batt is None:
+            self._telemetry_misses += 1
+            if self._telemetry_misses >= self.config.telemetry_max_misses:
+                return "NO_TELEMETRY"
+        else:
+            self._telemetry_misses = 0
+            if self.battery_critical(batt):
+                return "LOW_BATTERY"
+
         if self.phase_timed_out():
             return f"TIMEOUT_{self._phase_name}"
         return None

@@ -44,3 +44,26 @@ class MockCamera:
             "dy": self._dy,
             "distance": self._distance,
         }
+
+
+class ScriptedCamera:
+    """Replays a fixed sequence of offset frames, one per call. Used to exercise
+    the OVER_TARGET correction loop in tests and SITL dry-runs: feed a few
+    off-centre frames that converge to the centre and watch the mission nudge the
+    drone and then drop. After the script is exhausted it keeps returning the last
+    frame (typically the centred one), so the mission proceeds deterministically.
+
+    Each frame is a dict with the same keys as MockCamera:
+        {"detected": bool, "dx": float, "dy": float, "distance": float}
+    """
+
+    def __init__(self, frames: list[dict]):
+        if not frames:
+            raise ValueError("ScriptedCamera needs at least one frame")
+        self._frames = frames
+        self._i = 0
+
+    def get_target_offset(self) -> dict:
+        frame = self._frames[min(self._i, len(self._frames) - 1)]
+        self._i += 1
+        return frame

@@ -56,6 +56,16 @@ class Config:
     battery_min_percent: int = 20       # abort threshold, remaining capacity [%]
     phase_timeout_s: float = 60.0       # max duration per mission phase
     geofence_enable: bool = True        # set FENCE_ENABLE?
+    heartbeat_timeout_s: float = 3.0    # no FC heartbeat within this -> LINK_LOSS
+    telemetry_max_misses: int = 5       # consecutive missing telemetry reads -> NO_TELEMETRY
+
+    # ------------------------------------------------------------------
+    # Target alignment (visual servoing over the target before the drop)
+    # ------------------------------------------------------------------
+    centre_tolerance: float = 0.15  # |dx|,|dy| below this counts as "centred"
+    approach_gain: float = 0.5      # body metres to nudge per unit of image offset
+    max_nudge_m: float = 0.3        # clamp for a single correction step [m]
+    nudge_settle_s: float = 0.5     # wait after each nudge so the move settles
 
     # ------------------------------------------------------------------
     # Logging

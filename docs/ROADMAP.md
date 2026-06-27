@@ -168,7 +168,7 @@ Every test is logged and documented (what was tested, parameters, outcome).
 | Phase | Title                          | State |
 |-------|--------------------------------|-------|
 | 0     | Foundation & hygiene           | ☑ done |
-| 1     | Full mission in SITL (GPS)     | ☐     |
+| 1     | Full mission in SITL (GPS)     | ☑ done (SITL: full mission + LOW_BATTERY abort verified) |
 | 2     | GPS-denied nav + target search | ☐     |
 | 3     | Real AI camera                 | ☐     |
 | 4     | Pi provisioning & HIL prep     | ☐     |

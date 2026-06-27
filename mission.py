@@ -114,12 +114,16 @@ class DeliveryMission:
 
     def _over_target(self) -> State:
         """
-        Fine alignment over the target using the camera. With the MockCamera
-        (dx=dy=0) the drone is centred immediately and goes straight to the drop.
-        Later the real camera provides real dx/dy -> the correction loop goes
-        here (small position commands).
+        Fine alignment over the target by visual servoing. Reads the camera's
+        image offset (dx, dy) and nudges the drone in the body frame until it is
+        centred, then drops.
+
+        Axis mapping (downward-facing camera): dx -> body 'right', dy -> body
+        'forward'. Each step is scaled by approach_gain and clamped to max_nudge_m,
+        so corrections stay small and safe. With the MockCamera (dx=dy=0) the first
+        frame is already centred and we go straight to the drop.
         """
-        tol = 0.15  # allowed offset below which we count as "centred"
+        tol = self.config.centre_tolerance
         deadline = time.time() + self.config.phase_timeout_s
 
         while time.time() < deadline:
@@ -129,18 +133,24 @@ class DeliveryMission:
                 time.sleep(0.5)
                 continue
 
-            if abs(offset["dx"]) <= tol and abs(offset["dy"]) <= tol:
-                log.info(f"[CAM] Centred (dx={offset['dx']}, dy={offset['dy']})")
+            dx, dy = offset["dx"], offset["dy"]
+            if abs(dx) <= tol and abs(dy) <= tol:
+                log.info(f"[CAM] Centred (dx={dx:.2f}, dy={dy:.2f})")
                 return State.DROP
 
-            # --- placeholder for the real correction ---
-            # Here one would nudge the drone based on dx/dy, e.g. via
-            # SET_POSITION_TARGET_LOCAL_NED in the body frame. Never hit with mock.
-            log.info(f"[CAM] Correcting position (dx={offset['dx']}, dy={offset['dy']})")
-            time.sleep(0.5)
+            right = self._clamp(self.config.approach_gain * dx, self.config.max_nudge_m)
+            forward = self._clamp(self.config.approach_gain * dy, self.config.max_nudge_m)
+            log.info(f"[CAM] Correcting (dx={dx:.2f}, dy={dy:.2f}) -> fwd={forward:+.2f} right={right:+.2f}")
+            self.drone.move_body_offset(forward, right)
+            time.sleep(self.config.nudge_settle_s)
 
         log.warning("[CAM] Timeout during target alignment")
         return State.ABORT
+
+    @staticmethod
+    def _clamp(value: float, limit: float) -> float:
+        """Clamp 'value' into [-limit, +limit]."""
+        return max(-limit, min(limit, value))
 
     def _drop(self) -> State:
         """Perform the release and verify it via the read-back servo value."""

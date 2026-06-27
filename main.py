@@ -1,7 +1,7 @@
 """
 main.py
-=======
 Entry point. Wires together configuration, drone, camera, failsafe and mission.
+=======
 
 Usage:
     python main.py                 # uses the SITL default from config.py
@@ -13,7 +13,7 @@ Config.pi_serial() instead of Config() below.
 
 import sys
 
-from camera import MockCamera
+from camera import MockCamera, ScriptedCamera
 from config import Config
 from drone import Drone
 from failsafe import FailsafeMonitor
@@ -41,6 +41,11 @@ def main() -> None:
 
     # --- assemble the components ---
     camera = MockCamera()                 # later: real camera, same interface
+    #camera = ScriptedCamera([
+    #    {"detected": "True", "dx": 1.0, "dy": 0.5, "distance": 2.0},
+    #    {"detected": "True", "dx": 0.4, "dy": 0.2, "distance": 1.8},
+    #    {"detected": "True", "dx": 0.0, "dy": 0.0, "distance": 1.5}
+    #])
     failsafe = FailsafeMonitor(drone, config)
     mission = DeliveryMission(drone, camera, failsafe, config)
 

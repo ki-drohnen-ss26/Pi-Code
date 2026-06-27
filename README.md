@@ -11,13 +11,16 @@ The only difference is the `connection_string` in `config.py`.
 |------------------|-------------------------------------------------------------|
 | `config.py`      | Connection + all parameters (SITL vs. Pi in one place)      |
 | `drone.py`       | Heartbeat, telemetry, basic commands, payload release       |
-| `camera.py`      | Camera interface as a mock (`get_target_offset()`)          |
+| `camera.py`      | Camera interface: `MockCamera` + `ScriptedCamera` (replay offsets) |
 | `failsafe.py`    | Battery threshold, phase timeout, geofence                  |
 | `mission.py`     | State machine IDLE→TAKEOFF→ENROUTE→OVER_TARGET→DROP→RTL      |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |
 | `tests/`         | `pytest` unit tests for the mission logic (no SITL needed)  |
+| `params/`        | FC parameter baseline (capture/restore) — see `params/README.md` |
 | `requirements.txt` | Pinned dependencies (pymavlink, pytest)                   |
+| `ARCHITECTURE.md`| Components, relationships & mission flow (Mermaid diagrams) |
+| `SIM_TO_REAL.md` | Concrete SITL→hardware transition guide + safety checklist |
 | `ROADMAP.md`     | Phased development plan toward the real Pi + flight tests   |
 
 > The indoor target is found by search (the pad position is not known in advance), so
@@ -145,40 +148,13 @@ state machine switches to `ABORT → RTL`.
 
 ## From SITL to the real Pi
 
-Conceptually **nothing in the code changes**, only the endpoint the script
-connects to.
+Conceptually **nothing in the code changes** except the endpoint in `main.py`:
 
-**Physical connection:** the Pi connects via its UART (GPIO TX/RX) to the
-flight controller's TELEM port – TX↔RX crossed, common ground (GND).
-Alternatively a USB-UART adapter to the FC.
-
-**On the flight controller** (once, e.g. via a ground station):
-- `SERIALx_PROTOCOL = 2` (MAVLink2) for the port the Pi is on
-- `SERIALx_BAUD` matching the Pi side (e.g. 921 = 921600)
-
-**On the Pi:**
-- Enable the UART in `raspi-config`, disable the serial login console on that
-  port so that `/dev/serial0` is free.
-
-**In the code** – just this one line in `main.py`:
 ```python
 config = Config.pi_serial("/dev/serial0", baud=921600)
 ```
 
-### What is different from SITL
-- **Pre-arm checks are real:** GPS fix, EKF, compass must be healthy. `arm()`
-  retries several times with a pause instead of giving up at once or blocking.
-- **Indoors without GPS:** `goto()` uses global coordinates and needs GPS.
-  Indoors the MTF-01P provides the position via optical flow + LiDAR. Then you
-  fly via `SET_POSITION_TARGET_LOCAL_NED` in the local NED frame instead of
-  lat/lon, and `wait_ready_to_arm()` waits for the relative EKF position flag
-  (`EKF_POS_HORIZ_REL`, from optical flow) instead of the absolute one
-  (`EKF_POS_HORIZ_ABS`, from GPS). This is the later adaptation tied to Task 4.
-- **Data rates:** over the serial link telemetry streams are often slower;
-  `request_data_streams()` therefore sets a fixed rate.
-
-## Safety (real hardware)
-- First tests **without propellers**.
-- Always keep an independent kill switch on the transmitter (mode switch /
-  disarm). The companion failsafe does not replace it.
-- Also configure ArduPilot's own failsafes (`BATT_LOW_VOLT`, `FS_*`).
+The full transition — wiring, FC params, EKF/pre-arm differences, **camera axis
+mapping**, drop-servo calibration, link-loss / `FS_GCS`, and the safety checklist — is
+documented in **[SIM_TO_REAL.md](SIM_TO_REAL.md)**. For how the components fit together
+and the mission flow (with diagrams), see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
