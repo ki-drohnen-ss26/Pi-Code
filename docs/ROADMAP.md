@@ -104,14 +104,33 @@ IDLE → TAKEOFF → SEARCH → APPROACH → OVER_TARGET → DROP → RTL
   target at a known local NED position and "detects" it once the drone is within a
   field-of-view footprint. This lets the whole search → approach → drop logic be
   validated in SITL/`FakeDrone` **before** the real camera exists. The
-  `{detected, dx, dy, distance}` contract is unchanged, so Phase 3 only swaps the
+  `{detected, dx, dy, distance}` contract is unchanged, so Phase 4 only swaps the
   detector.
 
 **Done when:** the full indoor delivery mission flies in SITL using optical flow + LiDAR
 for position, with no GPS, and finds the target by search before dropping. Both search
 patterns and both detection cadences are exercised via config.
 
-### Phase 3 — Real AI camera *(Pi, developed in parallel)*
+### Phase 3 — GPS-denied for real hardware: EKF origin, fence, camera-less search *(SITL → real)*
+**Goal:** make the indoor (no-GPS) path work on the real drone, and let the search
+pattern + drop be flight-tested *before* the AI camera is ready.
+
+In SITL we leave GPS on as a shortcut to seed the EKF origin/home. Indoors there is no
+GPS, so the companion must establish the reference itself:
+- **`Drone.set_origin()`** — send `SET_GPS_GLOBAL_ORIGIN` (a chosen reference lat/lon) so
+  the EKF origin/home, `LOCAL_POSITION_NED` and `goto_local()` work without GPS.
+- **Geofence indoors** — the GPS-style fence needs a position; use an altitude-only fence
+  or disable it indoors (`config.geofence_enable`). Decide and wire it.
+- **`TimedCamera`** (config-selectable camera source) — "finds" the target after a set
+  time (centred), so a real flight can exercise the search-pattern flight + the drop
+  mechanism with **no AI camera**. Same `Camera` interface, so the mission is untouched.
+
+**Done when:** in SITL with GPS truly off (`GPS1_TYPE 0` + `set_origin`) the indoor
+mission arms, flies the search pattern and drops; and `TimedCamera` lets the same run
+complete with no camera. This unlocks the first camera-less real indoor flight (flown in
+the flight-test phase).
+
+### Phase 4 — Real AI camera *(Pi, developed in parallel)*
 **Goal:** replace the mock camera without touching mission logic.
 - Implement `RealCamera` (IMX500 / YOLO from `yolo-imx500/`) that satisfies the
   existing `Camera` protocol: turn a detection bounding box into `dx/dy/distance`.
@@ -120,7 +139,7 @@ patterns and both detection cadences are exercised via config.
 **Done when:** swapping `MockCamera` → `RealCamera` in `main.py` is the only change
 and the mission code is untouched.
 
-### Phase 4 — Pi provisioning & hardware-in-the-loop prep
+### Phase 5 — Pi provisioning & hardware-in-the-loop prep
 **Goal:** a reproducible Pi image and a configured flight controller.
 - Configure the MTF-01P on the bench via the CP2102 USB-UART adapter (sensor doc).
 - Pi OS image: enable UART, disable the serial login console, install pymavlink, clone
@@ -132,7 +151,7 @@ and the mission code is untouched.
 **Done when:** the Pi boots, routes MAVLink, and the FC is parameterised for flow +
 LiDAR + companion link.
 
-### Phase 5 — Bench integration *(no propellers)*
+### Phase 6 — Bench integration *(no propellers)*
 **Goal:** prove the real link and sensors before anything spins.
 - Pi ↔ FC: heartbeat, `--tele` telemetry, mode changes, servo drop, arm/disarm.
 - MTF-01P live: `RNGFND` distance and `OPTFLOW_QUALITY` healthy; move the airframe by
@@ -140,16 +159,18 @@ LiDAR + companion link.
 
 **Done when:** every companion action works against the real FC on the bench, props off.
 
-### Phase 6 — Flight tests *(incremental, props on, in the hall)*
+### Phase 7 — Flight tests *(incremental, props on, in the hall)*
 **Goal:** earn trust step by step.
 1. Manual `AltHold` → confirms LiDAR altitude hold.
 2. Manual `PosHold` → confirms optical-flow position hold.
 3. `GUIDED` hover → `goto_local` → short delivery.
-4. Full indoor delivery mission.
+4. **Camera-less search test:** `set_origin` → arm → fly the search pattern →
+   `TimedCamera` "finds" after a set time → timed drop → RTL (enabled by Phase 3).
+5. Full indoor delivery mission with the real AI camera.
 
 Every test is logged and documented (what was tested, parameters, outcome).
 
-### Phase 7 — Documentation & deliverables *(continuous, finalised here)*
+### Phase 8 — Documentation & deliverables *(continuous, finalised here)*
 - Fill the mkdocs stub pages, write the tutorials, keep the project journal, complete
   `results/limitations`, and prepare the poster + live demo.
 
@@ -169,9 +190,10 @@ Every test is logged and documented (what was tested, parameters, outcome).
 |-------|--------------------------------|-------|
 | 0     | Foundation & hygiene           | ☑ done |
 | 1     | Full mission in SITL (GPS)     | ☑ done (SITL: full mission + LOW_BATTERY abort verified) |
-| 2     | GPS-denied nav + target search | ☐     |
-| 3     | Real AI camera                 | ☐     |
-| 4     | Pi provisioning & HIL prep     | ☐     |
-| 5     | Bench integration (no props)   | ☐     |
-| 6     | Flight tests                   | ☐     |
-| 7     | Documentation & deliverables   | ☐     |
+| 2     | GPS-denied nav + target search | ☑ done (SITL: optical-flow search→approach→drop verified) |
+| 3     | GPS-denied real HW: origin, fence, TimedCamera | ☐ next |
+| 4     | Real AI camera                 | ☐     |
+| 5     | Pi provisioning & HIL prep     | ☐     |
+| 6     | Bench integration (no props)   | ☐     |
+| 7     | Flight tests                   | ☐     |
+| 8     | Documentation & deliverables   | ☐     |

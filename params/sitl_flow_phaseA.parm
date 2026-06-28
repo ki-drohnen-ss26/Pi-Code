@@ -1,0 +1,12 @@
+# SITL optical-flow + rangefinder setup — PHASE A (enable the sensors).
+# These stand in for the real MTF-01P (optical flow + LiDAR) in simulation.
+#
+# Load in the MAVProxy console, then reboot:
+#   param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_flow_phaseA.parm
+#   reboot
+#
+# The RNGFND1_* sub-parameters only come into existence AFTER RNGFND1_TYPE is set
+# and the autopilot reboots — that is why this is split from phase B.
+RNGFND1_TYPE 1
+SIM_FLOW_ENABLE 1
+FLOW_TYPE 10

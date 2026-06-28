@@ -16,6 +16,7 @@ Return format:
     }
 """
 
+import math
 from typing import Protocol
 
 
@@ -67,3 +68,36 @@ class ScriptedCamera:
         frame = self._frames[min(self._i, len(self._frames) - 1)]
         self._i += 1
         return frame
+
+
+class SimCamera:
+    """Simulated detector for SITL and tests. Pretends a target sits at a fixed local
+    NED position and "detects" it once the drone is within `fov_radius` (ground
+    distance). Returns the ground offset to the target as dx (east error) / dy (north
+    error), so the same APPROACH / OVER_TARGET servo loop drives the drone onto it.
+
+    This lets the whole search → approach → drop flow be validated before the real AI
+    camera exists. `drone` only needs a `get_local_position()` returning
+    `{"north": .., "east": ..}` — the real Drone and the test FakeDrone both provide it.
+    """
+
+    def __init__(self, drone, target_north: float, target_east: float, fov_radius: float = 1.5):
+        self._drone = drone
+        self._tn = target_north
+        self._te = target_east
+        self._fov = fov_radius
+
+    def get_target_offset(self) -> dict:
+        pos = self._drone.get_local_position()
+        if not pos:
+            return {"detected": False, "dx": 0.0, "dy": 0.0, "distance": float("inf")}
+        dn = self._tn - pos["north"]
+        de = self._te - pos["east"]
+        dist = math.hypot(dn, de)
+        detected = dist <= self._fov
+        return {
+            "detected": detected,
+            "dx": de if detected else 0.0,  # east error  -> body "right"
+            "dy": dn if detected else 0.0,  # north error -> body "forward"
+            "distance": dist,
+        }

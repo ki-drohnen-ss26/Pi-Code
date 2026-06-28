@@ -13,7 +13,7 @@ Config.pi_serial() instead of Config() below.
 
 import sys
 
-from camera import MockCamera, ScriptedCamera
+from camera import MockCamera, ScriptedCamera, SimCamera
 from config import Config
 from drone import Drone
 from failsafe import FailsafeMonitor
@@ -40,12 +40,19 @@ def main() -> None:
         return
 
     # --- assemble the components ---
-    camera = MockCamera()                 # later: real camera, same interface
-    #camera = ScriptedCamera([
-    #    {"detected": "True", "dx": 1.0, "dy": 0.5, "distance": 2.0},
-    #    {"detected": "True", "dx": 0.4, "dy": 0.2, "distance": 1.8},
-    #    {"detected": "True", "dx": 0.0, "dy": 0.0, "distance": 1.5}
-    #])
+    # Every camera implements the same interface (get_target_offset). Pick one:
+    if config.gps_denied:
+        # Indoor: simulate a target at a known local position so the SEARCH +
+        # APPROACH flow can be exercised in SITL before the real AI camera exists.
+        camera = SimCamera(drone, config.sim_target_north, config.sim_target_east,
+                           config.sim_fov_radius_m)
+    else:
+        camera = MockCamera()             # GPS path: target already centred
+    # Alternative for the OVER_TARGET correction loop with fixed frames:
+    # camera = ScriptedCamera([
+    #     {"detected": True, "dx": 1.0, "dy": 0.5, "distance": 2.0},
+    #     {"detected": True, "dx": 0.0, "dy": 0.0, "distance": 1.5},
+    # ])
     failsafe = FailsafeMonitor(drone, config)
     mission = DeliveryMission(drone, camera, failsafe, config)
 

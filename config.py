@@ -66,6 +66,35 @@ class Config:
     approach_gain: float = 0.5      # body metres to nudge per unit of image offset
     max_nudge_m: float = 0.3        # clamp for a single correction step [m]
     nudge_settle_s: float = 0.5     # wait after each nudge so the move settles
+    approach_lost_max: int = 5      # consecutive "target lost" frames before back to SEARCH
+
+    # ------------------------------------------------------------------
+    # Navigation mode (Phase 2 — indoor, GPS-denied)
+    # ------------------------------------------------------------------
+    # gps_denied=True: position comes from optical flow (MTF-01P), navigation is in
+    # local NED, pre-arm waits for the RELATIVE EKF position. False = the GPS/Phase-1
+    # path (global lat/lon, absolute EKF position).
+    gps_denied: bool = True
+    search_altitude: float = 2.0        # indoor cruise/search height [m]
+    local_arrival_radius_m: float = 0.5  # local-NED waypoint reached within this [m]
+
+    # ------------------------------------------------------------------
+    # Search pattern (Phase 2)
+    # ------------------------------------------------------------------
+    search_pattern: str = "spiral"   # "spiral" (expanding square, default) or "lawnmower"
+    search_step_m: float = 1.0       # spacing between search legs / rings [m]
+    search_max_radius_m: float = 6.0  # spiral: stop expanding beyond this [m]
+    search_area_w_m: float = 6.0     # lawnmower: rectangle width (east) [m]
+    search_area_h_m: float = 6.0     # lawnmower: rectangle height (north) [m]
+    detection_cadence: str = "stop_and_look"  # "stop_and_look" (default) or "continuous"
+    look_settle_s: float = 0.5       # hover time before detecting at a waypoint [s]
+
+    # ------------------------------------------------------------------
+    # Simulation target (SimCamera pretends the pad is here, local NED [m])
+    # ------------------------------------------------------------------
+    sim_target_north: float = 2.0
+    sim_target_east: float = 2.0
+    sim_fov_radius_m: float = 1.5    # camera "sees" the target within this ground radius
 
     # ------------------------------------------------------------------
     # Logging

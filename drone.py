@@ -137,6 +137,17 @@ class Drone:
             "rel_alt": msg.relative_alt / 1000.0,   # above launch point
         }
 
+    def get_local_position(self, timeout: float = 2.0) -> Optional[dict]:
+        """
+        Read LOCAL_POSITION_NED: position in metres relative to the EKF origin
+        (≈ the launch point), in the NED frame. Used for indoor navigation where
+        there is no GPS - the position comes from optical flow.
+        """
+        msg = self.master.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=timeout)
+        if not msg:
+            return None
+        return {"north": msg.x, "east": msg.y, "down": msg.z}
+
     def get_battery(self, timeout: float = 2.0) -> Optional[dict]:
         """Read SYS_STATUS: voltage [V], current [A], remaining capacity [%]."""
         msg = self.master.recv_match(type="SYS_STATUS", blocking=True, timeout=timeout)
@@ -187,24 +198,26 @@ class Drone:
         log.warning(f"[MODE] mode {mode_name} not confirmed")
         return False
 
-    def wait_ready_to_arm(self, timeout: float = 60.0) -> bool:
+    def wait_ready_to_arm(self, timeout: float = 60.0, require_abs: bool = True) -> bool:
         """
-        Wait until the EKF has a valid absolute horizontal position estimate BEFORE
-        arming. A GPS fix alone is NOT enough - the EKF needs a few more seconds to
-        converge, and arming earlier is rejected with 'Need position estimate'
-        (made worse by an active geofence). We therefore wait for the
-        EKF_POS_HORIZ_ABS flag in EKF_STATUS_REPORT, which is exactly what the
-        autopilot means by 'position estimate'.
+        Wait until the EKF has a valid horizontal position estimate BEFORE arming. A
+        GPS fix alone is NOT enough - the EKF needs a few seconds to converge, and
+        arming earlier is rejected with 'Need position estimate' (worse with an active
+        geofence). We wait for the relevant flag in EKF_STATUS_REPORT, which is exactly
+        what the autopilot means by 'position estimate'.
 
-        Indoors without GPS the relevant flag is EKF_POS_HORIZ_REL instead (the
-        position then comes from optical flow); swap 0x10 for 0x08 there.
+        require_abs=True  -> EKF_POS_HORIZ_ABS (0x10): ABSOLUTE position, from GPS
+                             (outdoor / Phase 1).
+        require_abs=False -> EKF_POS_HORIZ_REL (0x08): RELATIVE position, from optical
+                             flow (indoor / GPS-denied, Phase 2).
         """
-        EKF_POS_HORIZ_ABS = 0x10  # bit 4 of EKF_STATUS_FLAGS = absolute horizontal position
-        log.info("[PREARM] Waiting for EKF position estimate ...")
+        flag = 0x10 if require_abs else 0x08
+        kind = "absolute (GPS)" if require_abs else "relative (optical flow)"
+        log.info(f"[PREARM] Waiting for {kind} EKF position estimate ...")
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1.0)
-            if msg and (msg.flags & EKF_POS_HORIZ_ABS):
+            if msg and (msg.flags & flag):
                 log.info("[PREARM] EKF position estimate ready")
                 return True
         log.warning("[PREARM] Timeout: no EKF position estimate")
@@ -324,6 +337,42 @@ class Drone:
                     log.info(f"[GOTO] Target reached (distance {dist:.1f} m)")
                     return True
         log.warning("[GOTO] Timeout before arrival")
+        return False
+
+    def goto_local(self, north: float, east: float, down: float) -> None:
+        """
+        Fly to a position in the local NED frame (metres relative to the EKF origin),
+        via SET_POSITION_TARGET_LOCAL_NED with MAV_FRAME_LOCAL_NED. This is the
+        indoor / GPS-denied counterpart of goto(): no lat/lon needed.
+
+        Note NED sign: 'down' is positive downward, so a height of h above launch is
+        down = -h.
+        """
+        type_mask = 0b0000111111111000  # position only
+        self.master.mav.set_position_target_local_ned_send(
+            0,  # time_boot_ms
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            type_mask,
+            north, east, down,
+            0, 0, 0,   # vx, vy, vz
+            0, 0, 0,   # afx, afy, afz
+            0, 0,      # yaw, yaw_rate
+        )
+        log.info(f"[GOTO] Local target: north={north:.1f} east={east:.1f} down={down:.1f} m")
+
+    def wait_local_arrival(self, north: float, east: float, radius_m: float, timeout: float = 60.0) -> bool:
+        """Wait until the drone is within 'radius_m' (horizontal) of a local-NED point."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pos = self.get_local_position()
+            if pos:
+                dist = math.hypot(north - pos["north"], east - pos["east"])
+                if dist <= radius_m:
+                    log.info(f"[GOTO] Local target reached (distance {dist:.1f} m)")
+                    return True
+        log.warning("[GOTO] Timeout before local arrival")
         return False
 
     def land(self) -> None:

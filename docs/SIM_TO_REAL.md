@@ -41,9 +41,40 @@ adapter to the FC.
 - **Outdoor / GPS:** `wait_ready_to_arm()` waits for `EKF_POS_HORIZ_ABS` (absolute,
   from GPS). Pre-arm checks are real now: GPS fix, EKF, compass must be healthy —
   `arm()` retries with pauses instead of giving up or blocking.
-- **Indoor / no GPS (Phase 2):** switch to `EKF_POS_HORIZ_REL` (relative, from optical
-  flow), configure `EK3_SRCx_*`, run on the MTF-01P. Navigation moves from `goto()`
-  (lat/lon) to `goto_local()` (local NED).
+- **Indoor / no GPS (Phase 2, implemented):** `config.gps_denied = True` makes
+  `wait_ready_to_arm(require_abs=False)` wait for `EKF_POS_HORIZ_REL` (relative, from
+  optical flow), and navigation uses `goto_local()` (local NED) instead of `goto()`
+  (lat/lon). On the real drone this runs on the MTF-01P.
+
+  **To validate the indoor path in SITL** load the two ready-made overlays (values
+  match ArduPilot's own `copter-optflow.parm`), each followed by a reboot — see
+  `../params/README.md`:
+
+  ```
+  param load .../params/sitl_flow_phaseA.parm   # RNGFND1_TYPE, SIM_FLOW_ENABLE, FLOW_TYPE
+  reboot
+  param load .../params/sitl_flow_phaseB.parm   # RNGFND1_PIN/SCALING/MIN/MAX, EK3_SRC1_* = flow
+  reboot                                         # 2nd reboot REQUIRED (rangefinder reads PIN on boot)
+  ```
+  Pitfalls we hit: don't override `SIM_SONAR_SCALE` (default 12.1212 matches
+  `RNGFND1_SCALING`), and the rangefinder is only detected after the second reboot.
+
+  **GPS stays ON in SITL** as a shortcut: it only seeds the EKF origin/home so the
+  geofence and "waiting for home" pre-arm pass. The actual XY position/velocity still
+  come from optical flow (`EK3_SRC1_POSXY=0`, `VELXY=5`), so the flow navigation is
+  genuinely exercised. Once it flies, capture the working set into
+  `../params/gps_denied_sitl.parm`.
+
+  **Real hardware (no GPS reception) — the gap the SITL shortcut hides:** indoors there
+  is no GPS to set the origin/home. So on the real drone we must, before the mission:
+  - **Set the EKF origin without GPS** — send the MAVLink `SET_GPS_GLOBAL_ORIGIN`
+    message with a chosen reference lat/lon (the standard non-GPS / motion-capture
+    approach). Then `LOCAL_POSITION_NED`, home and `goto_local()` have a reference.
+  - **Handle the geofence** — the GPS-style fence needs a position; indoors use an
+    altitude-only fence or set `config.geofence_enable = False`.
+
+  These are companion-side tasks for Phase 3 (a `Drone.set_origin()` helper + a fence
+  decision); the flow *navigation* itself is already validated and GPS-independent.
 
 ## 3. Camera axis mapping ← MUST be calibrated
 The camera reports where the target is in the **image** (`dx` = right of centre,
@@ -89,7 +120,7 @@ with `ScriptedCamera`, then re-verify on the real camera (mounting may differ).
 Over a serial link telemetry is slower than SITL's local UDP;
 `Drone.request_data_streams()` sets a fixed rate so position/battery arrive reliably.
 
-## 7. Sensors (Phase 4)
+## 7. Sensors (Phase 5)
 MTF-01P configured via the CP2102 USB-UART adapter; FC params for the rangefinder +
 optical-flow serial protocol. See `../params/README.md` and the project sensor docs.
 

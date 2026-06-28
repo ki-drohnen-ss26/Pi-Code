@@ -1,11 +1,15 @@
 """
 mission.py
 ==========
-The delivery state machine. Casts the loose command sequence into a clean,
-extensible state machine:
+The delivery state machine. Two paths share the same machine, chosen by
+config.gps_denied:
 
-    IDLE -> TAKEOFF -> ENROUTE -> OVER_TARGET -> DROP -> RTL -> DONE
-                                                          (ABORT on failsafe)
+    GPS / outdoor (Phase 1):
+        IDLE -> TAKEOFF -> ENROUTE -> OVER_TARGET -> DROP -> RTL -> DONE
+    Indoor / GPS-denied (Phase 2):
+        IDLE -> TAKEOFF -> SEARCH -> APPROACH -> DROP -> RTL -> DONE
+                              ^_________|  (target lost)
+                                                      (ABORT on failsafe)
 
 Each state does exactly one thing and returns the next state. The failsafe is
 checked before every step - if it fires, the machine jumps to ABORT (and from
@@ -13,6 +17,7 @@ there in a controlled way to RTL/DONE).
 """
 
 import logging
+import math
 import time
 from enum import Enum, auto
 
@@ -20,6 +25,7 @@ from camera import Camera
 from config import Config
 from drone import Drone
 from failsafe import FailsafeMonitor
+from search import make_search_pattern
 
 log = logging.getLogger(__name__)
 
@@ -27,8 +33,10 @@ log = logging.getLogger(__name__)
 class State(Enum):
     IDLE = auto()
     TAKEOFF = auto()
-    ENROUTE = auto()
-    OVER_TARGET = auto()
+    SEARCH = auto()       # indoor: fly a pattern, look for the target
+    APPROACH = auto()     # indoor: visual servoing onto a detected target
+    ENROUTE = auto()      # GPS: fly to known coordinates
+    OVER_TARGET = auto()  # GPS: fine centring over the target
     DROP = auto()
     RTL = auto()
     ABORT = auto()
@@ -52,6 +60,8 @@ class DeliveryMission:
         dispatch = {
             State.IDLE: self._idle,
             State.TAKEOFF: self._takeoff,
+            State.SEARCH: self._search,
+            State.APPROACH: self._approach,
             State.ENROUTE: self._enroute,
             State.OVER_TARGET: self._over_target,
             State.DROP: self._drop,
@@ -83,7 +93,9 @@ class DeliveryMission:
         self.drone.configure_drop_servo()
         self.drone.reset_servo()
 
-        if not self.drone.wait_ready_to_arm():
+        # Indoor (GPS-denied) needs only the RELATIVE EKF position (optical flow);
+        # outdoor needs the ABSOLUTE one (GPS).
+        if not self.drone.wait_ready_to_arm(require_abs=not self.config.gps_denied):
             return State.ABORT
         if not self.drone.set_mode("GUIDED"):
             return State.ABORT
@@ -94,10 +106,14 @@ class DeliveryMission:
         return State.TAKEOFF
 
     def _takeoff(self) -> State:
-        if self.drone.takeoff(self.config.cruise_alt):
-            self.failsafe.start_phase("ENROUTE")
-            return State.ENROUTE
-        return State.ABORT
+        altitude = self.config.search_altitude if self.config.gps_denied else self.config.cruise_alt
+        if not self.drone.takeoff(altitude):
+            return State.ABORT
+        if self.config.gps_denied:
+            self.failsafe.start_phase("SEARCH")
+            return State.SEARCH
+        self.failsafe.start_phase("ENROUTE")
+        return State.ENROUTE
 
     def _enroute(self) -> State:
         self.drone.goto(self.config.target_lat, self.config.target_lon, self.config.cruise_alt)
@@ -138,14 +154,113 @@ class DeliveryMission:
                 log.info(f"[CAM] Centred (dx={dx:.2f}, dy={dy:.2f})")
                 return State.DROP
 
-            right = self._clamp(self.config.approach_gain * dx, self.config.max_nudge_m)
-            forward = self._clamp(self.config.approach_gain * dy, self.config.max_nudge_m)
-            log.info(f"[CAM] Correcting (dx={dx:.2f}, dy={dy:.2f}) -> fwd={forward:+.2f} right={right:+.2f}")
-            self.drone.move_body_offset(forward, right)
+            log.info(f"[CAM] Correcting (dx={dx:.2f}, dy={dy:.2f})")
+            self._nudge_from_offset(dx, dy)
             time.sleep(self.config.nudge_settle_s)
 
         log.warning("[CAM] Timeout during target alignment")
         return State.ABORT
+
+    # ------------------------------------------------------------------
+    # Indoor / GPS-denied states (Phase 2)
+    # ------------------------------------------------------------------
+    def _search(self) -> State:
+        """
+        Fly a search pattern in local NED and look for the target with the camera.
+        On detection -> APPROACH; if the whole pattern is exhausted without a
+        detection -> ABORT (return home).
+        """
+        pattern = make_search_pattern(self.config)
+        waypoints = pattern.waypoints()
+        log.info(f"[SEARCH] {self.config.search_pattern} pattern, {len(waypoints)} waypoints, "
+                 f"cadence={self.config.detection_cadence}")
+        down = -self.config.search_altitude
+
+        for (north, east) in waypoints:
+            # SEARCH is long-running, so re-check the failsafe on every leg.
+            reason = self.failsafe.check()
+            if reason:
+                self.abort_reason = reason
+                log.info(f"[SEARCH] Failsafe during search: {reason}")
+                return State.ABORT
+
+            self.drone.goto_local(north, east, down)
+
+            if self.config.detection_cadence == "continuous":
+                if self._poll_until_arrival_or_detection(north, east):
+                    return State.APPROACH
+            else:  # stop_and_look
+                self.drone.wait_local_arrival(
+                    north, east, self.config.local_arrival_radius_m,
+                    timeout=self.config.phase_timeout_s,
+                )
+                time.sleep(self.config.look_settle_s)
+                if self.camera.get_target_offset()["detected"]:
+                    log.info(f"[SEARCH] Target detected near ({north:.1f}, {east:.1f})")
+                    return State.APPROACH
+
+        log.warning("[SEARCH] Pattern exhausted, no target found")
+        self.abort_reason = "TARGET_NOT_FOUND"
+        return State.ABORT
+
+    def _poll_until_arrival_or_detection(self, north: float, east: float) -> bool:
+        """
+        Continuous cadence: poll the camera while flying toward (north, east).
+        Returns True as soon as the target is detected, False once the waypoint is
+        reached without a detection.
+        """
+        deadline = time.time() + self.config.phase_timeout_s
+        while time.time() < deadline:
+            if self.camera.get_target_offset()["detected"]:
+                log.info("[SEARCH] Target detected en route")
+                return True
+            pos = self.drone.get_local_position()
+            if pos and math.hypot(north - pos["north"], east - pos["east"]) <= self.config.local_arrival_radius_m:
+                return False
+            time.sleep(0.2)
+        return False
+
+    def _approach(self) -> State:
+        """
+        Visual servoing toward a detected target until centred, then DROP. If the
+        target is lost for too many frames in a row, fall back to SEARCH.
+        """
+        tol = self.config.centre_tolerance
+        deadline = time.time() + self.config.phase_timeout_s
+        lost = 0
+
+        while time.time() < deadline:
+            offset = self.camera.get_target_offset()
+            if not offset["detected"]:
+                lost += 1
+                if lost >= self.config.approach_lost_max:
+                    log.warning("[APPROACH] Target lost -> back to SEARCH")
+                    return State.SEARCH
+                log.info(f"[APPROACH] Target lost ({lost}), waiting ...")
+                time.sleep(0.3)
+                continue
+
+            lost = 0
+            dx, dy = offset["dx"], offset["dy"]
+            if abs(dx) <= tol and abs(dy) <= tol:
+                log.info(f"[APPROACH] Centred over target (dx={dx:.2f}, dy={dy:.2f})")
+                return State.DROP
+            self._nudge_from_offset(dx, dy)
+            time.sleep(self.config.nudge_settle_s)
+
+        log.warning("[APPROACH] Timeout")
+        return State.ABORT
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+    def _nudge_from_offset(self, dx: float, dy: float) -> None:
+        """Turn an image offset (dx -> body right, dy -> body forward) into a clamped
+        body-frame nudge. Shared by OVER_TARGET and APPROACH."""
+        right = self._clamp(self.config.approach_gain * dx, self.config.max_nudge_m)
+        forward = self._clamp(self.config.approach_gain * dy, self.config.max_nudge_m)
+        log.info(f"[ALIGN] nudge fwd={forward:+.2f} right={right:+.2f}")
+        self.drone.move_body_offset(forward, right)
 
     @staticmethod
     def _clamp(value: float, limit: float) -> float:

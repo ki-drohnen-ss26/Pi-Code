@@ -16,7 +16,7 @@ navigation) from silently breaking the mission flow.
 
 import pytest
 
-from camera import MockCamera, ScriptedCamera
+from camera import MockCamera, ScriptedCamera, SimCamera
 from config import Config
 from failsafe import FailsafeMonitor
 from mission import DeliveryMission, State
@@ -51,6 +51,8 @@ class FakeDrone:
         self.arrival_ok = arrival_ok
         self.disarm_ok = disarm_ok
         self.link_alive_ok = link_alive_ok
+        self._north = 0.0  # local NED position, updated by goto_local / move_body_offset
+        self._east = 0.0
 
     # --- used by the failsafe ---
     def set_param(self, name, value, timeout=3.0):
@@ -68,6 +70,9 @@ class FakeDrone:
         return self.link_alive_ok
 
     def move_body_offset(self, forward, right, down=0.0):
+        # yaw=0 assumption: body forward=north, body right=east
+        self._north += forward
+        self._east += right
         self.calls.append(("move_body_offset", forward, right))
 
     # --- preparation ---
@@ -78,8 +83,8 @@ class FakeDrone:
         self._servo = self.config.neutral_pwm
         self.calls.append(("reset_servo",))
 
-    def wait_ready_to_arm(self, timeout=60.0):
-        self.calls.append(("wait_ready_to_arm",))
+    def wait_ready_to_arm(self, timeout=60.0, require_abs=True):
+        self.calls.append(("wait_ready_to_arm", require_abs))
         return self.ready_ok
 
     def set_mode(self, mode_name, timeout=5.0):
@@ -109,6 +114,18 @@ class FakeDrone:
 
     def wait_arrival(self, lat, lon, radius_m, timeout=60.0):
         self.calls.append(("wait_arrival",))
+        return self.arrival_ok
+
+    def get_local_position(self, timeout=2.0):
+        return {"north": self._north, "east": self._east, "down": -2.0}
+
+    def goto_local(self, north, east, down):
+        # teleport to the waypoint (good enough for logic tests)
+        self._north, self._east = north, east
+        self.calls.append(("goto_local", north, east))
+
+    def wait_local_arrival(self, north, east, radius_m, timeout=60.0):
+        self.calls.append(("wait_local_arrival",))
         return self.arrival_ok
 
     def return_to_launch(self):
@@ -146,6 +163,7 @@ def _build_mission(drone: FakeDrone, config: Config, camera=None) -> DeliveryMis
 
 def test_happy_path_runs_to_done_and_delivers():
     config = Config.sitl()
+    config.gps_denied = False  # GPS path: IDLE->TAKEOFF->ENROUTE->OVER_TARGET->DROP->RTL
     drone = FakeDrone(config)
     mission = _build_mission(drone, config)
 
@@ -188,6 +206,7 @@ def test_failed_arming_aborts_into_rtl():
 
 def test_over_target_correction_nudges_then_drops():
     config = Config.sitl()
+    config.gps_denied = False  # GPS path so OVER_TARGET consumes all camera frames
     drone = FakeDrone(config)
     # Two off-centre frames (outside centre_tolerance) then a centred one.
     camera = ScriptedCamera([
@@ -244,3 +263,59 @@ def test_single_telemetry_hiccup_does_not_abort():
     assert mission.state is State.DONE
     assert mission.abort_reason is None
     assert "drop" in drone.actions()
+
+
+# ----------------------------------------------------------------------
+# Indoor / GPS-denied path (Phase 2): search + approach with SimCamera
+# ----------------------------------------------------------------------
+def test_indoor_search_finds_target_approaches_and_delivers():
+    config = Config.sitl()  # gps_denied=True by default
+    config.sim_target_north = 2.5  # off a spiral corner, so APPROACH actually nudges
+    config.sim_target_east = 1.5
+    drone = FakeDrone(config)
+    camera = SimCamera(drone, config.sim_target_north, config.sim_target_east, config.sim_fov_radius_m)
+    mission = _build_mission(drone, config, camera=camera)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    actions = drone.actions()
+    assert "goto_local" in actions         # it flew a search pattern
+    assert "move_body_offset" in actions   # it servo-approached the target
+    assert "drop" in actions
+    assert actions.index("goto_local") < actions.index("drop")
+    # ended within tolerance of the target
+    assert abs(drone._north - 2.5) <= config.centre_tolerance
+    assert abs(drone._east - 1.5) <= config.centre_tolerance
+
+
+def test_indoor_continuous_cadence_finds_target():
+    config = Config.sitl()
+    config.detection_cadence = "continuous"
+    config.sim_target_north = 2.5
+    config.sim_target_east = 1.5
+    drone = FakeDrone(config)
+    camera = SimCamera(drone, config.sim_target_north, config.sim_target_east, config.sim_fov_radius_m)
+    mission = _build_mission(drone, config, camera=camera)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert "drop" in drone.actions()
+
+
+def test_indoor_target_not_found_aborts_home():
+    config = Config.sitl()
+    far = 20.0  # outside search_max_radius -> no waypoint ever detects it
+    config.sim_target_north = far
+    config.sim_target_east = far
+    drone = FakeDrone(config)
+    camera = SimCamera(drone, far, far, config.sim_fov_radius_m)
+    mission = _build_mission(drone, config, camera=camera)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason == "TARGET_NOT_FOUND"
+    assert "drop" not in drone.actions()
+    assert "return_to_launch" in drone.actions()

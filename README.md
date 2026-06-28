@@ -11,9 +11,10 @@ The only difference is the `connection_string` in `config.py`.
 |------------------|-------------------------------------------------------------|
 | `config.py`      | Connection + all parameters (SITL vs. Pi in one place)      |
 | `drone.py`       | Heartbeat, telemetry, basic commands, payload release       |
-| `camera.py`      | Camera interface: `MockCamera` + `ScriptedCamera` (replay offsets) |
-| `failsafe.py`    | Battery threshold, phase timeout, geofence                  |
-| `mission.py`     | State machine IDLE→TAKEOFF→ENROUTE→OVER_TARGET→DROP→RTL      |
+| `camera.py`      | Camera interface: `MockCamera`, `ScriptedCamera`, `SimCamera` |
+| `failsafe.py`    | Link loss, telemetry loss, battery, phase timeout, geofence |
+| `mission.py`     | State machine — GPS path + indoor SEARCH/APPROACH path      |
+| `search.py`      | Search patterns (expanding spiral / lawnmower) in local NED |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |
 | `tests/`         | `pytest` unit tests for the mission logic (no SITL needed)  |
@@ -23,9 +24,10 @@ The only difference is the `connection_string` in `config.py`.
 | `docs/SIM_TO_REAL.md`  | Concrete SITL→hardware transition guide + safety checklist |
 | `docs/ROADMAP.md`      | Phased development plan toward the real Pi + flight tests   |
 
-> The indoor target is found by search (the pad position is not known in advance), so
-> the state machine will grow `SEARCH` and `APPROACH` stages in Phase 2 — see
-> `docs/ROADMAP.md`. The `Camera` interface already supports this (`detected`/`dx`/`dy`).
+> The indoor target position is not known in advance, so the state machine has a
+> `SEARCH` stage (fly a pattern, look with the camera) and an `APPROACH` stage (visual
+> servoing onto a detected target). `config.gps_denied` selects the indoor path
+> (default) vs the GPS path — see `docs/ARCHITECTURE.md` and `docs/ROADMAP.md`.
 
 ## Prerequisites
 
@@ -89,6 +91,11 @@ python main.py
 
 By default `main.py` connects on port 14550 (`Config.sitl()`), which is the port
 `sim_vehicle.py` outputs to.
+
+> **GPS vs indoor path.** `config.gps_denied` defaults to **True**, so `main.py` runs
+> the indoor SEARCH/APPROACH path with `SimCamera`. For a plain GPS SITL run (Phase 1),
+> set `gps_denied = False`. To validate the indoor path against SITL, configure SITL
+> for optical flow first — see `docs/SIM_TO_REAL.md` §2.
 
 ### Expected output
 

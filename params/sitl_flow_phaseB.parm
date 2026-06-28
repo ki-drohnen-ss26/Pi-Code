@@ -1,0 +1,19 @@
+# SITL optical-flow + rangefinder setup — PHASE B (configure + point the EKF at flow).
+# Values match ArduPilot's own Tools/autotest/default_params/copter-optflow.parm.
+#
+# Load AFTER phase A + reboot (so the RNGFND1_* params exist), THEN REBOOT AGAIN
+# (the analog rangefinder backend only picks up RNGFND1_PIN on the next boot):
+#   param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_flow_phaseB.parm
+#   reboot
+#
+# Note: we do NOT touch SIM_SONAR_SCALE — its default (12.1212) already matches
+# RNGFND1_SCALING (12.12). And we do NOT disable GPS: the EKF uses optical flow for
+# horizontal position/velocity (POSXY=0, VELXY=OpticalFlow), while GPS still provides
+# the origin/home so the geofence and "waiting for home" pre-arm are satisfied.
+RNGFND1_MIN 0
+RNGFND1_MAX 40
+RNGFND1_PIN 0
+RNGFND1_SCALING 12.12
+EK3_SRC1_POSXY 0
+EK3_SRC1_VELXY 5
+EK3_SRC1_VELZ 0
