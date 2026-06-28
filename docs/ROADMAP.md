@@ -73,9 +73,9 @@ whose position is not known in advance.
 The delivery pad location is unknown, so the state machine grows a search stage:
 
 ```
-IDLE → TAKEOFF → SEARCH → APPROACH → OVER_TARGET → DROP → RTL
+IDLE → TAKEOFF → SEARCH → APPROACH → DROP → RTL
                     ↑__________|   (target lost → back to SEARCH)
-                                              (ABORT → RTL on failsafe)
+                                       (ABORT → RTL on failsafe)
 ```
 
 *Navigation (GPS-denied):*
@@ -98,8 +98,9 @@ IDLE → TAKEOFF → SEARCH → APPROACH → OVER_TARGET → DROP → RTL
 - **Detection cadence** (config-selected): `stop_and_look` (**default** — fly to a
   waypoint, hover, detect, decide; robust, low motion blur) or `continuous` (poll while
   flying each leg, abort the leg on detection).
-- **`APPROACH`** state: visual servoing — turn the camera's `dx/dy` into local-NED
-  nudges and descend until the existing `OVER_TARGET` fine-centre takes over.
+- **`APPROACH`** state: visual servoing — turn the camera's `dx/dy` into body-frame
+  nudges until centred, then **`DROP`** (the indoor path does not use `OVER_TARGET`;
+  that is the GPS path's fine-centring state). On sustained target loss → back to SEARCH.
 - **`SimCamera`** (`camera.py`, satisfies the existing `Camera` protocol): models a
   target at a known local NED position and "detects" it once the drone is within a
   field-of-view footprint. This lets the whole search → approach → drop logic be
@@ -191,7 +192,7 @@ Every test is logged and documented (what was tested, parameters, outcome).
 | 0     | Foundation & hygiene           | ☑ done |
 | 1     | Full mission in SITL (GPS)     | ☑ done (SITL: full mission + LOW_BATTERY abort verified) |
 | 2     | GPS-denied nav + target search | ☑ done (SITL: optical-flow search→approach→drop verified) |
-| 3     | GPS-denied real HW: origin, fence, TimedCamera | ☐ next |
+| 3     | GPS-denied real HW: origin, fence, TimedCamera | ◑ code + tests done, SITL/real flight pending |
 | 4     | Real AI camera                 | ☐     |
 | 5     | Pi provisioning & HIL prep     | ☐     |
 | 6     | Bench integration (no props)   | ☐     |

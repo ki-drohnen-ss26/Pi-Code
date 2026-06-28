@@ -67,6 +67,23 @@ class Drone:
             1,  # 1 = start
         )
 
+    def set_origin(self, lat: float, lon: float, alt: float) -> None:
+        """
+        Tell the EKF where it is WITHOUT GPS, via SET_GPS_GLOBAL_ORIGIN. Indoors there is
+        no GPS to seed the EKF origin/home, so the companion provides a reference. Any
+        sensible lat/lon works - it only anchors the local NED frame and home. After this,
+        LOCAL_POSITION_NED, home and the geofence have a reference.
+
+        lat/lon in degrees, alt in metres (AMSL).
+        """
+        self.master.mav.set_gps_global_origin_send(
+            self.master.target_system,
+            int(lat * 1e7),     # degE7
+            int(lon * 1e7),     # degE7
+            int(alt * 1000.0),  # mm
+        )
+        log.info(f"[ORIGIN] EKF origin set: lat={lat:.6f} lon={lon:.6f} alt={alt} m")
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

@@ -88,7 +88,12 @@ class DeliveryMission:
     # States (each returns the next state)
     # ------------------------------------------------------------------
     def _idle(self) -> State:
-        """Preparation: geofence, configure drop servo, GUIDED, arm."""
+        """Preparation: (origin), geofence, configure drop servo, GUIDED, arm."""
+        # Indoors without GPS the EKF needs an origin before it can report a position.
+        if self.config.gps_denied and self.config.set_origin_on_start:
+            self.drone.set_origin(
+                self.config.origin_lat, self.config.origin_lon, self.config.origin_alt
+            )
         self.failsafe.setup_geofence()
         self.drone.configure_drop_servo()
         self.drone.reset_servo()

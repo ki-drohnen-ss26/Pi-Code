@@ -26,7 +26,7 @@ Everything else (drone / mission / failsafe / camera) is identical.
 | Mission logic | identical | identical |
 | Pre-arm | GPS/EKF converge in seconds | real GPS fix / EKF / compass must be healthy |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
-| Camera | Mock / Scripted | RealCamera (AI camera) |
+| Camera | Mock / Sim / Timed | RealCamera (AI camera) |
 | Drop servo | values just echoed back | real servo — **calibrate PWM, test on bench** |
 
 ## 1. Physical connection
@@ -65,21 +65,29 @@ adapter to the FC.
   genuinely exercised. Once it flies, capture the working set into
   `../params/gps_denied_sitl.parm`.
 
-  **Real hardware (no GPS reception) — the gap the SITL shortcut hides:** indoors there
-  is no GPS to set the origin/home. So on the real drone we must, before the mission:
-  - **Set the EKF origin without GPS** — send the MAVLink `SET_GPS_GLOBAL_ORIGIN`
-    message with a chosen reference lat/lon (the standard non-GPS / motion-capture
-    approach). Then `LOCAL_POSITION_NED`, home and `goto_local()` have a reference.
-  - **Handle the geofence** — the GPS-style fence needs a position; indoors use an
-    altitude-only fence or set `config.geofence_enable = False`.
+  **Real hardware (no GPS reception) — handled in Phase 3:** indoors there is no GPS to
+  set the origin/home, so the companion does it itself:
+  - **EKF origin without GPS** — set `config.set_origin_on_start = True` (+ `origin_lat`/
+    `origin_lon`/`origin_alt`). `_idle` then calls `Drone.set_origin()` →
+    `SET_GPS_GLOBAL_ORIGIN` before arming, so `LOCAL_POSITION_NED`, home and
+    `goto_local()` have a reference. (Leave it `False` in SITL while GPS is still on — it
+    seeds the origin itself.) Set `origin_lat`/`origin_lon` to the **real hall** coordinate
+    so the magnetic declination matches; for SITL, launch the sim at the same spot
+    (`sim_vehicle.py ... --custom-location=lat,lon,alt,0`) or expect a few-degrees yaw
+    offset (the mission still works — the local frame is just rotated).
+  - **Geofence** — `setup_geofence()` sets an **altitude-only** fence by default
+    (`fence_type = 1`, `fence_alt_max_m`), which needs no horizontal position. Size
+    `fence_alt_max_m` to the flight, or set `config.geofence_enable = False` indoors.
+  - **Camera-less flight test** — set `config.camera_source = "timed"` to fly the search
+    pattern and drop after `timed_camera_after_s`, with no AI camera (Phase 3).
 
-  These are companion-side tasks for Phase 3 (a `Drone.set_origin()` helper + a fence
-  decision); the flow *navigation* itself is already validated and GPS-independent.
+  The flow *navigation* is GPS-independent and already validated.
 
 ## 3. Camera axis mapping ← MUST be calibrated
 The camera reports where the target is in the **image** (`dx` = right of centre,
 `dy` = up/down). The mission turns that into a **body-frame move** (forward/right) in
-`mission._over_target()`. Current assumption (downward-facing camera, image-top = nose):
+`mission._nudge_from_offset()` (used by both OVER_TARGET and APPROACH). Current
+assumption (downward-facing camera, image-top = nose):
 
 | Image value | → Body move |
 |-------------|-------------|
@@ -92,14 +100,14 @@ conventions.** Calibrate once:
 1. Hover and place the target clearly to the drone's **right**.
 2. Read and log the camera's `dx / dy`.
 3. Confirm a positive `dx` makes the drone move **toward** the target (right), not away.
-4. If reversed or swapped, flip the sign / swap the axes in `_over_target()`.
+4. If reversed or swapped, flip the sign / swap the axes in `_nudge_from_offset()`.
 
 Getting this wrong means the drone "corrects" **away** from the target. Verify in SITL
 with `ScriptedCamera`, then re-verify on the real camera (mounting may differ).
 
 > Related open design question: downward (nadir) vs slightly tilted camera. Nadir keeps
 > this mapping trivial and is the recommended starting point; a forward tilt helps the
-> search but complicates centring. See [ROADMAP.md](ROADMAP.md) Phase 2/3.
+> search but complicates centring. See [ROADMAP.md](ROADMAP.md) Phase 2/4.
 
 ## 4. Drop servo calibration
 `config.drop_pwm` / `config.neutral_pwm` are raw PWM values. On real hardware:

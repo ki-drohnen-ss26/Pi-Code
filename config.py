@@ -56,6 +56,13 @@ class Config:
     battery_min_percent: int = 20       # abort threshold, remaining capacity [%]
     phase_timeout_s: float = 60.0       # max duration per mission phase
     geofence_enable: bool = True        # set FENCE_ENABLE?
+    # FENCE_TYPE bitmask. 1 = max altitude only — works WITHOUT a horizontal position,
+    # so it is indoor-safe (a circle/polygon fence would need GPS/position). Outdoor you
+    # can add the circle bit (2) / polygon bit (4).
+    fence_type: int = 1
+    # Size the altitude fence to the flight: indoor ~ search_altitude (default 2 m).
+    # NOTE: for the GPS path raise this above cruise_alt (10 m) or it trips on takeoff.
+    fence_alt_max_m: float = 4.0        # max altitude for the fence [m]
     heartbeat_timeout_s: float = 3.0    # no FC heartbeat within this -> LINK_LOSS
     telemetry_max_misses: int = 5       # consecutive missing telemetry reads -> NO_TELEMETRY
 
@@ -78,6 +85,21 @@ class Config:
     search_altitude: float = 2.0        # indoor cruise/search height [m]
     local_arrival_radius_m: float = 0.5  # local-NED waypoint reached within this [m]
 
+    # EKF origin (Phase 3). Indoors there is no GPS to seed the EKF origin/home, so the
+    # companion sends SET_GPS_GLOBAL_ORIGIN before arming. Any sensible reference works —
+    # it only anchors the local NED frame + home. Enable for a truly GPS-off run; leave
+    # off when SITL still has GPS (which seeds the origin itself).
+    set_origin_on_start: bool = True
+    # Reference origin = the real hall (from Google Maps). Indoor nav is purely relative,
+    # so only the magnetic declination + map display depend on this value; using the true
+    # location gives the correct compass heading. NOTE for SITL: the simulator's compass is
+    # modelled at its own home (CMAC/Canberra by default), so launch sim_vehicle at the same
+    # spot - sim_vehicle.py ... --custom-location=50.131196,8.692972,112,0 - or expect a
+    # small yaw offset (the mission still works, the local frame is just rotated a few deg).
+    origin_lat: float = 50.13119602511582   # hall latitude  [deg]
+    origin_lon: float = 8.692972038286195   # hall longitude [deg]
+    origin_alt: float = 112.0               # approx hall altitude [m AMSL]; indoor height comes from LiDAR
+
     # ------------------------------------------------------------------
     # Search pattern (Phase 2)
     # ------------------------------------------------------------------
@@ -95,6 +117,15 @@ class Config:
     sim_target_north: float = 2.0
     sim_target_east: float = 2.0
     sim_fov_radius_m: float = 1.5    # camera "sees" the target within this ground radius
+
+    # ------------------------------------------------------------------
+    # Camera selection (which Camera implementation main.py wires in)
+    # ------------------------------------------------------------------
+    # "auto" = SimCamera when gps_denied else MockCamera; "sim" / "mock" force one;
+    # "timed" = TimedCamera (finds the target after a set time, no real detection) to
+    # flight-test the search pattern + drop without the AI camera (Phase 3).
+    camera_source: str = "auto"
+    timed_camera_after_s: float = 20.0  # TimedCamera: declare "found" after this many seconds
 
     # ------------------------------------------------------------------
     # Logging

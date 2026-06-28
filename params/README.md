@@ -11,7 +11,8 @@ SITL and, later, on the real FC.
 | `default.parm` | Full baseline dump, captured from SITL (or the real FC). *Capture it in the Phase 1 SITL run — see below.* |
 | `sitl_flow_phaseA.parm` | SITL: enable simulated optical flow + rangefinder (load, then reboot). |
 | `sitl_flow_phaseB.parm` | SITL: configure flow/rangefinder + point the EKF at flow, GPS off (load after phase A reboot). |
-| `gps_denied_sitl.parm`  | *(capture after a working indoor run)* the full GPS-denied param set. |
+| `gps_denied_sitl.parm`  | *(capture after a working indoor run)* indoor set with GPS still ON (Phase 2). |
+| `gps_off_sitl.parm`     | *(capture after a Phase 3 run)* indoor set with GPS truly OFF (`GPS1_TYPE 0`) + `set_origin`. |
 
 > `default.parm` is captured during validation, not hand-written. The list below
 > documents the parameters our companion code relies on, so you know what must be
@@ -23,8 +24,13 @@ Set at runtime by the code (you do **not** need to pre-set these):
 
 | Parameter         | Value | Set by                          | Why                                                              |
 |-------------------|-------|---------------------------------|------------------------------------------------------------------|
+| `FENCE_TYPE`      | `1`   | `failsafe.setup_geofence()`     | Altitude-only fence (`config.fence_type`) — works without a horizontal position (indoor-safe). |
+| `FENCE_ALT_MAX`   | `4.0` | `failsafe.setup_geofence()`     | Max fence altitude in m (`config.fence_alt_max_m`).              |
 | `FENCE_ENABLE`    | `1`   | `failsafe.setup_geofence()`     | Geofence on before the mission (`config.geofence_enable`).       |
 | `SERVO9_FUNCTION` | `0`   | `drone.configure_drop_servo()`  | "Disabled" = MAVLink/mission-controlled, so `DO_SET_SERVO` works for the drop (`config.drop_servo`). |
+
+Indoors the companion also sends `SET_GPS_GLOBAL_ORIGIN` (a message, not a parameter)
+when `config.set_origin_on_start` is set — see Phase 3 in the roadmap.
 
 Assumed present / worth setting on the FC side (independent of the companion
 failsafe — both should coexist):
@@ -91,8 +97,9 @@ Notes:
   `RNGFND1_SCALING` 12.12 — overriding it breaks the rangefinder).
 - We do **not** disable GPS. The EKF uses optical flow for horizontal position/velocity
   (`EK3_SRC1_POSXY 0`, `VELXY 5`); GPS only provides the origin/home so the geofence and
-  the "waiting for home" pre-arm are satisfied. (For a *truly* GPS-denied test, set
-  `GPS1_TYPE 0` — but then expect to handle home/fence separately.)
+  the "waiting for home" pre-arm are satisfied. (For a *truly* GPS-denied test — Phase 3
+  — set `GPS1_TYPE 0` and `config.set_origin_on_start = True`; the companion then sets the
+  origin itself and uses the altitude-only fence. Capture that as `gps_off_sitl.parm`.)
 
 After the second reboot, wait until the EKF reports a relative position estimate, then
 run `python main.py` (with `config.gps_denied = True`). Once it flies, capture the

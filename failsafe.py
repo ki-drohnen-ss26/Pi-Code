@@ -32,9 +32,17 @@ class FailsafeMonitor:
     # Geofence (set once before the mission)
     # ------------------------------------------------------------------
     def setup_geofence(self) -> None:
-        if self.config.geofence_enable:
-            self.drone.set_param("FENCE_ENABLE", 1)
-            log.info("[FAILSAFE] Geofence enabled (FENCE_ENABLE=1)")
+        if not self.config.geofence_enable:
+            return
+        # Set the fence TYPE first (default 1 = max-altitude only, which works without a
+        # horizontal position estimate - indoor-safe), then the altitude, then enable.
+        self.drone.set_param("FENCE_TYPE", self.config.fence_type)
+        self.drone.set_param("FENCE_ALT_MAX", self.config.fence_alt_max_m)
+        self.drone.set_param("FENCE_ENABLE", 1)
+        log.info(
+            f"[FAILSAFE] Geofence enabled (type={self.config.fence_type}, "
+            f"alt_max={self.config.fence_alt_max_m} m)"
+        )
 
     # ------------------------------------------------------------------
     # Phase timeout

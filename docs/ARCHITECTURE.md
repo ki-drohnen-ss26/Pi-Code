@@ -26,6 +26,7 @@ flowchart TB
         mock["MockCamera"]
         scripted["ScriptedCamera"]
         sim["SimCamera"]
+        timed["TimedCamera"]
         real["RealCamera — Phase 4"]
     end
 
@@ -50,8 +51,8 @@ flowchart TB
 |-----------|----------------|
 | `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The single line that differs SITL vs Pi lives here. |
 | `Config` | All parameters + the `connection_string`. `Config.sitl()` vs `Config.pi_serial()`. |
-| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat, telemetry, mode/arm/takeoff/goto/RTL, body-frame nudges, servo drop. Hardware-agnostic. |
-| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera` now; `RealCamera` (AI camera) later — same contract, so the mission never changes. |
+| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat, telemetry, set EKF origin, mode/arm/takeoff/goto/goto_local/RTL, body-frame nudges, servo drop. Hardware-agnostic. |
+| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera`/`TimedCamera` now; `RealCamera` (AI camera) later — same contract, so the mission never changes. Chosen by `config.camera_source`. |
 | `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout. Returns a reason string; the mission decides to ABORT. |
 | `DeliveryMission` | The state machine that sequences the delivery and runs the failsafe check before each state. |
 | `logbook` | Configures logging to console + a timestamped file under `logs/`. |
@@ -169,6 +170,10 @@ sequenceDiagram
 
     note over Mis: IDLE
     Mis->>FS: setup_geofence()
+    FS->>Dr: set_param("FENCE_TYPE", 1)
+    Dr->>FC: PARAM_SET FENCE_TYPE=1
+    FS->>Dr: set_param("FENCE_ALT_MAX", fence_alt_max_m)
+    Dr->>FC: PARAM_SET FENCE_ALT_MAX
     FS->>Dr: set_param("FENCE_ENABLE", 1)
     Dr->>FC: PARAM_SET FENCE_ENABLE=1
     Mis->>Dr: configure_drop_servo()
@@ -231,13 +236,15 @@ machine, same components, same `Camera` interface as sequence 1 — only the nav
 differs.
 
 **Unchanged from sequence 1:** `connect()` / heartbeat, the failsafe `check()` before
-every state, all of IDLE (geofence, drop servo, GUIDED, arm), TAKEOFF, and the final
-DROP → RTL block. Those calls are identical, so they are not redrawn below.
+every state, the rest of IDLE (geofence, drop servo, GUIDED, arm), TAKEOFF, and the final
+DROP → RTL block. Those calls are identical, so they are not redrawn below. (IDLE also
+gains the optional `set_origin()` — see the Changed table.)
 
 **Changed from sequence 1:**
 
 | Step | Sequence 1 (GPS) | Sequence 2 (no GPS) |
 |------|------------------|----------------------|
+| Pre-flight (IDLE) | — | (optional) `set_origin()` → `SET_GPS_GLOBAL_ORIGIN` when `set_origin_on_start`, since there is no GPS to seed the EKF origin/home |
 | Pre-arm | `wait_ready_to_arm()` → `EKF_POS_HORIZ_ABS` | `wait_ready_to_arm(require_abs=False)` → `EKF_POS_HORIZ_REL` |
 | Go to target | `ENROUTE`: `goto(lat, lon)` (global) | `SEARCH`: `make_search_pattern` + `goto_local(north, east)` (local NED) + camera polling |
 | Centre & drop | `OVER_TARGET`: `move_body_offset` until centred | `APPROACH`: same `move_body_offset`, but falls back to `SEARCH` if the target is lost |

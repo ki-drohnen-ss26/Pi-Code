@@ -16,7 +16,7 @@ navigation) from silently breaking the mission flow.
 
 import pytest
 
-from camera import MockCamera, ScriptedCamera, SimCamera
+from camera import MockCamera, ScriptedCamera, SimCamera, TimedCamera
 from config import Config
 from failsafe import FailsafeMonitor
 from mission import DeliveryMission, State
@@ -115,6 +115,9 @@ class FakeDrone:
     def wait_arrival(self, lat, lon, radius_m, timeout=60.0):
         self.calls.append(("wait_arrival",))
         return self.arrival_ok
+
+    def set_origin(self, lat, lon, alt):
+        self.calls.append(("set_origin", lat, lon, alt))
 
     def get_local_position(self, timeout=2.0):
         return {"north": self._north, "east": self._east, "down": -2.0}
@@ -319,3 +322,68 @@ def test_indoor_target_not_found_aborts_home():
     assert mission.abort_reason == "TARGET_NOT_FOUND"
     assert "drop" not in drone.actions()
     assert "return_to_launch" in drone.actions()
+
+
+# ----------------------------------------------------------------------
+# Phase 3: EKF origin, indoor geofence, camera-less flight (TimedCamera)
+# ----------------------------------------------------------------------
+def test_set_origin_sent_before_arming_when_enabled():
+    config = Config.sitl()  # gps_denied=True
+    config.set_origin_on_start = True
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    actions = drone.actions()
+    assert "set_origin" in actions
+    assert actions.index("set_origin") < actions.index("arm")
+    assert ("set_origin", config.origin_lat, config.origin_lon, config.origin_alt) in drone.calls
+
+
+def test_no_origin_when_disabled():
+    config = Config.sitl()
+    config.set_origin_on_start = False  # explicit, don't rely on the default
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert "set_origin" not in drone.actions()
+
+
+def test_geofence_sets_altitude_fence():
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert ("set_param", "FENCE_TYPE", config.fence_type) in drone.calls
+    assert ("set_param", "FENCE_ALT_MAX", config.fence_alt_max_m) in drone.calls
+    assert ("set_param", "FENCE_ENABLE", 1) in drone.calls
+
+
+def test_timed_camera_finds_after_time():
+    assert TimedCamera(detected_after_s=1000.0).get_target_offset()["detected"] is False
+    offset = TimedCamera(detected_after_s=0.0).get_target_offset()
+    assert offset["detected"] is True
+    assert offset["dx"] == 0.0 and offset["dy"] == 0.0
+
+
+def test_camera_less_flight_searches_and_drops():
+    """Phase 3 end-to-end: origin set, fly the search pattern, TimedCamera 'finds'
+    immediately, drop — all without a real camera."""
+    config = Config.sitl()
+    config.set_origin_on_start = True
+    drone = FakeDrone(config)
+    camera = TimedCamera(detected_after_s=0.0)
+    mission = _build_mission(drone, config, camera=camera)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    actions = drone.actions()
+    assert "set_origin" in actions
+    assert "goto_local" in actions   # it flew the search pattern
+    assert "drop" in actions

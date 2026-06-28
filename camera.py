@@ -17,6 +17,7 @@ Return format:
 """
 
 import math
+import time
 from typing import Protocol
 
 
@@ -101,3 +102,24 @@ class SimCamera:
             "dy": dn if detected else 0.0,  # north error -> body "forward"
             "distance": dist,
         }
+
+
+class TimedCamera:
+    """Pretends to "find" the target (centred) after `detected_after_s` seconds. There is
+    NO real detection - it lets a real flight exercise the search-pattern flight and the
+    drop mechanism without the AI camera (Phase 3 / camera-less flight test).
+
+    The timer starts on the first call (i.e. when SEARCH first polls), not at
+    construction, so takeoff time does not count.
+    """
+
+    def __init__(self, detected_after_s: float = 20.0):
+        self._after = detected_after_s
+        self._start: float | None = None
+
+    def get_target_offset(self) -> dict:
+        if self._start is None:
+            self._start = time.monotonic()
+        found = (time.monotonic() - self._start) >= self._after
+        # Centred (dx=dy=0): APPROACH drops immediately where the drone currently is.
+        return {"detected": found, "dx": 0.0, "dy": 0.0, "distance": 0.0}
