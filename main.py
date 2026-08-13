@@ -19,6 +19,7 @@ from drone import Drone
 from failsafe import FailsafeMonitor
 from logbook import setup_logging
 from mission import DeliveryMission
+from release import FcServo, PiServo
 
 
 def make_camera(config: Config, drone: Drone):
@@ -43,6 +44,20 @@ def make_camera(config: Config, drone: Drone):
     raise ValueError(f"Unknown camera_source '{config.camera_source}'")
 
 
+def make_release(config: Config, drone: Drone):
+    """Build the ReleaseMechanism selected by config.release_mechanism.
+
+    "fc" -> FcServo (drop servo on an FC output, over MAVLink; SITL / tests)
+    "pi" -> PiServo (drop servo on a Raspberry Pi GPIO pin, PWM from the Pi)
+    """
+    mech = config.release_mechanism.lower()
+    if mech == "fc":
+        return FcServo(drone, config)
+    if mech == "pi":
+        return PiServo(config)
+    raise ValueError(f"Unknown release_mechanism '{config.release_mechanism}'")
+
+
 def main() -> None:
     # --- choose configuration ---
     # config = Config.sitl(port=14551)    # NOTE: Since QGroundControl takes 14550, we need to add 14551 at runtime
@@ -64,8 +79,9 @@ def main() -> None:
     # --- assemble the components ---
     # Every camera implements the same interface (get_target_offset); config picks one.
     camera = make_camera(config, drone)
+    release = make_release(config, drone)
     failsafe = FailsafeMonitor(drone, config)
-    mission = DeliveryMission(drone, camera, failsafe, config)
+    mission = DeliveryMission(drone, camera, failsafe, config, release)
 
     # --- start the mission ---
     mission.run()

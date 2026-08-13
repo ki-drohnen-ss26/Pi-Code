@@ -25,6 +25,7 @@ from camera import Camera
 from config import Config
 from drone import Drone
 from failsafe import FailsafeMonitor
+from release import ReleaseMechanism
 from search import make_search_pattern
 
 log = logging.getLogger(__name__)
@@ -44,11 +45,13 @@ class State(Enum):
 
 
 class DeliveryMission:
-    def __init__(self, drone: Drone, camera: Camera, failsafe: FailsafeMonitor, config: Config):
+    def __init__(self, drone: Drone, camera: Camera, failsafe: FailsafeMonitor,
+                 config: Config, release: ReleaseMechanism):
         self.drone = drone
         self.camera = camera
         self.failsafe = failsafe
         self.config = config
+        self.release = release
         self.state = State.IDLE
         self.abort_reason = None
 
@@ -95,8 +98,8 @@ class DeliveryMission:
                 self.config.origin_lat, self.config.origin_lon, self.config.origin_alt
             )
         self.failsafe.setup_geofence()
-        self.drone.configure_drop_servo()
-        self.drone.reset_servo()
+        self.release.setup()
+        self.release.reset()
 
         # Indoor (GPS-denied) needs only the RELATIVE EKF position (optical flow);
         # outdoor needs the ABSOLUTE one (GPS).
@@ -273,16 +276,15 @@ class DeliveryMission:
         return max(-limit, min(limit, value))
 
     def _drop(self) -> State:
-        """Perform the release and verify it via the read-back servo value."""
-        self.drone.drop()
+        """Perform the release and verify it (FC: servo read-back; Pi: open-loop)."""
+        self.release.drop()
         time.sleep(0.5)  # brief wait so the new value reaches the telemetry
-        value = self.drone.read_servo(expected=self.config.drop_pwm)
-        if value is not None and abs(value - self.config.drop_pwm) <= 50:
+        if self.release.confirm():
             log.info("[DROP] Release confirmed")
         else:
-            log.warning("[DROP] servo value not as expected")
+            log.warning("[DROP] release not confirmed")
         time.sleep(1.0)
-        self.drone.reset_servo()
+        self.release.reset()
         self.failsafe.start_phase("RTL")
         return State.RTL
 

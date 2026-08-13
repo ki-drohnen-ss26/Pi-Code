@@ -27,7 +27,7 @@ Everything else (drone / mission / failsafe / camera) is identical.
 | Pre-arm | GPS/EKF converge in seconds | real GPS fix / EKF / compass must be healthy |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
 | Camera | Mock / Sim / Timed | RealCamera (AI camera) |
-| Drop servo | values just echoed back | real servo — **calibrate PWM, test on bench** |
+| Drop servo | `FcServo` (FC output, value echoed back) | `PiServo` (servo on Pi GPIO) — **calibrate PWM, test on bench** |
 
 ## 1. Physical connection
 Pi UART (GPIO TX/RX) ↔ FC TELEM port: **TX↔RX crossed, common GND**. Or a USB-UART
@@ -109,12 +109,31 @@ with `ScriptedCamera`, then re-verify on the real camera (mounting may differ).
 > this mapping trivial and is the recommended starting point; a forward tilt helps the
 > search but complicates centring. See [ROADMAP.md](ROADMAP.md) Phase 2/4.
 
-## 4. Drop servo calibration
-`config.drop_pwm` / `config.neutral_pwm` are raw PWM values. On real hardware:
-- Test on the **bench, no props**: does `neutral_pwm` hold the hatch closed and
-  `drop_pwm` open it cleanly?
-- Adjust the values to the actual servo + mechanism. `SERVO9_FUNCTION = 0` keeps the
-  output MAVLink-controlled (set automatically by `configure_drop_servo()`).
+## 4. Drop servo: where it is wired + calibration
+The release lives behind the `ReleaseMechanism` protocol (`release.py`), selected by
+`config.release_mechanism`, so the mission logic is identical either way:
+
+| `release_mechanism` | Implementation | Servo wired to | Signal path |
+|---------------------|----------------|----------------|-------------|
+| `"fc"` (SITL / tests) | `FcServo` | a flight-controller AUX output (`SERVO9`) | Pi → MAVLink `DO_SET_SERVO` → FC → servo |
+| `"pi"` (our indoor build) | `PiServo` | a **Raspberry Pi GPIO pin** (`config.drop_gpio_pin`, BCM, default 18) | Pi generates the PWM directly; the FC is not involved |
+
+**Our build uses `"pi"`** — the servo hangs off the Pi. On the Pi:
+- Install the GPIO libs: `pip install gpiozero pigpio`. For jitter-free pulses run the
+  pigpio daemon (`sudo apt install pigpio && sudo systemctl enable --now pigpiod`) and
+  export `GPIOZERO_PIN_FACTORY=pigpio`; otherwise gpiozero uses software PWM and the
+  servo may twitch.
+- **Power the servo from a separate 5 V BEC, not the Pi's 5 V pin** — stall/inrush
+  current can brown out a Pi Zero 2 W. Only the **signal** wire goes to the GPIO pin,
+  with a **common ground** between the BEC and the Pi.
+- The Pi release is **open-loop** (no servo read-back), so `confirm()` trusts the pulse.
+  SITL still verifies the drop via the FC read-back on the `"fc"` path.
+
+Calibration (either path), on the **bench, no props**:
+- Does `config.neutral_pwm` hold the hatch closed and `config.drop_pwm` open it cleanly?
+  Adjust the raw PWM values (µs) to the actual servo + mechanism.
+- `"fc"` only: `SERVO9_FUNCTION = 0` keeps the FC output MAVLink-controlled (set
+  automatically by `FcServo.setup()` → `configure_drop_servo()`). Not needed for `"pi"`.
 
 ## 5. Link loss: companion vs flight controller
 - Our **`LINK_LOSS`** = the **Pi stops receiving heartbeats from the FC** (UART dead /

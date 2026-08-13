@@ -30,29 +30,40 @@ flowchart TB
         real["RealCamera — Phase 4"]
     end
 
+    subgraph rel["ReleaseMechanism — Protocol, release.py"]
+        fcservo["FcServo — servo on FC"]
+        piservo["PiServo — servo on Pi GPIO"]
+    end
+    gpio[("Pi GPIO pin → drop servo")]
+
     main --> logb
     main --> cfg
     main --> drone
     main --> cam
+    main --> rel
     main --> fs
     main --> mission
 
     mission --> drone
     mission --> cam
+    mission --> rel
     mission --> fs
     mission -.->|reads| cfg
     fs --> drone
     fs -.->|reads| cfg
     drone -.->|reads| cfg
     drone <-->|"MAVLink: UDP in SITL, UART on Pi"| fc
+    fcservo -->|"DO_SET_SERVO"| drone
+    piservo -->|"PWM"| gpio
 ```
 
 | Component | Responsibility |
 |-----------|----------------|
 | `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The single line that differs SITL vs Pi lives here. |
 | `Config` | All parameters + the `connection_string`. `Config.sitl()` vs `Config.pi_serial()`. |
-| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat, telemetry, set EKF origin, mode/arm/takeoff/goto/goto_local/RTL, body-frame nudges, servo drop. Hardware-agnostic. |
+| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat, telemetry, set EKF origin, mode/arm/takeoff/goto/goto_local/RTL, body-frame nudges, FC servo helpers. Hardware-agnostic. |
 | `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera`/`TimedCamera` now; `RealCamera` (AI camera) later — same contract, so the mission never changes. Chosen by `config.camera_source`. |
+| `ReleaseMechanism` | A `Protocol` (`setup/reset/drop/confirm`) for the payload drop. `FcServo` drives a servo on an FC output over MAVLink (SITL); `PiServo` drives a servo on a Pi GPIO pin directly. Chosen by `config.release_mechanism` — the mission never changes. |
 | `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout. Returns a reason string; the mission decides to ABORT. |
 | `DeliveryMission` | The state machine that sequences the delivery and runs the failsafe check before each state. |
 | `logbook` | Configures logging to console + a timestamped file under `logs/`. |
@@ -153,12 +164,13 @@ sequenceDiagram
     participant FS as FailsafeMonitor
     participant Dr as Drone
     participant Cam as Camera
+    participant Rel as ReleaseMechanism
     participant FC as FC / SITL
 
     Main->>Dr: Drone(config).connect()
     Dr->>FC: wait_heartbeat()
     Dr->>FC: request_data_streams(rate_hz=4)
-    Main->>Mis: DeliveryMission(drone, camera, failsafe, config).run()
+    Main->>Mis: DeliveryMission(drone, camera, failsafe, config, release).run()
 
     note over Mis,FS: before EVERY state
     Mis->>FS: check()
@@ -176,10 +188,11 @@ sequenceDiagram
     Dr->>FC: PARAM_SET FENCE_ALT_MAX
     FS->>Dr: set_param("FENCE_ENABLE", 1)
     Dr->>FC: PARAM_SET FENCE_ENABLE=1
-    Mis->>Dr: configure_drop_servo()
+    Mis->>Rel: setup()  (FcServo)
+    Rel->>Dr: configure_drop_servo()
     Dr->>FC: PARAM_SET SERVO9_FUNCTION=0
-    Mis->>Dr: reset_servo()
-    Dr->>FC: MAV_CMD_DO_SET_SERVO(9, neutral_pwm)
+    Mis->>Rel: reset()
+    Rel->>Dr: reset_servo() → MAV_CMD_DO_SET_SERVO(9, neutral_pwm)
     Mis->>Dr: wait_ready_to_arm(require_abs=True)
     Dr->>FC: read EKF_STATUS_REPORT until EKF_POS_HORIZ_ABS
     Mis->>Dr: set_mode("GUIDED")
@@ -204,13 +217,13 @@ sequenceDiagram
     Mis->>Dr: move_body_offset(forward, right)
     Dr->>FC: SET_POSITION_TARGET_LOCAL_NED (BODY_OFFSET)
 
-    note over Mis: DROP
-    Mis->>Dr: drop()
-    Dr->>FC: MAV_CMD_DO_SET_SERVO(9, drop_pwm=1900)
-    Mis->>Dr: read_servo(expected=drop_pwm)
-    Dr->>FC: read SERVO_OUTPUT_RAW
-    Mis->>Dr: reset_servo()
-    Dr->>FC: MAV_CMD_DO_SET_SERVO(9, neutral_pwm)
+    note over Mis: DROP (release_mechanism="fc"; "pi" drives a Pi GPIO instead)
+    Mis->>Rel: drop()
+    Rel->>Dr: drop() → MAV_CMD_DO_SET_SERVO(9, drop_pwm=1900)
+    Mis->>Rel: confirm()
+    Rel->>Dr: read_servo(expected=drop_pwm) → read SERVO_OUTPUT_RAW
+    Mis->>Rel: reset()
+    Rel->>Dr: reset_servo() → MAV_CMD_DO_SET_SERVO(9, neutral_pwm)
 
     note over Mis: RTL
     Mis->>Dr: return_to_launch()
@@ -236,9 +249,14 @@ machine, same components, same `Camera` interface as sequence 1 — only the nav
 differs.
 
 **Unchanged from sequence 1:** `connect()` / heartbeat, the failsafe `check()` before
-every state, the rest of IDLE (geofence, drop servo, GUIDED, arm), TAKEOFF, and the final
-DROP → RTL block. Those calls are identical, so they are not redrawn below. (IDLE also
-gains the optional `set_origin()` — see the Changed table.)
+every state, the rest of IDLE (geofence, release `setup()`/`reset()`, GUIDED, arm),
+TAKEOFF, and the final DROP → RTL block — the mission calls are identical, so they are not
+redrawn below. (IDLE also gains the optional `set_origin()` — see the Changed table.)
+
+> The drop still goes through the `ReleaseMechanism` protocol, but on the **real indoor
+> build** `config.release_mechanism = "pi"`, so `PiServo` drives the servo on a Pi GPIO
+> pin (PWM from the Pi) instead of `FcServo`'s `DO_SET_SERVO` to the FC. The mission code
+> is the same; only the wired implementation differs.
 
 **Changed from sequence 1:**
 

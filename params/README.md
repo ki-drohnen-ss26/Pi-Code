@@ -27,7 +27,7 @@ Set at runtime by the code (you do **not** need to pre-set these):
 | `FENCE_TYPE`      | `1`   | `failsafe.setup_geofence()`     | Altitude-only fence (`config.fence_type`) — works without a horizontal position (indoor-safe). |
 | `FENCE_ALT_MAX`   | `4.0` | `failsafe.setup_geofence()`     | Max fence altitude in m (`config.fence_alt_max_m`).              |
 | `FENCE_ENABLE`    | `1`   | `failsafe.setup_geofence()`     | Geofence on before the mission (`config.geofence_enable`).       |
-| `SERVO9_FUNCTION` | `0`   | `drone.configure_drop_servo()`  | "Disabled" = MAVLink/mission-controlled, so `DO_SET_SERVO` works for the drop (`config.drop_servo`). |
+| `SERVO9_FUNCTION` | `0`   | `drone.configure_drop_servo()`  | "Disabled" = MAVLink/mission-controlled, so `DO_SET_SERVO` works for the drop (`config.drop_servo`). **Only for `release_mechanism="fc"` (SITL);** the real build uses `"pi"` (servo on a Pi GPIO), where the FC has no drop servo. |
 
 Indoors the companion also sends `SET_GPS_GLOBAL_ORIGIN` (a message, not a parameter)
 when `config.set_origin_on_start` is set — see Phase 3 in the roadmap.

@@ -20,6 +20,7 @@ from camera import MockCamera, ScriptedCamera, SimCamera, TimedCamera
 from config import Config
 from failsafe import FailsafeMonitor
 from mission import DeliveryMission, State
+from release import FcServo
 
 
 class FakeDrone:
@@ -161,7 +162,8 @@ def _no_sleep(monkeypatch):
 def _build_mission(drone: FakeDrone, config: Config, camera=None) -> DeliveryMission:
     camera = camera or MockCamera()  # target detected dead-centre by default
     failsafe = FailsafeMonitor(drone, config)  # the REAL failsafe, fed by FakeDrone
-    return DeliveryMission(drone, camera, failsafe, config)
+    release = FcServo(drone, config)  # FC servo path; FakeDrone provides the servo calls
+    return DeliveryMission(drone, camera, failsafe, config, release)
 
 
 def test_happy_path_runs_to_done_and_delivers():
@@ -369,6 +371,19 @@ def test_timed_camera_finds_after_time():
     offset = TimedCamera(detected_after_s=0.0).get_target_offset()
     assert offset["detected"] is True
     assert offset["dx"] == 0.0 and offset["dy"] == 0.0
+
+
+def test_piservo_pulse_mapping_clamps_to_unit_range():
+    """PiServo maps microsecond pulses onto gpiozero's [-1, 1], clamped. This runs
+    without gpiozero (only the pure mapping is exercised)."""
+    from release import PiServo
+    assert PiServo._pw_to_value(1500) == 0.0    # centre
+    assert PiServo._pw_to_value(1000) == -1.0   # min band
+    assert PiServo._pw_to_value(2000) == 1.0    # max band
+    assert PiServo._pw_to_value(1100) == pytest.approx(-0.8)
+    assert PiServo._pw_to_value(1900) == pytest.approx(0.8)
+    assert PiServo._pw_to_value(2500) == 1.0    # above band -> clamped
+    assert PiServo._pw_to_value(500) == -1.0    # below band -> clamped
 
 
 def test_camera_less_flight_searches_and_drops():

@@ -14,6 +14,7 @@ The only difference is the `connection_string` in `config.py`.
 | `camera.py`      | Camera interface: `MockCamera`, `ScriptedCamera`, `SimCamera`, `TimedCamera` |
 | `failsafe.py`    | Link loss, telemetry loss, battery, phase timeout, geofence |
 | `mission.py`     | State machine — GPS path + indoor SEARCH/APPROACH path      |
+| `release.py`     | Drop mechanism: `FcServo` (servo on FC) / `PiServo` (servo on Pi GPIO) |
 | `search.py`      | Search patterns (expanding spiral / lawnmower) in local NED |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |
