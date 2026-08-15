@@ -56,35 +56,44 @@ adapter to the FC.
   optical flow), and navigation uses `goto_local()` (local NED) instead of `goto()`
   (lat/lon). On the real drone this runs on the MTF-01P.
 
-  **To validate the indoor path in SITL** load the two ready-made overlays (values
-  match ArduPilot's own `copter-optflow.parm`), each followed by a reboot — see
-  `../params/README.md`:
+  **To validate the indoor path in SITL** load the three ready-made overlays, each
+  followed by a reboot — see `../params/README.md` for what each one does and why:
 
   ```
-  param load .../params/sitl_flow_phaseA.parm   # RNGFND1_TYPE, SIM_FLOW_ENABLE, FLOW_TYPE
+  param load .../params/sitl_flow_phaseA.parm   # sensors on + SIM_TERRAIN 0
   reboot
-  param load .../params/sitl_flow_phaseB.parm   # RNGFND1_PIN/SCALING/MIN/MAX, EK3_SRC1_* = flow
-  reboot                                         # 2nd reboot REQUIRED (rangefinder reads PIN on boot)
+  param load .../params/sitl_flow_phaseB.parm   # limits + EKF sources = optical flow
+  reboot
+  param load .../params/sitl_gps_off.parm       # GPS truly off (Phase 3)
+  reboot
   ```
-  Pitfalls we hit: don't override `SIM_SONAR_SCALE` (default 12.1212 matches
-  `RNGFND1_SCALING`), and the rangefinder is only detected after the second reboot.
+  Start the simulator at the same coordinates the companion uses as its EKF origin
+  (`--custom-location=50.131196,8.692972,112,0`), otherwise pre-arm fails with
+  *"Check mag field"*. The two pitfalls that cost us the most time are documented in
+  `../params/README.md`: `SIM_TERRAIN` must be 0 (otherwise the rangefinder reads a
+  constant 0.00 m and optical flow silently cannot be scaled), and parameter names
+  differ between 4.6 and 4.7.
 
-  **GPS stays ON in SITL** as a shortcut: it only seeds the EKF origin/home so the
-  geofence and "waiting for home" pre-arm pass. The actual XY position/velocity still
-  come from optical flow (`EK3_SRC1_POSXY=0`, `VELXY=5`), so the flow navigation is
-  genuinely exercised. Once it flies, capture the working set into
-  `../params/gps_denied_sitl.parm`.
+  Verified working on **ArduCopter 4.6.3** — the same release our flight controller
+  runs. `sitl_indoor_463.parm` is the captured state of that green run — load it to get
+  straight back to a known-good simulator.
 
   **Real hardware (no GPS reception) — handled in Phase 3:** indoors there is no GPS to
   set the origin/home, so the companion does it itself:
   - **EKF origin without GPS** — set `config.set_origin_on_start = True` (+ `origin_lat`/
     `origin_lon`/`origin_alt`). `_idle` then calls `Drone.set_origin()` →
     `SET_GPS_GLOBAL_ORIGIN` before arming, so `LOCAL_POSITION_NED`, home and
-    `goto_local()` have a reference. (Leave it `False` in SITL while GPS is still on — it
-    seeds the origin itself.) Set `origin_lat`/`origin_lon` to the **real hall** coordinate
-    so the magnetic declination matches; for SITL, launch the sim at the same spot
-    (`sim_vehicle.py ... --custom-location=lat,lon,alt,0`) or expect a few-degrees yaw
-    offset (the mission still works — the local frame is just rotated).
+    `goto_local()` have a reference. Our SITL setup now runs GPS-off too
+    (`sitl_gps_off.parm`), so this path is exercised there as well; `set_origin()` reads
+    the origin back and warns if the autopilot kept a different one. Set
+    `origin_lat`/`origin_lon` to the **real hall** coordinate
+    so the magnetic declination matches. For SITL you **must** launch the sim at the same
+    spot (`sim_vehicle.py ... --custom-location=lat,lon,alt,0`) — the simulated compass is
+    modelled at the SITL home, so a mismatch is not a small yaw
+    offset but a hard pre-arm block: *"PreArm: Check mag field (z diff:976>200)"*. The
+    976 mGauss is exactly the difference between the northern and southern hemisphere
+    (Frankfurt vs the default home at CMAC, Canberra). Also set `SIM_TERRAIN 0` when you
+    use `--custom-location` — see `../params/README.md`.
   - **Geofence** — `setup_geofence()` sets an **altitude-only** fence by default
     (`fence_type = 1`, `fence_alt_max_m`), which needs no horizontal position. Size
     `fence_alt_max_m` to the flight, or set `config.geofence_enable = False` indoors.

@@ -28,6 +28,7 @@ SITL and, later, on the real FC.
 | `sitl_flow_phaseA.parm` | 4.6.x | SITL: enable simulated optical flow + rangefinder (load, then reboot). |
 | `sitl_flow_phaseB.parm` | 4.6.x | SITL: configure flow/rangefinder + point the EKF at flow (load after phase A reboot, then reboot again). |
 | `sitl_gps_off.parm`     | 4.6.x | SITL: GPS truly off (`GPS1_TYPE 0`) + an `ARMING_CHECK` mask without the GPS bit (Phase 3). |
+| `sitl_indoor_463.parm`  | 4.6.3 | **Restore point.** Full dump captured from the first fully green indoor mission on 4.6.3. Load this to get back to a known-good state in one step. |
 | `default.parm` | 4.8.0-dev | *Historical.* Full dump from the old master-branch SITL. **Not loadable on 4.6.3.** |
 | `gps_denied_sitl.parm`  | 4.8.0-dev | *Historical*, indoor set with GPS still ON (Phase 2). |
 | `gps_off_sitl.parm`     | 4.8.0-dev | *Historical*, indoor set with GPS off (Phase 3). |
@@ -38,7 +39,7 @@ also contain the SITL airframe's PID tuning, which must **never** go onto the re
 aircraft. A fresh baseline captured from the real FC is still missing and is the most
 valuable file this folder could have.
 
-> `default.parm` is captured during validation, not hand-written. The list below
+> Full dumps are captured from a working run, not hand-written. The list below
 > documents the parameters our companion code relies on, so you know what must be
 > present in any baseline.
 
@@ -73,23 +74,33 @@ failsafe — both should coexist):
 Phase 5 extends this baseline with the MTF-01P (rangefinder + optical-flow serial
 protocol) and the Pi TELEM-port parameters.
 
-## Capture the baseline from SITL (Phase 1)
+## Capture a baseline
 
-With SITL running (`sim_vehicle.py -v ArduCopter --console`), in the MAVProxy
-console:
+After a run that actually flew, capture the working set so it can be restored:
 
 ```
 param fetch
-param save default.parm
+param save sitl_indoor_463.parm
 ```
 
-The file lands in MAVProxy's working directory — copy it here as
-`params/default.parm`.
+The file lands in MAVProxy's working directory (`Simulation/ardupilot/`) — copy it here.
+MAVProxy also keeps a live cache in `mav.parm` in the same directory, which is usually
+already up to date.
+
+`sitl_indoor_463.parm` in this folder is such a capture: the state of the **first fully
+green indoor mission on 4.6.3** (origin set by the companion, GPS off, optical flow +
+rangefinder, search → approach → drop → land). It includes the three parameters the
+companion sets at runtime (`FENCE_ACTION`, `RTL_ALT`, `WPNAV_SPEED_UP`), which is
+intentional — it is a restore point for a known-good run, not a minimal overlay.
 
 ## Restore a baseline
 
-- **MAVProxy:** `param load default.parm`
+- **MAVProxy:** `param load sitl_indoor_463.parm` (the known-good indoor state), then
+  `reboot`
 - **QGroundControl:** Vehicle Setup → Parameters → Tools → *Load from file*
+
+Check the firmware version first — a dump only loads cleanly onto the release it was
+taken from (see the warning at the top).
 
 ## Reset SITL to firmware defaults (clean slate)
 
@@ -105,31 +116,52 @@ sim_vehicle.py -v ArduCopter --console -w
 
 ## Configure SITL for the MTF-01P stand-in (optical flow + LiDAR)
 
-Load the two overlays instead of typing params one by one — this avoids the
-paste/garbling problems of multi-line input in the MAVProxy console. The values match
-ArduPilot's own `Tools/autotest/default_params/copter-optflow.parm`.
+Load the three overlays instead of typing parameters one by one — this avoids the
+paste/garbling problems of multi-line input in the MAVProxy console. Reboot after each,
+and wait for MAVProxy to reconnect before the next:
 
 ```
 param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_flow_phaseA.parm
 reboot
-# wait for reconnect, then:
 param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_flow_phaseB.parm
+reboot
+param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_gps_off.parm
 reboot
 ```
 
-**The second reboot is required** — the analog rangefinder backend only picks up
-`RNGFND1_PIN` on the next boot, otherwise pre-arm reports *"Rangefinder 1: Not
-Detected"*.
+Why three, and why the reboots:
 
-Notes:
-- We do **not** set `SIM_SONAR_SCALE` (its default 12.1212 already matches
-  `RNGFND1_SCALING` 12.12 — overriding it breaks the rangefinder).
-- We do **not** disable GPS. The EKF uses optical flow for horizontal position/velocity
-  (`EK3_SRC1_POSXY 0`, `VELXY 5`); GPS only provides the origin/home so the geofence and
-  the "waiting for home" pre-arm are satisfied. (For a *truly* GPS-denied test — Phase 3
-  — set `GPS1_TYPE 0` and `config.set_origin_on_start = True`; the companion then sets the
-  origin itself and uses the altitude-only fence. Capture that as `gps_off_sitl.parm`.)
+| Overlay | What it does | Why it needs its own reboot |
+|---|---|---|
+| `phaseA` | `RNGFND1_TYPE 100`, `FLOW_TYPE`, `SIM_FLOW_ENABLE`, **`SIM_TERRAIN 0`** | the `RNGFND1_*` sub-parameters only come into existence once `RNGFND1_TYPE` is set and the FC reboots |
+| `phaseB` | rangefinder limits, EKF sources → optical flow, `EK3_SRC_OPTIONS 0` | the rangefinder backend is only re-read on boot |
+| `sitl_gps_off` | `GPS1_TYPE 0`, `ARMING_CHECK` without the GPS bit | GPS is torn down on boot |
 
-After the second reboot, wait until the EKF reports a relative position estimate, then
-run `python main.py` (with `config.gps_denied = True`). Once it flies, capture the
-working set: `param fetch` → `param save gps_denied_sitl.parm` → copy it here.
+**`SIM_TERRAIN 0` is the one that is easy to miss and impossible to debug.** With terrain
+enabled, SITL measures the rangefinder against a terrain model anchored at
+`SIM_OPOS_ALT` — default **584 m, the altitude of the default SITL home at CMAC** — and
+`--custom-location` does *not* change it. Start the simulator in Frankfurt (112 m) and
+the vehicle sits ~470 m below the modelled ground, so the rangefinder reports a constant
+**0.00 m** with no warning. Optical flow then cannot be scaled into a velocity and the
+position estimate drifts away (we measured 366 m of drift while the vehicle stood still),
+waypoints are never reached and altitude control oscillates.
+
+We use `RNGFND1_TYPE 100` ("SITL", the simulator's native backend) rather than type 1
+("Analog") from ArduPilot's `copter-optflow.parm`. Type 1 emulates a voltage on an ADC
+pin which the driver converts back via `RNGFND1_SCALING`; type 100 skips that round trip.
+Both read zero when `SIM_TERRAIN` is wrong — that is in fact how we found the real cause,
+after first suspecting the driver.
+
+Start SITL at the same coordinates the companion uses as its EKF origin, otherwise
+pre-arm fails with *"Check mag field"* (the simulated compass is modelled at the SITL
+home position):
+
+```
+sim_vehicle.py -v ArduCopter --console --custom-location=50.131196,8.692972,112,0
+```
+
+**Verify before flying:** in QGroundControl's MAVLink Inspector, `DISTANCE_SENSOR` must
+follow the actual altitude. In a dataflash log, `RFND.Dist` must track `CTUN.Alt`. A
+rangefinder reading 0.00 m at every altitude means `SIM_TERRAIN` is still on.
+
+Then run `python main.py` (`config.gps_denied = True`, the default).
