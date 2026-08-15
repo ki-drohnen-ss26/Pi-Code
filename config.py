@@ -1,11 +1,20 @@
 """
 config.py
 =========
-Central configuration. This holds the ONLY difference between "test against
-SITL" and "real flight on the Pi": the connection_string.
+Central configuration. Everything that differs between "test against SITL" and
+"real flight on the Pi" lives HERE and nowhere else - drone.py, mission.py,
+failsafe.py and the state machine are identical either way.
 
-Everything else (drone.py, mission.py, ...) stays exactly the same, whether SITL
-or a real flight controller is behind it.
+Use the convenience constructors at the bottom rather than editing fields by hand;
+they encode the whole SITL/Pi delta:
+
+    Config.sitl()  -> UDP to the simulator, drop servo on an FC output, SITL battery
+    Config.pi()    -> UDP to mavlink-router on the Pi, drop servo on a GPIO pin,
+                      4S Li-Ion battery threshold
+
+(It used to be true that the connection string was the *only* difference. It no
+longer is - the drop servo and the battery pack are genuinely different hardware -
+so the presets exist to keep that difference in one place.)
 """
 
 from dataclasses import dataclass
@@ -58,8 +67,16 @@ class Config:
     # ------------------------------------------------------------------
     # Failsafe / safety
     # ------------------------------------------------------------------
-    battery_min_voltage: float = 10.8   # abort threshold, voltage [V] (3S example)
+    # Abort threshold [V]. NOTE: this depends on the pack and is therefore set by the
+    # convenience constructors, not here: our drone flies 4S Li-Ion (4.1 V/cell full =
+    # 16.4 V, 2.8 V/cell empty = 11.2 V), so a real abort threshold is ~12.8 V. SITL's
+    # simulated pack sits at 12.6 V, which would trip that instantly - Config.sitl()
+    # therefore lowers it. The value below is only the dataclass default.
+    battery_min_voltage: float = 12.8
     battery_min_percent: int = 20       # abort threshold, remaining capacity [%]
+    # A single sagging reading is not an empty battery: Li-Ion dips hard under load.
+    # Only this many consecutive readings below the threshold abort the mission.
+    battery_low_samples: int = 3
     phase_timeout_s: float = 60.0       # max duration per mission phase
     geofence_enable: bool = True        # set FENCE_ENABLE?
     # FENCE_TYPE bitmask. 1 = max altitude only — works WITHOUT a horizontal position,
@@ -71,6 +88,34 @@ class Config:
     fence_alt_max_m: float = 4.0        # max altitude for the fence [m]
     heartbeat_timeout_s: float = 3.0    # no FC heartbeat within this -> LINK_LOSS
     telemetry_max_misses: int = 5       # consecutive missing telemetry reads -> NO_TELEMETRY
+
+    # Abort if the FC leaves this mode. The pilot flipping out of GUIDED, a fence
+    # breach or an EKF failsafe all change the mode behind our back - from that moment
+    # every setpoint we send is ignored, and commanding RTL would OVERRIDE the human.
+    # So we notice and stop sending. Empty string disables the check.
+    expect_mode: str = "GUIDED"
+
+    # ------------------------------------------------------------------
+    # Recovery: what we do after the drop and on every abort
+    # ------------------------------------------------------------------
+    # "land" = descend where we are. Indoors this is almost always right: LAND needs no
+    #          position estimate, no home and no altitude headroom.
+    # "rtl"  = fly back to the launch point. OUTDOOR ONLY - RTL first CLIMBS to RTL_ALT
+    #          before returning, which in a hall means flying into the ceiling.
+    recovery_action: str = "land"
+
+    # ------------------------------------------------------------------
+    # FC-side safety envelope (set + verified by the companion before every flight)
+    # ------------------------------------------------------------------
+    # These are NOT companion logic - they are what the autopilot does on its own when
+    # something goes wrong, and its defaults are made for outdoor flight: FENCE_ACTION
+    # defaults to 1 ("RTL or Land") and RTL climbs to RTL_ALT (default 15 m). We set
+    # them explicitly rather than trusting whatever is stored in the FC.
+    enforce_safety_envelope: bool = True
+    fence_action: int = 2           # 2 = Always Land (1 = RTL or Land -> climbs first)
+    rtl_alt_m: float = 2.0          # RTL altitude [m], in case RTL is triggered anyway
+    climb_rate_cms: float = 50.0    # WPNAV_SPEED_UP [cm/s]. The default 250 overshoots
+                                    # a 2 m takeoff by >2 m and trips a low fence.
 
     # ------------------------------------------------------------------
     # Target alignment (visual servoing over the target before the drop)
@@ -116,6 +161,16 @@ class Config:
     search_area_h_m: float = 6.0     # lawnmower: rectangle height (north) [m]
     detection_cadence: str = "stop_and_look"  # "stop_and_look" (default) or "continuous"
     look_settle_s: float = 0.5       # hover time before detecting at a waypoint [s]
+    # SEARCH needs its own budget: the default spiral has 25 waypoints, so reusing
+    # phase_timeout_s (60 s) for the whole phase aborts long before the pattern is
+    # flown. waypoint_timeout_s bounds a SINGLE leg, search_timeout_s the whole phase.
+    search_timeout_s: float = 300.0
+    waypoint_timeout_s: float = 30.0
+    # Consecutive unreachable waypoints before we give up. Repeatedly missing a
+    # waypoint means the vehicle is not following us (mode changed) or the position
+    # estimate has diverged - flying the rest of the pattern from an unknown place
+    # would only make things worse.
+    search_max_misses: int = 3
 
     # ------------------------------------------------------------------
     # Simulation target (SimCamera pretends the pad is here, local NED [m])
@@ -143,10 +198,41 @@ class Config:
     # ------------------------------------------------------------------
     @classmethod
     def sitl(cls, host: str = "127.0.0.1", port: int = 14550) -> "Config":
-        """Preset for testing against SITL. Use host=0.0.0.0 if SITL runs in a container."""
-        return cls(connection_string=f"udpin:{host}:{port}")
+        """Preset for testing against SITL. Use host=0.0.0.0 if SITL runs in a container.
+
+        Also picks the two settings that genuinely differ from the real aircraft:
+        the drop servo lives on an FC output (there is no GPIO on the Mac), and the
+        battery threshold matches SITL's simulated ~12.6 V pack instead of our 4S
+        Li-Ion. Everything else is identical to the flight configuration on purpose.
+        """
+        return cls(
+            connection_string=f"udpin:{host}:{port}",
+            release_mechanism="fc",
+            battery_min_voltage=10.8,
+        )
+
+    @classmethod
+    def pi(cls, host: str = "127.0.0.1", port: int = 14550) -> "Config":
+        """Preset for the real Raspberry Pi - and yes, this is a UDP link, not a serial one.
+
+        mavlink-router owns /dev/serial0 and forwards the FC stream to
+        127.0.0.1:14550, so the script binds there exactly like it does against SITL.
+        Two processes cannot share the UART, which is why Config.pi_serial() is only
+        for setups WITHOUT a router.
+        """
+        return cls(
+            connection_string=f"udpin:{host}:{port}",
+            release_mechanism="pi",
+            battery_min_voltage=12.8,
+        )
 
     @classmethod
     def pi_serial(cls, device: str = "/dev/serial0", baud: int = 921600) -> "Config":
-        """Preset for the real Pi on the flight controller (UART)."""
-        return cls(connection_string=device, baud=baud)
+        """Preset for a DIRECT UART link to the flight controller, i.e. WITHOUT
+        mavlink-router. Use Config.pi() when the router is running (our setup)."""
+        return cls(
+            connection_string=device,
+            baud=baud,
+            release_mechanism="pi",
+            battery_min_voltage=12.8,
+        )

@@ -37,6 +37,8 @@ class FakeDrone:
         arrival_ok: bool = True,
         disarm_ok: bool = True,
         link_alive_ok: bool = True,
+        origin_ok: bool = True,
+        unknown_params=None,
     ):
         self.config = config
         self.calls: list[tuple] = []
@@ -52,11 +54,26 @@ class FakeDrone:
         self.arrival_ok = arrival_ok
         self.disarm_ok = disarm_ok
         self.link_alive_ok = link_alive_ok
+        self._link_checks = 0
         self._north = 0.0  # local NED position, updated by goto_local / move_body_offset
         self._east = 0.0
+        # Flight mode the FC reports. Tests flip this to simulate the pilot taking over.
+        self.mode = "GUIDED"
+        self.origin_ok = origin_ok
+        # Parameter names the fake FC does NOT know, so tests can exercise the
+        # RTL_ALT / RTL_ALT_M fallback across firmware versions.
+        self.unknown_params = set(unknown_params or ())
 
     # --- used by the failsafe ---
+    def tick(self):
+        self.calls.append(("tick",))
+
+    def get_mode(self):
+        return self.mode
+
     def set_param(self, name, value, timeout=3.0):
+        if name in self.unknown_params:
+            raise TimeoutError(f"No confirmation for parameter {name}")
         self.calls.append(("set_param", name, value))
         return float(value)
 
@@ -68,7 +85,12 @@ class FakeDrone:
         return self._battery
 
     def link_alive(self, timeout=3.0):
-        return self.link_alive_ok
+        # bool = constant. int = this many checks succeed, then the link dies, which
+        # lets a test lose the link mid-flight instead of before arming.
+        if isinstance(self.link_alive_ok, bool):
+            return self.link_alive_ok
+        self._link_checks += 1
+        return self._link_checks <= self.link_alive_ok
 
     def move_body_offset(self, forward, right, down=0.0):
         # yaw=0 assumption: body forward=north, body right=east
@@ -89,6 +111,7 @@ class FakeDrone:
         return self.ready_ok
 
     def set_mode(self, mode_name, timeout=5.0):
+        self.mode = mode_name
         self.calls.append(("set_mode", mode_name))
         return True
 
@@ -119,6 +142,11 @@ class FakeDrone:
 
     def set_origin(self, lat, lon, alt):
         self.calls.append(("set_origin", lat, lon, alt))
+        return self.origin_ok
+
+    def land(self):
+        self.mode = "LAND"
+        self.calls.append(("land",))
 
     def get_local_position(self, timeout=2.0):
         return {"north": self._north, "east": self._east, "down": -2.0}
@@ -133,6 +161,7 @@ class FakeDrone:
         return self.arrival_ok
 
     def return_to_launch(self):
+        self.mode = "RTL"
         self.calls.append(("return_to_launch",))
 
     def wait_disarmed(self, timeout=60.0):
@@ -180,7 +209,7 @@ def test_happy_path_runs_to_done_and_delivers():
     actions = drone.actions()
     # The delivery happened in the right order and ended with a return to launch.
     assert "drop" in actions
-    assert actions.index("takeoff") < actions.index("drop") < actions.index("return_to_launch")
+    assert actions.index("takeoff") < actions.index("drop") < actions.index("land")
 
 
 def test_low_battery_aborts_before_drop_but_still_returns():
@@ -194,10 +223,13 @@ def test_low_battery_aborts_before_drop_but_still_returns():
     assert mission.state is State.DONE
     assert mission.abort_reason == "LOW_BATTERY"
     assert "drop" not in drone.actions()          # no delivery on abort
-    assert "return_to_launch" in drone.actions()  # but it returned safely
+    assert "land" in drone.actions()  # but it returned safely
 
 
-def test_failed_arming_aborts_into_rtl():
+def test_failed_arming_ends_without_commanding_flight():
+    """A vehicle that never armed is standing on the ground. Commanding LAND or RTL at
+    it is pointless - and the old code did exactly that, then logged "landed and
+    disarmed" for a drone that had never left the floor."""
     config = Config.sitl()
     drone = FakeDrone(config, arm_ok=False)
     mission = _build_mission(drone, config)
@@ -205,8 +237,10 @@ def test_failed_arming_aborts_into_rtl():
     mission.run()
 
     assert mission.state is State.DONE
+    assert mission.abort_reason == "ARMING_FAILED"   # named, not None
     assert "drop" not in drone.actions()
-    assert "return_to_launch" in drone.actions()
+    assert "land" not in drone.actions()
+    assert "return_to_launch" not in drone.actions()
 
 
 def test_over_target_correction_nudges_then_drops():
@@ -230,9 +264,12 @@ def test_over_target_correction_nudges_then_drops():
     assert actions.index("move_body_offset") < actions.index("drop")
 
 
-def test_link_loss_aborts_before_drop():
+def test_link_loss_in_flight_aborts_and_lands():
+    """Link loss AFTER takeoff: the mission must abort and bring the aircraft down.
+    (link_alive_ok=2 lets the checks before IDLE and TAKEOFF pass, so the link dies
+    once we are airborne rather than on the ground.)"""
     config = Config.sitl()
-    drone = FakeDrone(config, link_alive_ok=False)
+    drone = FakeDrone(config, link_alive_ok=2)
     mission = _build_mission(drone, config)
 
     mission.run()
@@ -240,7 +277,8 @@ def test_link_loss_aborts_before_drop():
     assert mission.state is State.DONE
     assert mission.abort_reason == "LINK_LOSS"
     assert "drop" not in drone.actions()
-    assert "return_to_launch" in drone.actions()
+    assert "land" in drone.actions()
+    assert "land" in drone.actions()
 
 
 def test_sustained_telemetry_loss_aborts():
@@ -323,7 +361,7 @@ def test_indoor_target_not_found_aborts_home():
     assert mission.state is State.DONE
     assert mission.abort_reason == "TARGET_NOT_FOUND"
     assert "drop" not in drone.actions()
-    assert "return_to_launch" in drone.actions()
+    assert "land" in drone.actions()
 
 
 # ----------------------------------------------------------------------
@@ -384,6 +422,151 @@ def test_piservo_pulse_mapping_clamps_to_unit_range():
     assert PiServo._pw_to_value(1900) == pytest.approx(0.8)
     assert PiServo._pw_to_value(2500) == 1.0    # above band -> clamped
     assert PiServo._pw_to_value(500) == -1.0    # below band -> clamped
+
+
+def test_boot_mode_does_not_abort_before_the_mission_starts():
+    """Regression: the mode check must not fire before we have set GUIDED ourselves.
+
+    failsafe.check() runs before the FIRST state, and at that moment the FC is still
+    in whatever mode it booted into (STABILIZE). Checking from the start aborted every
+    mission with MODE_CHANGED_STABILIZE before it had done anything at all.
+    """
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.mode = "STABILIZE"          # as the autopilot reports on boot
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason is None
+    assert "drop" in drone.actions()
+
+
+def test_pilot_override_stops_without_commanding_anything():
+    """If the FC leaves GUIDED, someone else is flying: the pilot flipped a switch, or
+    an FC failsafe (fence breach, EKF) took over. Commanding LAND or RTL now would
+    fight them, so the mission must go quiet. In SITL the old code did the opposite -
+    it kept sending waypoints for 60 s to a vehicle that had already left GUIDED."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    # The pilot takes over right after takeoff.
+    original_takeoff = drone.takeoff
+
+    def takeoff_then_pilot_takes_over(altitude, timeout=30.0):
+        result = original_takeoff(altitude, timeout)
+        drone.mode = "LOITER"
+        return result
+
+    drone.takeoff = takeoff_then_pilot_takes_over
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason == "MODE_CHANGED_LOITER"
+    assert "drop" not in drone.actions()
+    # The decisive assertion: we did NOT override the human.
+    assert "land" not in drone.actions()
+    assert "return_to_launch" not in drone.actions()
+
+
+def test_safety_envelope_is_enforced_before_flight():
+    """The FC defaults are built for open sky: FENCE_ACTION=1 climbs to RTL_ALT (15 m)
+    on a breach. Indoors that is the ceiling, so the companion sets its own limits."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    _build_mission(drone, config).run()
+
+    assert ("set_param", "WPNAV_SPEED_UP", config.climb_rate_cms) in drone.calls
+    assert ("set_param", "FENCE_ACTION", config.fence_action) in drone.calls
+    assert ("set_param", "RTL_ALT", config.rtl_alt_m * 100.0) in drone.calls  # cm on 4.6
+
+
+def test_rtl_altitude_falls_back_to_the_newer_parameter_name():
+    """RTL_ALT (cm) was renamed to RTL_ALT_M (m) in ArduPilot 4.7. Setting the wrong
+    one is not an error - the autopilot ignores unknown parameters and silently keeps
+    its 15 m default - so we try both."""
+    config = Config.sitl()
+    drone = FakeDrone(config, unknown_params={"RTL_ALT"})   # pretend firmware >= 4.7
+    _build_mission(drone, config).run()
+
+    assert ("set_param", "RTL_ALT", config.rtl_alt_m * 100.0) not in drone.calls
+    assert ("set_param", "RTL_ALT_M", config.rtl_alt_m) in drone.calls
+
+
+def test_battery_sag_needs_several_samples_before_aborting():
+    """Li-Ion dips hard under load. A single reading below the threshold is a sag, not
+    an empty pack - only a run of them may abort a flight."""
+    config = Config.sitl()
+    low = {"voltage": config.battery_min_voltage - 0.5, "current": 30.0, "remaining": 60}
+    ok = {"voltage": config.battery_min_voltage + 1.0, "current": 5.0, "remaining": 60}
+    # One dip, then recovery, then healthy readings for the rest of the flight.
+    drone = FakeDrone(config, battery=[ok, low, ok])
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason is None
+    assert "drop" in drone.actions()
+
+
+def test_unreachable_waypoints_abort_the_search():
+    """Not arriving at a waypoint means the vehicle is not following us or the position
+    estimate has diverged (optical flow without a valid rangefinder height). Flying the
+    rest of the pattern from an unknown place makes it worse, so we stop."""
+    config = Config.sitl()
+    drone = FakeDrone(config, arrival_ok=False)
+    mission = _build_mission(drone, config, camera=MockCamera(detected=False))
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason == "WAYPOINTS_UNREACHABLE"
+    assert "drop" not in drone.actions()
+    assert "land" in drone.actions()
+
+
+def test_crash_in_a_state_still_commands_land():
+    """An unhandled exception used to kill the process, leaving the aircraft armed in
+    GUIDED holding its last position target - GUID_TIMEOUT does not apply to position
+    targets, so it would hover until the battery died."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    def explode(*_a, **_k):
+        raise RuntimeError("simulated MAVLink failure")
+
+    drone.goto_local = explode
+
+    with pytest.raises(RuntimeError):
+        mission.run()
+
+    assert "land" in drone.actions()
+
+
+def test_factories_build_every_configured_variant():
+    """main.py's factories are the one path that pytest never exercised - which is how
+    an unrunnable release_mechanism='pi' on the Mac stayed green in CI and only blew up
+    against SITL."""
+    from main import make_camera, make_release
+
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    for source in ("auto", "sim", "mock", "timed"):
+        config.camera_source = source
+        assert make_camera(config, drone).get_target_offset() is not None
+    assert isinstance(make_release(Config.sitl(), drone), FcServo)
+
+    bad = Config.sitl()
+    bad.camera_source = "nonsense"
+    with pytest.raises(ValueError):
+        make_camera(bad, drone)
+    bad = Config.sitl()
+    bad.release_mechanism = "nonsense"
+    with pytest.raises(ValueError):
+        make_release(bad, drone)
 
 
 def test_camera_less_flight_searches_and_drops():

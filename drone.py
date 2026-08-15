@@ -27,9 +27,14 @@ log = logging.getLogger(__name__)
 
 
 class Drone:
+    # MAV_SEVERITY -> label, for the STATUSTEXT messages we mirror into our log.
+    _SEVERITY = {0: "EMERGENCY", 1: "ALERT", 2: "CRITICAL", 3: "ERROR",
+                 4: "WARNING", 5: "NOTICE", 6: "INFO", 7: "DEBUG"}
+
     def __init__(self, config: Config):
         self.config = config
         self.master: Optional[mavutil.mavfile] = None
+        self._last_heartbeat_sent: float = 0.0
 
     # ==================================================================
     # 1. Connection & heartbeat
@@ -43,15 +48,106 @@ class Drone:
             source_system=self.config.gcs_system_id,
         )
         self.wait_heartbeat()
+        self.send_heartbeat()          # announce ourselves before anything else
         self.request_data_streams()
+        self.log_autopilot_version()
 
-    def wait_heartbeat(self) -> None:
-        """Block until a HEARTBEAT is received. Proves the link is up."""
-        self.master.wait_heartbeat()
-        log.info(
-            f"[HEARTBEAT] Connected to system {self.master.target_system}, "
-            f"component {self.master.target_component}"
+    def wait_heartbeat(self, timeout: float = 30.0) -> None:
+        """Block until a HEARTBEAT *from the autopilot* is received.
+
+        Not every heartbeat on the link comes from the flight controller. Over
+        mavlink-router a ground station announces itself as MAV_TYPE_GCS, and a
+        MAVLink sensor (the MTF-01P speaks MAVLink too) has its own system id.
+        pymavlink only locks `target_system` onto a heartbeat it recognises as a
+        vehicle, but plain wait_heartbeat() returns on the *first* packet of any
+        kind - and if that was the GCS, target_system stays 0 and every later
+        get_mode()/is_armed() reads an empty state bucket. So we wait until
+        pymavlink actually latched onto a vehicle.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.master.wait_heartbeat(timeout=1.0)
+            if self.master.target_system != 0:
+                log.info(
+                    f"[HEARTBEAT] Connected to system {self.master.target_system}, "
+                    f"component {self.master.target_component}"
+                )
+                return
+        raise TimeoutError("No autopilot heartbeat (only GCS/sensor traffic?)")
+
+    def send_heartbeat(self) -> None:
+        """Announce ourselves as a ground station.
+
+        Required for the FC-side GCS failsafe: ArduPilot only starts monitoring
+        FS_GCS_* after it has seen at least one heartbeat from the configured GCS
+        system id (SYSID_MYGCS, default 255). Setpoint traffic does NOT count. Without
+        this, FS_GCS_ENABLE=1 is silently dead and the aircraft has no FC-side rescue
+        if the companion dies.
+        """
+        self.master.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+            0, 0, 0,
         )
+        self._last_heartbeat_sent = time.time()
+
+    def tick(self) -> None:
+        """Housekeeping to call from every polling loop. Cheap and non-blocking.
+
+        Two jobs:
+        1. Keep our GCS heartbeat alive (see send_heartbeat).
+        2. Drain and LOG pending STATUSTEXT messages. This is the single most
+           valuable diagnostic in the whole file: every pre-arm rejection, fence
+           breach and EKF failsafe reason the autopilot produces arrives as
+           STATUSTEXT, and a plain recv_match(type="SYS_STATUS") throws it away. Not
+           logging it is why a rejected arming used to appear as a bare "result=4"
+           with the actual reason ("PreArm: Check mag field") visible only in a
+           MAVProxy console we do not have in flight.
+
+        Draining also refreshes pymavlink's cached mode/armed state as a side effect,
+        which is what makes the mode-change failsafe work.
+        """
+        now = time.time()
+        if now - self._last_heartbeat_sent >= 1.0:
+            self.send_heartbeat()
+        while True:
+            msg = self.master.recv_match(type="STATUSTEXT", blocking=False)
+            if msg is None:
+                return
+            self._log_statustext(msg)
+
+    def _log_statustext(self, msg) -> None:
+        """Mirror one autopilot STATUSTEXT into our log, keeping its severity."""
+        text = msg.text
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", errors="replace")
+        text = text.strip()
+        label = self._SEVERITY.get(msg.severity, str(msg.severity))
+        if msg.severity <= 4:          # EMERGENCY..WARNING
+            log.warning(f"[FC/{label}] {text}")
+        else:
+            log.info(f"[FC/{label}] {text}")
+
+    def log_autopilot_version(self, timeout: float = 3.0) -> Optional[str]:
+        """Ask the FC which firmware it runs and record it.
+
+        Worth a dedicated call because parameter names move between ArduPilot
+        releases (RTL_ALT in cm on 4.5/4.6 vs RTL_ALT_M in m from 4.7,
+        RNGFND1_MIN_CM vs RNGFND1_MIN). Every flight log should therefore state what
+        it was actually flown against, instead of us guessing later.
+        """
+        self._command_long(
+            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+            mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+        )
+        msg = self.master.recv_match(type="AUTOPILOT_VERSION", blocking=True, timeout=timeout)
+        if not msg:
+            log.warning("[FC] No AUTOPILOT_VERSION received - firmware version unknown")
+            return None
+        raw = msg.flight_sw_version
+        version = f"{(raw >> 24) & 0xFF}.{(raw >> 16) & 0xFF}.{(raw >> 8) & 0xFF}"
+        log.info(f"[FC] ArduPilot flight software {version}")
+        return version
 
     def request_data_streams(self, rate_hz: int = 4) -> None:
         """
@@ -67,14 +163,21 @@ class Drone:
             1,  # 1 = start
         )
 
-    def set_origin(self, lat: float, lon: float, alt: float) -> None:
+    def set_origin(self, lat: float, lon: float, alt: float, timeout: float = 5.0) -> bool:
         """
         Tell the EKF where it is WITHOUT GPS, via SET_GPS_GLOBAL_ORIGIN. Indoors there is
         no GPS to seed the EKF origin/home, so the companion provides a reference. Any
         sensible lat/lon works - it only anchors the local NED frame and home. After this,
         LOCAL_POSITION_NED, home and the geofence have a reference.
 
-        lat/lon in degrees, alt in metres (AMSL).
+        lat/lon in degrees, alt in metres (AMSL). Returns True only if the origin we
+        asked for is the one the autopilot ended up using.
+
+        VERIFY, do not assume: ArduPilot drops SET_GPS_GLOBAL_ORIGIN silently when an
+        origin is already set (and when the coordinates are invalid) - no ACK, no error
+        message. We learned this the hard way: a SITL run that looked like it validated
+        this feature had in fact been flying on the simulator's own origin while our
+        log cheerfully claimed "EKF origin set".
         """
         self.master.mav.set_gps_global_origin_send(
             self.master.target_system,
@@ -82,7 +185,26 @@ class Drone:
             int(lon * 1e7),     # degE7
             int(alt * 1000.0),  # mm
         )
-        log.info(f"[ORIGIN] EKF origin set: lat={lat:.6f} lon={lon:.6f} alt={alt} m")
+        self._command_long(
+            mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+            mavutil.mavlink.MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN,
+        )
+        msg = self.master.recv_match(type="GPS_GLOBAL_ORIGIN", blocking=True, timeout=timeout)
+        if not msg:
+            log.warning("[ORIGIN] No GPS_GLOBAL_ORIGIN read-back - origin unverified")
+            return False
+
+        actual_lat, actual_lon = msg.latitude / 1e7, msg.longitude / 1e7
+        # ~1e-4 deg is about 11 m: we only care that the FC uses OUR reference, not the
+        # simulator's default half a world away.
+        if abs(actual_lat - lat) < 1e-4 and abs(actual_lon - lon) < 1e-4:
+            log.info(f"[ORIGIN] EKF origin confirmed: lat={actual_lat:.6f} lon={actual_lon:.6f}")
+            return True
+        log.warning(
+            f"[ORIGIN] Rejected - FC uses lat={actual_lat:.6f} lon={actual_lon:.6f}, "
+            f"we asked for lat={lat:.6f} lon={lon:.6f} (origin already set?)"
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -233,6 +355,7 @@ class Drone:
         log.info(f"[PREARM] Waiting for {kind} EKF position estimate ...")
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self.tick()   # surfaces "PreArm: ..." messages while we wait
             msg = self.master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1.0)
             if msg and (msg.flags & flag):
                 log.info("[PREARM] EKF position estimate ready")
@@ -249,6 +372,9 @@ class Drone:
         for attempt in range(1, attempts + 1):
             self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
             result = self._wait_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout)
+            # The ACK only carries a numeric result; the REASON ("PreArm: Check mag
+            # field", "Arm: Gyros inconsistent") comes as STATUSTEXT, so drain it now.
+            self.tick()
 
             if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
                 deadline = time.time() + timeout
@@ -260,7 +386,8 @@ class Drone:
             else:
                 log.warning(f"[ARM] Attempt {attempt}/{attempts} rejected (result={result}); waiting ...")
                 time.sleep(2.0)
-        log.warning("[ARM] Arming failed (pre-arm check?)")
+                self.tick()
+        log.warning("[ARM] Arming failed - see the [FC/...] messages above for the reason")
         return False
 
     def disarm(self) -> None:
@@ -268,21 +395,51 @@ class Drone:
         self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0)
         log.info("[ARM] Disarm sent")
 
-    def takeoff(self, altitude: float, timeout: float = 30.0) -> bool:
+    def takeoff(self, altitude: float, timeout: float = 30.0,
+                settle_s: float = 3.0, tolerance: float = 0.5) -> bool:
         """
         GUIDED takeoff to 'altitude' metres (relative to launch).
-        Requires GUIDED + armed. Waits until ~95 % of the altitude is reached.
+        Requires GUIDED + armed. Returns True once the altitude is not just reached
+        but HELD for `settle_s` within `tolerance` metres.
+
+        Why the settling window: returning on the first sample above 95 % of the target
+        reports success while the aircraft is still climbing. With the stock climb rate
+        (WPNAV_SPEED_UP 250 cm/s) a 2 m takeoff sailed on to 4.5 m in our SITL runs,
+        breached a 4 m altitude fence, and the FC switched out of GUIDED - while the
+        mission happily continued sending waypoints to a vehicle that was no longer
+        listening. Overshoot is a hall-ceiling problem, so we watch for it here.
         """
         self._command_long(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, altitude)
         log.info(f"[TAKEOFF] Climbing to {altitude} m ...")
 
         deadline = time.time() + timeout
+        stable_since: Optional[float] = None
+        peak = 0.0
         while time.time() < deadline:
+            self.tick()
             pos = self.get_position()
-            if pos and pos["rel_alt"] >= altitude * 0.95:
-                log.info(f"[TAKEOFF] Altitude reached ({pos['rel_alt']:.1f} m)")
-                return True
-        log.warning("[TAKEOFF] Timeout while climbing")
+            if not pos:
+                continue
+            alt = pos["rel_alt"]
+            peak = max(peak, alt)
+
+            if abs(alt - altitude) <= tolerance:
+                if stable_since is None:
+                    stable_since = time.time()
+                    log.info(f"[TAKEOFF] Altitude reached ({alt:.1f} m), settling ...")
+                elif time.time() - stable_since >= settle_s:
+                    if peak > altitude + tolerance:
+                        log.warning(
+                            f"[TAKEOFF] Overshot to {peak:.1f} m before settling at "
+                            f"{alt:.1f} m - consider lowering WPNAV_SPEED_UP"
+                        )
+                    log.info(f"[TAKEOFF] Altitude stable at {alt:.1f} m")
+                    return True
+            elif stable_since is not None:
+                # Drifted back out of the band - start the settling window again.
+                log.info(f"[TAKEOFF] Altitude {alt:.1f} m left the band, re-settling ...")
+                stable_since = None
+        log.warning(f"[TAKEOFF] Timeout while climbing (peak {peak:.1f} m)")
         return False
 
     def goto(self, lat: float, lon: float, alt: float) -> None:
@@ -382,14 +539,20 @@ class Drone:
     def wait_local_arrival(self, north: float, east: float, radius_m: float, timeout: float = 60.0) -> bool:
         """Wait until the drone is within 'radius_m' (horizontal) of a local-NED point."""
         deadline = time.time() + timeout
+        worst = float("inf")
         while time.time() < deadline:
+            self.tick()
             pos = self.get_local_position()
             if pos:
                 dist = math.hypot(north - pos["north"], east - pos["east"])
+                worst = min(worst, dist)
                 if dist <= radius_m:
                     log.info(f"[GOTO] Local target reached (distance {dist:.1f} m)")
                     return True
-        log.warning("[GOTO] Timeout before local arrival")
+        # Log how close we actually got - a huge residual points at a diverging
+        # position estimate (optical flow without a valid rangefinder height), not at
+        # a vehicle that is merely slow.
+        log.warning(f"[GOTO] Timeout before local arrival (closest {worst:.1f} m)")
         return False
 
     def land(self) -> None:
@@ -408,6 +571,7 @@ class Drone:
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self.tick()
             self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=2.0)
             if not self.is_armed():
                 return True

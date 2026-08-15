@@ -1,12 +1,34 @@
 # SITL optical-flow + rangefinder setup — PHASE A (enable the sensors).
 # These stand in for the real MTF-01P (optical flow + LiDAR) in simulation.
 #
+# TARGET FIRMWARE: ArduCopter 4.6.x (our FlywooF745 runs 4.6.3).
+#
 # Load in the MAVProxy console, then reboot:
 #   param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_flow_phaseA.parm
 #   reboot
 #
 # The RNGFND1_* sub-parameters only come into existence AFTER RNGFND1_TYPE is set
 # and the autopilot reboots — that is why this is split from phase B.
-RNGFND1_TYPE 1
+#
+# RNGFND1_TYPE 100 = "SITL": the simulator's native rangefinder backend. ArduPilot's
+# own copter-optflow.parm uses type 1 ("Analog"), which emulates a voltage on an ADC
+# pin and converts it back via RNGFND1_SCALING. Type 100 skips that round trip and is
+# what we verified working on 4.6.3.
+RNGFND1_TYPE 100
 SIM_FLOW_ENABLE 1
 FLOW_TYPE 10
+
+# !! DO NOT REMOVE !! SIM_TERRAIN 0 = flat ground at the home altitude.
+#
+# With terrain enabled (the default), SITL measures the rangefinder against a terrain
+# model anchored at SIM_OPOS_ALT — whose default is 584 m, the altitude of the default
+# SITL home at CMAC/Canberra. As soon as you start the simulator somewhere else with
+# --custom-location (we use the hall in Frankfurt, 112 m), the vehicle sits ~470 m
+# *below* the modelled ground and the rangefinder reads a constant 0.00 m.
+#
+# Nothing warns you about this. The knock-on effect is total: optical flow only yields
+# an angular rate, so without a height above ground the EKF cannot scale it into a
+# velocity — the position estimate then drifts away (we measured 366 m of drift while
+# the vehicle physically stood still), waypoints are never reached and altitude control
+# oscillates. A flat ground plane is also the correct model for an indoor hall.
+SIM_TERRAIN 0

@@ -60,8 +60,8 @@ flowchart TB
 | Component | Responsibility |
 |-----------|----------------|
 | `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The single line that differs SITL vs Pi lives here. |
-| `Config` | All parameters + the `connection_string`. `Config.sitl()` vs `Config.pi_serial()`. |
-| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat, telemetry, set EKF origin, mode/arm/takeoff/goto/goto_local/RTL, body-frame nudges, FC servo helpers. Hardware-agnostic. |
+| `Config` | All parameters. `Config.sitl()` / `Config.pi()` / `Config.pi_serial()` encode the whole SITL↔hardware delta (endpoint, drop-servo path, battery threshold); `main.py` picks one from a CLI flag. |
+| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. |
 | `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera`/`TimedCamera` now; `RealCamera` (AI camera) later — same contract, so the mission never changes. Chosen by `config.camera_source`. |
 | `ReleaseMechanism` | A `Protocol` (`setup/reset/drop/confirm`) for the payload drop. `FcServo` drives a servo on an FC output over MAVLink (SITL); `PiServo` drives a servo on a Pi GPIO pin directly. Chosen by `config.release_mechanism` — the mission never changes. |
 | `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout. Returns a reason string; the mission decides to ABORT. |
@@ -99,18 +99,32 @@ stateDiagram-v2
     TAKEOFF --> ENROUTE: altitude reached
     ENROUTE --> OVER_TARGET: arrived
     OVER_TARGET --> DROP: centred
-    DROP --> RTL: released
-    RTL --> [*]: landed + disarmed
+    DROP --> RECOVER: released
+    RECOVER --> [*]: landed + disarmed
     IDLE --> ABORT: pre-arm / arm fails
-    TAKEOFF --> ABORT: climb timeout
+    TAKEOFF --> ABORT: climb timeout / not held
     ENROUTE --> ABORT: arrival timeout
     OVER_TARGET --> ABORT: align timeout
-    ABORT --> RTL: controlled return
+    ABORT --> RECOVER: airborne
+    ABORT --> [*]: never armed / mode changed
 ```
 
 - **Failsafe before every state:** the loop calls `FailsafeMonitor.check()` before
-  each state (except while already aborting/landing). It can return `LINK_LOSS`,
-  `NO_TELEMETRY`, `LOW_BATTERY` or `TIMEOUT_<phase>` → the machine jumps to `ABORT`.
+  each state (except while already recovering). It can return `LINK_LOSS`,
+  `MODE_CHANGED_<mode>`, `NO_TELEMETRY`, `LOW_BATTERY` or `TIMEOUT_<phase>` → the
+  machine jumps to `ABORT`.
+- **`ABORT` is not one path.** Commanding a flight mode is only correct if we are
+  actually flying and still in control:
+
+  | Situation | Exit | Why |
+  |---|---|---|
+  | never armed | `DONE` | the aircraft is on the ground |
+  | `MODE_CHANGED_*` | `DONE` | the pilot or an FC failsafe has control — commanding anything would override the human |
+  | airborne, in control | `RECOVER` | land (or RTL outdoors), then disarm |
+
+- **`RECOVER` lands by default.** `config.recovery_action` selects `"land"` (indoor,
+  default) or `"rtl"`. RTL first *climbs* to `RTL_ALT` before returning, which in a hall
+  means flying into the ceiling.
 - **`OVER_TARGET` is the visual-servoing loop:** read the camera's `dx/dy`, nudge the
   drone in the body frame (`Drone.move_body_offset()`), repeat until centred, then
   `DROP`. With `MockCamera` (dx=dy=0) the first frame is already centred; with
@@ -133,9 +147,11 @@ stateDiagram-v2
     APPROACH --> DROP: centred over target
     APPROACH --> SEARCH: target lost too long
     APPROACH --> ABORT: timeout
-    DROP --> RTL
-    ABORT --> RTL
-    RTL --> [*]
+    SEARCH --> ABORT: waypoints unreachable
+    DROP --> RECOVER
+    ABORT --> RECOVER: airborne
+    ABORT --> [*]: never armed / mode changed
+    RECOVER --> [*]
 ```
 
 - **`SEARCH`** (`mission._search`) flies a pattern in local NED — an expanding spiral by
@@ -225,16 +241,20 @@ sequenceDiagram
     Mis->>Rel: reset()
     Rel->>Dr: reset_servo() → MAV_CMD_DO_SET_SERVO(9, neutral_pwm)
 
-    note over Mis: RTL
-    Mis->>Dr: return_to_launch()
-    Dr->>FC: SET_MODE RTL
+    note over Mis: RECOVER (recovery_action="land")
+    Mis->>Dr: land()
+    Dr->>FC: SET_MODE LAND
     Mis->>Dr: wait_disarmed(phase_timeout_s=60.0)
     Dr->>FC: read HEARTBEAT (until disarmed)
 ```
 
 > Parameters shown are the defaults from `config.py`. On an abort the flow jumps from
-> the current state straight to `ABORT → RTL` (the `_rtl` calls above), skipping the
-> remaining steps.
+> the current state to `ABORT`, which either ends the mission outright (never armed, or
+> the FC left our mode) or goes to `RECOVER` — see the state diagram above.
+>
+> Not drawn: `Drone.tick()` runs inside every polling loop and before every failsafe
+> check. It sends our 1 Hz GCS heartbeat (without which the FC's `FS_GCS_*` failsafe can
+> never trigger) and logs the autopilot's `STATUSTEXT` messages.
 >
 > **Convention:** each `Dr->>FC` is a method's *primary* MAVLink interaction — a command
 > for the "doers" (`takeoff`, `goto`, `arm`, `set_mode`, `drop`, …) or a read for the
@@ -307,6 +327,6 @@ sequenceDiagram
         Dr->>FC: SET_POSITION_TARGET_LOCAL_NED (BODY_OFFSET)
     end
 
-    note over Mis: centred -> DROP -> RTL
+    note over Mis: centred -> DROP -> RECOVER (land)
 ```
 

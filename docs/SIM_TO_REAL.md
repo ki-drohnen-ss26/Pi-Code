@@ -5,24 +5,34 @@ The whole point of the architecture is that going from SITL to the real drone ch
 verified on hardware, and what stays the same. See [ARCHITECTURE.md](ARCHITECTURE.md)
 for how the components fit together.
 
-## The one thing the code changes
+## The one thing that changes: a command-line flag
 
-In `main.py`:
+Nothing in the source changes. `main.py` picks a preset:
 
-```python
-# SITL (Mac)
-config = Config.sitl()
-# Real Pi on the flight controller (UART)
-config = Config.pi_serial("/dev/serial0", baud=921600)
+```bash
+python main.py            # SITL on the Mac
+python main.py --pi       # the real Pi, via mavlink-router
 ```
 
-Everything else (drone / mission / failsafe / camera) is identical.
+> **The Pi link is UDP, not serial** — this surprises people. `mavlink-router` runs as a
+> systemd service on the Pi, owns `/dev/serial0` and forwards the FC stream to
+> `127.0.0.1:14550`. Two processes cannot share a UART, so the script binds to the same
+> UDP endpoint it uses against SITL. `Config.pi_serial()` (`python main.py --pi-serial`)
+> exists only for a setup **without** a router.
+
+Everything else (drone / mission / failsafe / camera) is identical. `Config.sitl()` and
+`Config.pi()` also carry the two genuine hardware differences, so they stay in one place:
+
+| | `Config.sitl()` | `Config.pi()` |
+|---|---|---|
+| `release_mechanism` | `"fc"` — servo on an FC output (there is no GPIO on a Mac) | `"pi"` — servo on a Pi GPIO pin |
+| `battery_min_voltage` | `10.8 V` — matches SITL's simulated ~12.6 V pack | `12.8 V` — our 4S Li-Ion (16.4 V full, 11.2 V empty) |
 
 ## What stays the same vs what changes
 
 | Area | SITL | Real hardware |
 |------|------|---------------|
-| Connection | `udpin:127.0.0.1:14550` | `/dev/serial0` @ 921600 (UART) |
+| Connection | `udpin:127.0.0.1:14550` | `udpin:127.0.0.1:14550` (via mavlink-router) |
 | Mission logic | identical | identical |
 | Pre-arm | GPS/EKF converge in seconds | real GPS fix / EKF / compass must be healthy |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
@@ -138,10 +148,34 @@ Calibration (either path), on the **bench, no props**:
 ## 5. Link loss: companion vs flight controller
 - Our **`LINK_LOSS`** = the **Pi stops receiving heartbeats from the FC** (UART dead /
   unplugged / baud mismatch). The companion notices and stops — but if the link is
-  truly dead it cannot command RTL either.
-- Therefore configure the **FC's own** GCS failsafe (`FS_GCS_ENABLE = 1`, action
-  RTL/Land) so the aircraft recovers on its own. This is different from the RC/radio
-  failsafe (transmitter ↔ FC).
+  truly dead it cannot command anything either.
+- The **FC's own** GCS failsafe (`FS_GCS_ENABLE`, `FS_GCS_TIMEOUT` 5 s) is the
+  counterpart: it reacts when the *autopilot* stops hearing from *us*. Two things about
+  it are easy to get wrong:
+  - **It never fires unless we send heartbeats.** ArduPilot only starts monitoring after
+    it has seen at least one HEARTBEAT from the GCS system id (`SYSID_MYGCS`, default
+    255); setpoint traffic does not count. `Drone.tick()` sends one every second, so the
+    option is now actually usable — before that, setting `FS_GCS_ENABLE = 1` was silently
+    dead.
+  - **Its action must not be RTL indoors.** Values are
+    `0:Disabled, 1:RTL, 3:SmartRTL or RTL, 4:SmartRTL or Land, 5:Land`. Use `5` (Land)
+    in a hall, or leave it `0` and rely on the pilot — but then write down that a dead
+    Pi has no automatic rescue.
+
+## 5a. The safety envelope the companion enforces
+`failsafe.setup_safety_envelope()` writes three FC parameters before every flight,
+because the autopilot's defaults are built for open sky and a freshly flashed or wiped
+board silently reverts to them:
+
+| Parameter | We set | Default | Why the default is dangerous indoors |
+|---|---|---|---|
+| `FENCE_ACTION` | `2` (Always Land) | `1` (RTL or Land) | RTL **climbs** to `RTL_ALT` before returning — into the ceiling |
+| `RTL_ALT` | `200` cm | `1500` cm (15 m) | see above; set in case RTL is triggered from elsewhere |
+| `WPNAV_SPEED_UP` | `50` cm/s | `250` cm/s | overshot a 2 m takeoff by >2 m in SITL and breached a 4 m fence |
+
+> `RTL_ALT` is **centimetres** on ArduPilot 4.5/4.6 and was renamed to `RTL_ALT_M`
+> (metres) in 4.7. Setting the wrong one is not an error — the autopilot ignores unknown
+> parameters and keeps its 15 m default. `_set_rtl_altitude()` therefore tries both.
 
 ## 6. Data rates
 Over a serial link telemetry is slower than SITL's local UDP;
@@ -151,12 +185,50 @@ Over a serial link telemetry is slower than SITL's local UDP;
 MTF-01P configured via the CP2102 USB-UART adapter; FC params for the rangefinder +
 optical-flow serial protocol. See `../params/README.md` and the project sensor docs.
 
+## 8. What the companion does when things go wrong
+
+The mission never silently keeps flying. Every abort names itself in the log
+(`[ABORT] Reason: ...`) and then takes one of three exits:
+
+| Situation | What happens | Why |
+|---|---|---|
+| Never armed (pre-arm failed, GUIDED refused) | stop, command nothing | the aircraft is on the ground; commanding a flight mode at it is noise, and the old code then logged "landed and disarmed" for a drone that never left the floor |
+| **Mode changed** (`MODE_CHANGED_*`) | stop, command nothing | the pilot or an FC failsafe has control — commanding RTL now would **override the human** |
+| Anything else while airborne | `RECOVER` → **LAND** | LAND needs no position, no home and no altitude headroom |
+
+`config.recovery_action` switches `RECOVER` between `"land"` (default, indoor) and
+`"rtl"` (outdoor). An unhandled exception in the state machine also commands LAND before
+propagating — otherwise the process dies and leaves the aircraft armed in GUIDED holding
+its last position target, which `GUID_TIMEOUT` does **not** clear (it only applies to
+velocity/acceleration/attitude targets, not position ones). It would hover until the
+battery ran out.
+
+## 9. Reading a flight log
+`Drone.tick()` mirrors every autopilot `STATUSTEXT` into the mission log with its
+severity, so pre-arm rejections and failsafe reasons are in the file you already have:
+
+```
+[FC] ArduPilot flight software 4.6.3
+[FC/WARNING] PreArm: Check mag field (z diff:976>200)
+[ARM] Arming failed - see the [FC/...] messages above for the reason
+```
+
+Without this, a rejected arming is a bare `result=4` and the reason is only visible in a
+MAVProxy console — which you do not have on a flying aircraft. The firmware version is
+logged on connect for the same reason: parameter names differ between releases, so every
+log should state what it was flown against.
+
 ## Safety checklist (real hardware)
 - [ ] First flights **without propellers**.
 - [ ] Independent kill switch on the transmitter (mode switch / disarm). The companion
       failsafe does **not** replace it.
-- [ ] ArduPilot's own failsafes set: `BATT_LOW_VOLT`, `BATT_FS_LOW_ACT`,
-      `FS_GCS_ENABLE`, radio failsafe.
-- [ ] Baseline params loaded (`../params/default.parm`) and known-good.
+- [ ] ArduPilot's own failsafes set: `BATT_LOW_VOLT`, `BATT_FS_LOW_ACT` (Land, not RTL),
+      `FS_GCS_ENABLE` (Land, or 0 — see §5), radio failsafe (`FS_THR_ENABLE = 3`, Land).
+- [ ] `RNGFND1_MIN_CM` low enough (**1**, not the 20 cm default) — otherwise the
+      MTF-01P never reads "good" near the floor, the EKF gets no terrain height and
+      arming fails with *"Need Position Estimate"*.
+- [ ] Baseline params captured **from the real FC** and known-good. The files in
+      `../params/` are SITL dumps and are **not** loadable onto the flight controller.
 - [ ] Camera **axis mapping** verified on the real camera (§3).
 - [ ] Drop servo PWM verified on the bench (§4).
+- [ ] Firmware version in the mission log matches the FC you flashed (§9).

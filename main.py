@@ -4,13 +4,17 @@ Entry point. Wires together configuration, drone, camera, failsafe and mission.
 =======
 
 Usage:
-    python main.py                 # uses the SITL default from config.py
-    python main.py --tele          # only print telemetry (no flight)
+    python main.py                 # SITL (udpin:127.0.0.1:14550)
+    python main.py --port 14551    # SITL on a second MAVProxy output (QGC keeps 14550)
+    python main.py --pi            # real Pi via mavlink-router
+    python main.py --pi-serial     # real Pi, direct UART (no mavlink-router)
+    python main.py --tele          # only print telemetry (no flight), any of the above
 
-To switch to the real Pi: change the connection_string in config.py, or use
-Config.pi_serial() instead of Config() below.
+The preset is chosen here, not by editing config.py - so the same checked-out code
+runs on the Mac and on the drone.
 """
 
+import logging
 import sys
 
 from camera import MockCamera, ScriptedCamera, SimCamera, TimedCamera
@@ -20,6 +24,8 @@ from failsafe import FailsafeMonitor
 from logbook import setup_logging
 from mission import DeliveryMission
 from release import FcServo, PiServo
+
+log = logging.getLogger(__name__)
 
 
 def make_camera(config: Config, drone: Drone):
@@ -58,11 +64,27 @@ def make_release(config: Config, drone: Drone):
     raise ValueError(f"Unknown release_mechanism '{config.release_mechanism}'")
 
 
+def make_config(argv: list) -> Config:
+    """Pick the preset from the command line instead of editing source on the drone.
+
+    Both presets connect over UDP: on the Pi, mavlink-router owns /dev/serial0 and
+    forwards the FC stream to 127.0.0.1:14550, so the endpoint is the same as in SITL.
+    What differs is the drop servo (FC output vs Pi GPIO) and the battery threshold -
+    see the constructors in config.py.
+    """
+    if "--pi" in argv:
+        return Config.pi()
+    if "--pi-serial" in argv:      # direct UART, only without mavlink-router
+        return Config.pi_serial()
+    # QGroundControl also binds 14550. To run both, add a second output in the MAVProxy
+    # console (`output add 127.0.0.1:14551`) and start with --port 14551.
+    if "--port" in argv:
+        return Config.sitl(port=int(argv[argv.index("--port") + 1]))
+    return Config.sitl()
+
+
 def main() -> None:
-    # --- choose configuration ---
-    # config = Config.sitl(port=14551)    # NOTE: Since QGroundControl takes 14550, we need to add 14551 at runtime
-    config = Config.sitl()                # NOTE: This binds to 14550, therefore QGroundControl cant be used
-    # config = Config.pi_serial()         # real Pi on the flight controller (UART)
+    config = make_config(sys.argv)
 
     # --- logging: console + timestamped file under config.log_dir ---
     setup_logging(config.log_dir)
@@ -84,7 +106,16 @@ def main() -> None:
     mission = DeliveryMission(drone, camera, failsafe, config, release)
 
     # --- start the mission ---
-    mission.run()
+    # DeliveryMission.run() already commands LAND before re-raising, so we only have to
+    # make sure the failure is visible and the exit code is non-zero.
+    try:
+        mission.run()
+    except KeyboardInterrupt:
+        log.warning("[MAIN] Interrupted by user")
+        raise SystemExit(130)
+    except Exception:
+        log.exception("[MAIN] Mission failed")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

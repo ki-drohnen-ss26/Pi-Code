@@ -5,15 +5,24 @@ The delivery state machine. Two paths share the same machine, chosen by
 config.gps_denied:
 
     GPS / outdoor (Phase 1):
-        IDLE -> TAKEOFF -> ENROUTE -> OVER_TARGET -> DROP -> RTL -> DONE
+        IDLE -> TAKEOFF -> ENROUTE -> OVER_TARGET -> DROP -> RECOVER -> DONE
     Indoor / GPS-denied (Phase 2):
-        IDLE -> TAKEOFF -> SEARCH -> APPROACH -> DROP -> RTL -> DONE
+        IDLE -> TAKEOFF -> SEARCH -> APPROACH -> DROP -> RECOVER -> DONE
                               ^_________|  (target lost)
                                                       (ABORT on failsafe)
 
 Each state does exactly one thing and returns the next state. The failsafe is
-checked before every step - if it fires, the machine jumps to ABORT (and from
-there in a controlled way to RTL/DONE).
+checked before every step - if it fires, the machine jumps to ABORT.
+
+RECOVER is where the aircraft comes down. It LANDS by default rather than flying
+RTL, because RTL first climbs to RTL_ALT and indoors that is the ceiling; see
+config.recovery_action. ABORT itself is deliberately not a single path:
+
+    never armed        -> DONE       (nothing to recover; do not command a mode
+                                      at a vehicle standing on the ground)
+    mode changed       -> DONE       (the pilot or an FC failsafe has control -
+                                      commanding anything now would fight them)
+    otherwise          -> RECOVER    (land / return, then disarm)
 """
 
 import logging
@@ -39,7 +48,7 @@ class State(Enum):
     ENROUTE = auto()      # GPS: fly to known coordinates
     OVER_TARGET = auto()  # GPS: fine centring over the target
     DROP = auto()
-    RTL = auto()
+    RECOVER = auto()      # come down safely: LAND indoors, RTL outdoors
     ABORT = auto()
     DONE = auto()
 
@@ -54,6 +63,9 @@ class DeliveryMission:
         self.release = release
         self.state = State.IDLE
         self.abort_reason = None
+        # Did we ever get the motors running? An abort before arming must NOT command
+        # a flight mode at a vehicle sitting on the ground.
+        self._airborne = False
 
     # ------------------------------------------------------------------
     # Main loop
@@ -68,35 +80,60 @@ class DeliveryMission:
             State.ENROUTE: self._enroute,
             State.OVER_TARGET: self._over_target,
             State.DROP: self._drop,
-            State.RTL: self._rtl,
+            State.RECOVER: self._recover,
             State.ABORT: self._abort,
         }
 
-        while self.state != State.DONE:
-            # Failsafe check before each state (unless we are already aborting/landing)
-            if self.state not in (State.ABORT, State.RTL):
-                reason = self.failsafe.check()
-                if reason:
-                    self.abort_reason = reason
-                    log.info(f"\n[FAILSAFE] ABORT due to: {reason}")
-                    self.state = State.ABORT
-                    continue
+        try:
+            while self.state != State.DONE:
+                # Failsafe check before each state (unless we are already recovering)
+                if self.state not in (State.ABORT, State.RECOVER):
+                    reason = self.failsafe.check()
+                    if reason:
+                        self.abort_reason = reason
+                        log.info(f"\n[FAILSAFE] ABORT due to: {reason}")
+                        self.state = State.ABORT
+                        continue
 
-            log.info(f"\n--- State: {self.state.name} ---")
-            self.state = dispatch[self.state]()
+                log.info(f"\n--- State: {self.state.name} ---")
+                self.state = dispatch[self.state]()
+        except BaseException as exc:
+            # Any crash here used to kill the process outright, leaving the aircraft
+            # ARMED in GUIDED holding its last position target. GUID_TIMEOUT does not
+            # apply to position targets, so it would hover there until the battery ran
+            # out - with no companion left to rescue it. Bring it down first.
+            log.error(f"[MISSION] Aborting on unhandled error: {exc!r}")
+            self._emergency_land()
+            raise
+        finally:
+            log.info("\n=== MISSION END ===")
 
-        log.info("\n=== MISSION END ===")
+    def _emergency_land(self) -> None:
+        """Last-ditch attempt to get the aircraft down. Never raises."""
+        if not self._airborne:
+            return
+        try:
+            self.drone.land()
+            log.warning("[MISSION] Emergency LAND commanded")
+        except Exception:
+            log.exception("[MISSION] Could not command LAND - aircraft may still be flying")
 
     # ------------------------------------------------------------------
     # States (each returns the next state)
     # ------------------------------------------------------------------
     def _idle(self) -> State:
-        """Preparation: (origin), geofence, configure drop servo, GUIDED, arm."""
+        """Preparation: (origin), safety envelope, geofence, drop servo, GUIDED, arm."""
         # Indoors without GPS the EKF needs an origin before it can report a position.
         if self.config.gps_denied and self.config.set_origin_on_start:
-            self.drone.set_origin(
+            if not self.drone.set_origin(
                 self.config.origin_lat, self.config.origin_lon, self.config.origin_alt
-            )
+            ):
+                # Not fatal: the FC may legitimately already have an origin (SITL with
+                # GPS on). But it means local NED is anchored somewhere we did not
+                # choose, so the flight log must say so.
+                log.warning("[IDLE] Continuing with the origin the FC already had")
+
+        self.failsafe.setup_safety_envelope()
         self.failsafe.setup_geofence()
         self.release.setup()
         self.release.reset()
@@ -104,21 +141,36 @@ class DeliveryMission:
         # Indoor (GPS-denied) needs only the RELATIVE EKF position (optical flow);
         # outdoor needs the ABSOLUTE one (GPS).
         if not self.drone.wait_ready_to_arm(require_abs=not self.config.gps_denied):
-            return State.ABORT
+            return self._fail("NO_POSITION_ESTIMATE")
         if not self.drone.set_mode("GUIDED"):
-            return State.ABORT
+            return self._fail("MODE_GUIDED_REFUSED")
+        # Only now may the mode check run: until this point the FC is legitimately in
+        # whatever mode it booted into.
+        self.failsafe.watch_mode()
         if not self.drone.arm():
-            return State.ABORT
+            return self._fail("ARMING_FAILED")
 
+        self._airborne = True
         self.failsafe.start_phase("TAKEOFF")
         return State.TAKEOFF
+
+    def _fail(self, reason: str) -> State:
+        """Record why we are aborting, then go to ABORT.
+
+        Every abort path must name itself: a flight log that only says
+        "[ABORT] Reason: None" is useless for post-flight analysis, and that is
+        exactly what the old code produced for arming and takeoff failures.
+        """
+        self.abort_reason = reason
+        log.warning(f"[ABORT] {reason}")
+        return State.ABORT
 
     def _takeoff(self) -> State:
         altitude = self.config.search_altitude if self.config.gps_denied else self.config.cruise_alt
         if not self.drone.takeoff(altitude):
-            return State.ABORT
+            return self._fail("TAKEOFF_FAILED")
         if self.config.gps_denied:
-            self.failsafe.start_phase("SEARCH")
+            self.failsafe.start_phase("SEARCH", budget_s=self.config.search_timeout_s)
             return State.SEARCH
         self.failsafe.start_phase("ENROUTE")
         return State.ENROUTE
@@ -134,7 +186,7 @@ class DeliveryMission:
         if arrived:
             self.failsafe.start_phase("OVER_TARGET")
             return State.OVER_TARGET
-        return State.ABORT
+        return self._fail("ENROUTE_TIMEOUT")
 
     def _over_target(self) -> State:
         """
@@ -166,8 +218,7 @@ class DeliveryMission:
             self._nudge_from_offset(dx, dy)
             time.sleep(self.config.nudge_settle_s)
 
-        log.warning("[CAM] Timeout during target alignment")
-        return State.ABORT
+        return self._fail("ALIGNMENT_TIMEOUT")
 
     # ------------------------------------------------------------------
     # Indoor / GPS-denied states (Phase 2)
@@ -183,6 +234,7 @@ class DeliveryMission:
         log.info(f"[SEARCH] {self.config.search_pattern} pattern, {len(waypoints)} waypoints, "
                  f"cadence={self.config.detection_cadence}")
         down = -self.config.search_altitude
+        misses = 0   # consecutive waypoints we failed to reach
 
         for (north, east) in waypoints:
             # SEARCH is long-running, so re-check the failsafe on every leg.
@@ -198,18 +250,30 @@ class DeliveryMission:
                 if self._poll_until_arrival_or_detection(north, east):
                     return State.APPROACH
             else:  # stop_and_look
-                self.drone.wait_local_arrival(
+                arrived = self.drone.wait_local_arrival(
                     north, east, self.config.local_arrival_radius_m,
-                    timeout=self.config.phase_timeout_s,
+                    timeout=self.config.waypoint_timeout_s,
                 )
+                if not arrived:
+                    # Never pretend we got there. Not reaching a waypoint means either
+                    # the vehicle is not following us (mode changed) or the position
+                    # estimate has diverged - looking for the target from an unknown
+                    # place, and flying the rest of the pattern from it, is worse than
+                    # stopping.
+                    misses += 1
+                    log.warning(f"[SEARCH] Waypoint ({north:.1f}, {east:.1f}) not reached "
+                                f"({misses}/{self.config.search_max_misses})")
+                    if misses >= self.config.search_max_misses:
+                        return self._fail("WAYPOINTS_UNREACHABLE")
+                    continue
+                misses = 0
                 time.sleep(self.config.look_settle_s)
                 if self.camera.get_target_offset()["detected"]:
                     log.info(f"[SEARCH] Target detected near ({north:.1f}, {east:.1f})")
                     return State.APPROACH
 
         log.warning("[SEARCH] Pattern exhausted, no target found")
-        self.abort_reason = "TARGET_NOT_FOUND"
-        return State.ABORT
+        return self._fail("TARGET_NOT_FOUND")
 
     def _poll_until_arrival_or_detection(self, north: float, east: float) -> bool:
         """
@@ -256,8 +320,7 @@ class DeliveryMission:
             self._nudge_from_offset(dx, dy)
             time.sleep(self.config.nudge_settle_s)
 
-        log.warning("[APPROACH] Timeout")
-        return State.ABORT
+        return self._fail("APPROACH_TIMEOUT")
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -285,21 +348,62 @@ class DeliveryMission:
             log.warning("[DROP] release not confirmed")
         time.sleep(1.0)
         self.release.reset()
-        self.failsafe.start_phase("RTL")
-        return State.RTL
+        self.failsafe.start_phase("RECOVER")
+        return State.RECOVER
 
-    def _rtl(self) -> State:
-        """Return to launch. Waits until the drone has landed and disarmed."""
-        self.drone.return_to_launch()
-        if self.drone.wait_disarmed(self.config.phase_timeout_s):
-            log.info("[RTL] Landed and disarmed")
+    def _recover(self) -> State:
+        """Bring the aircraft down safely: LAND indoors, RTL outdoors.
+
+        LAND is the indoor default (config.recovery_action) because it needs no
+        position estimate, no home and - crucially - no altitude headroom. RTL first
+        CLIMBS to RTL_ALT before returning, which in a hall means flying into the
+        ceiling. Outdoors RTL is the better choice and can be selected in the config.
+        """
+        if self.config.recovery_action == "rtl":
+            log.info("[RECOVER] Returning to launch")
+            self.drone.return_to_launch()
         else:
-            log.warning("[RTL] Timeout - forcing disarm")
-            self.drone.disarm()
+            log.info("[RECOVER] Landing here")
+            self.drone.land()
+
+        if self.drone.wait_disarmed(self.config.phase_timeout_s):
+            log.info("[RECOVER] Landed and disarmed")
+            self._airborne = False
+        else:
+            # Deliberately NOT disarming here. The old code sent a disarm on timeout,
+            # which at best is refused by the autopilot and at worst cuts the motors
+            # of a vehicle that is still in the air. If it has not come down, the
+            # right answer is to keep the LAND command standing and let the pilot take
+            # over - our kill switch is on the transmitter, not in this script.
+            log.warning(
+                "[RECOVER] Still armed after the timeout - LAND stays commanded. "
+                "Take over on the transmitter if the aircraft is still flying."
+            )
         return State.DONE
 
     def _abort(self) -> State:
-        """Controlled abort: return to launch (RTL)."""
-        log.info(f"[ABORT] Reason: {self.abort_reason} -> RTL")
-        self.failsafe.start_phase("RTL")
-        return State.RTL
+        """Controlled abort.
+
+        Two cases, and telling them apart matters: if we never armed (a failed pre-arm
+        or a refused GUIDED), the aircraft is sitting on the ground and commanding a
+        flight mode at it is pointless noise that the old code nevertheless produced -
+        together with a log line claiming it had "landed and disarmed".
+
+        If the mode changed under us, the pilot (or the FC) is in control. Commanding
+        anything now would fight them, so we only stop.
+        """
+        log.info(f"[ABORT] Reason: {self.abort_reason}")
+
+        if not self._airborne:
+            log.info("[ABORT] Never armed - nothing to recover")
+            return State.DONE
+
+        if self.abort_reason and self.abort_reason.startswith("MODE_CHANGED"):
+            log.warning(
+                "[ABORT] The flight controller left our mode - the pilot or an FC "
+                "failsafe is in control. Sending nothing further."
+            )
+            return State.DONE
+
+        self.failsafe.start_phase("RECOVER")
+        return State.RECOVER

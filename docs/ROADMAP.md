@@ -8,8 +8,8 @@ mechanical step — **not** a debugging session on a flying aircraft.
 
 > Everything that can be developed and tested against **SITL** on the Mac is finished
 > there. On the real hardware only the following remains: flash the Pi → clone the
-> code → switch to `Config.pi_serial()` → wire the Pi to the flight controller →
-> run incremental flight tests. No logic debugging on the flying object.
+> code → run it with `--pi` → wire the Pi to the flight controller → run incremental
+> flight tests. No logic debugging on the flying object.
 
 The architecture already supports this: `config.py` isolates the only SITL ↔ Pi
 difference (the `connection_string`), `drone.py` is hardware-agnostic, `camera.py`
@@ -73,9 +73,9 @@ whose position is not known in advance.
 The delivery pad location is unknown, so the state machine grows a search stage:
 
 ```
-IDLE → TAKEOFF → SEARCH → APPROACH → DROP → RTL
+IDLE → TAKEOFF → SEARCH → APPROACH → DROP → RECOVER
                     ↑__________|   (target lost → back to SEARCH)
-                                       (ABORT → RTL on failsafe)
+                          (ABORT on failsafe → RECOVER, i.e. LAND indoors)
 ```
 
 *Navigation (GPS-denied):*
@@ -177,6 +177,35 @@ Every test is logged and documented (what was tested, parameters, outcome).
 
 ---
 
+### Phase 3b — Diagnostics & safety hardening *(done)*
+**Goal:** never again debug a flight from a log that does not say what happened, and
+never let a companion-side problem turn into a crash.
+
+Driven entirely by things that actually went wrong in SITL:
+
+- **`STATUSTEXT` into the mission log.** A rejected arming used to be a bare `result=4`;
+  the reason (`PreArm: Check mag field`) was only visible in a MAVProxy console we do
+  not have in flight. `Drone.tick()` now mirrors every autopilot message with its
+  severity, and logs the firmware version on connect.
+- **Companion heartbeat.** Without one the FC's `FS_GCS_*` failsafe can never fire —
+  ArduPilot only starts monitoring after it has seen a heartbeat from `SYSID_MYGCS`.
+- **Verified instead of assumed.** `set_origin()` reads the origin back (ArduPilot drops
+  the message silently when one is already set — a "green" Phase 3 run had in fact been
+  flying on the simulator's origin), and `takeoff()` checks the altitude is *held*, not
+  just crossed (a 2 m takeoff sailed to 4.5 m and breached the fence).
+- **Mode monitoring.** If the FC leaves GUIDED — pilot, fence breach, EKF failsafe — the
+  mission stops instead of sending waypoints into the void or, worse, commanding RTL
+  over a human who has just taken control.
+- **LAND instead of RTL, and `ABORT` split three ways** (never armed / mode changed /
+  airborne). RTL climbs to `RTL_ALT` first, which indoors is the ceiling.
+- **FC safety envelope** set + verified before every flight (`FENCE_ACTION`, `RTL_ALT`
+  with the 4.6/4.7 name fallback, `WPNAV_SPEED_UP`).
+- **Presets over source edits:** `python main.py --pi`; `Config.sitl()`/`Config.pi()`
+  carry the drop-servo path and battery threshold.
+
+**Done when:** `pytest` covers each of the above (28 tests) and a SITL run logs the
+firmware version, the autopilot's own messages and a named abort reason. ☑
+
 ## Cross-cutting
 
 - **Documentation is written per phase, not at the end.** Each phase produces or
@@ -192,9 +221,10 @@ Every test is logged and documented (what was tested, parameters, outcome).
 | 0     | Foundation & hygiene           | ☑ done |
 | 1     | Full mission in SITL (GPS)     | ☑ done (SITL: full mission + LOW_BATTERY abort verified) |
 | 2     | GPS-denied nav + target search | ☑ done (SITL: optical-flow search→approach→drop verified) |
-| 3     | GPS-denied real HW: origin, fence, TimedCamera | ◑ code + tests done, SITL/real flight pending |
+| 3     | GPS-denied real HW: origin, fence, TimedCamera | ☑ done (SITL on ArduCopter **4.6.3**: origin set + verified by the companion, GPS off, full indoor mission green) |
+| 3b    | Diagnostics & safety hardening | ☑ done (STATUSTEXT logging, companion heartbeat, verified origin/takeoff, mode monitoring, LAND instead of RTL, FC safety envelope) |
 | 4     | Real AI camera                 | ☐     |
-| 5     | Pi provisioning & HIL prep     | ☐     |
+| 5     | Pi provisioning & HIL prep     | ◑ MTF-01P configured + serial verified; Pi image / mavlink-router / systemd still open |
 | 6     | Bench integration (no props)   | ☐     |
 | 7     | Flight tests                   | ☐     |
 | 8     | Documentation & deliverables   | ☐     |

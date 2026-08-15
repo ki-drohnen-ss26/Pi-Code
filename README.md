@@ -104,19 +104,29 @@ By default `main.py` connects on port 14550 (`Config.sitl()`), which is the port
 Indoor run (default `gps_denied=True`):
 
 ```
-[ORIGIN] EKF origin set: lat=50.131196 lon=8.692972 alt=112.0 m
+[FC] ArduPilot flight software 4.6.3
+[ORIGIN] EKF origin confirmed: lat=50.131196 lon=8.692972
+[FAILSAFE] Safety envelope: climb<=50.0 cm/s, FENCE_ACTION=2 (2=Always Land), RTL_ALT=2.0 m
 [FAILSAFE] Geofence enabled (type=1, alt_max=4.0 m)
 [PREARM] Waiting for relative (optical flow) EKF position estimate ...
 [PREARM] EKF position estimate ready
 [MODE] Mode is now GUIDED
+[FAILSAFE] Watching for a mode change away from GUIDED
 [ARM] Motors are armed
-[TAKEOFF] Altitude reached (2.1 m)
+[TAKEOFF] Altitude reached (2.0 m), settling ...
+[TAKEOFF] Altitude stable at 2.0 m
 [SEARCH] spiral pattern, 25 waypoints, cadence=stop_and_look
 [SEARCH] Target detected near (2.0, 2.0)
 [APPROACH] Centred over target (dx=-0.08, dy=0.10)
 [DROP] Release confirmed
-[RTL] Landed and disarmed
+[RECOVER] Landing here
+[RECOVER] Landed and disarmed
 ```
+
+Lines prefixed `[FC/...]` are messages from the autopilot itself (pre-arm rejections,
+fence breaches, EKF failsafes), mirrored into the log with their severity. They are the
+first place to look when something is refused — see
+[docs/SIM_TO_REAL.md](docs/SIM_TO_REAL.md) §9.
 
 ## Live map with a ground station (optional)
 
@@ -156,16 +166,31 @@ the MAVProxy console in Terminal 1:
 param set SIM_BATT_VOLTAGE 10.5
 ```
 
-The threshold is 10.8 V, so the `LOW_BATTERY` abort fires immediately and the
-state machine switches to `ABORT → RTL`.
+`Config.sitl()` uses a 10.8 V threshold (SITL's simulated pack sits at 12.6 V; the real
+4S Li-Ion threshold of 12.8 V would trip instantly). The abort needs
+`battery_low_samples` consecutive low readings — a single sag under load is not an empty
+battery — and then the machine goes `ABORT → RECOVER`, which **lands** rather than
+flying RTL. Indoors that matters: RTL first climbs to `RTL_ALT`.
+
+Other things worth provoking in SITL:
+
+```
+mode LOITER          # simulates the pilot taking over -> MODE_CHANGED_LOITER,
+                     # and the mission must then command NOTHING further
+```
 
 ## From SITL to the real Pi
 
-Conceptually **nothing in the code changes** except the endpoint in `main.py`:
+**Nothing in the code changes** — you pass a flag:
 
-```python
-config = Config.pi_serial("/dev/serial0", baud=921600)
+```bash
+python main.py            # SITL
+python main.py --pi       # the real Pi (via mavlink-router)
 ```
+
+Note that the Pi link is **UDP, not serial**: `mavlink-router` owns `/dev/serial0` and
+forwards the FC stream to `127.0.0.1:14550`, so the script binds to the same endpoint it
+uses against SITL. Use `--pi-serial` only if no router is running.
 
 The full transition — wiring, FC params, EKF/pre-arm differences, **camera axis
 mapping**, drop-servo calibration, link-loss / `FS_GCS`, and the safety checklist — is

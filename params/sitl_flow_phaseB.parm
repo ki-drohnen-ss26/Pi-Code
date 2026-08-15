@@ -1,5 +1,16 @@
 # SITL optical-flow + rangefinder setup — PHASE B (configure + point the EKF at flow).
-# Values match ArduPilot's own Tools/autotest/default_params/copter-optflow.parm.
+#
+# TARGET FIRMWARE: ArduCopter 4.6.x (the version our real FlywooF745 runs: 4.6.3).
+# Values match ArduPilot's own Tools/autotest/default_params/copter-optflow.parm
+# AT TAG Copter-4.6.3.
+#
+# !! PARAMETER NAMES ARE VERSION-SPECIFIC !!
+#   4.5.x / 4.6.x : RNGFND1_MIN_CM / RNGFND1_MAX_CM   (centimetres)  <-- used here
+#   4.7+ / master : RNGFND1_MIN    / RNGFND1_MAX      (metres)
+# Loading the wrong variant silently skips those lines ("unknown parameter"), which
+# leaves the rangefinder at its defaults — RNGFND1_MIN_CM defaults to 20 cm, and a
+# sensor mounted a few cm above the floor then never reads "good", so the EKF gets no
+# terrain height and arming fails with "Need Position Estimate".
 #
 # Load AFTER phase A + reboot (so the RNGFND1_* params exist), THEN REBOOT AGAIN
 # (the analog rangefinder backend only picks up RNGFND1_PIN on the next boot):
@@ -7,13 +18,18 @@
 #   reboot
 #
 # Note: we do NOT touch SIM_SONAR_SCALE — its default (12.1212) already matches
-# RNGFND1_SCALING (12.12). And we do NOT disable GPS: the EKF uses optical flow for
+# RNGFND1_SCALING (12.12). And we do NOT disable GPS here: the EKF uses optical flow for
 # horizontal position/velocity (POSXY=0, VELXY=OpticalFlow), while GPS still provides
 # the origin/home so the geofence and "waiting for home" pre-arm are satisfied.
-RNGFND1_MIN 0
-RNGFND1_MAX 40
-RNGFND1_PIN 0
-RNGFND1_SCALING 12.12
+# For a truly GPS-denied run (Phase 3) load sitl_gps_off.parm afterwards.
+# RNGFND1_PIN / RNGFND1_SCALING are deliberately absent: they only apply to the analog
+# backend (RNGFND1_TYPE 1). Phase A selects type 100 (the simulator's own rangefinder),
+# which needs no pin and no voltage scaling.
+RNGFND1_MIN_CM 0
+RNGFND1_MAX_CM 4000
 EK3_SRC1_POSXY 0
 EK3_SRC1_VELXY 5
 EK3_SRC1_VELZ 0
+# FuseAllVelocities off. Our flight controller uses 0 too (see the project docs); the
+# firmware default is 1, which a wiped EEPROM restores.
+EK3_SRC_OPTIONS 0
