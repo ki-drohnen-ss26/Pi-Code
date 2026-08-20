@@ -10,9 +10,21 @@ for how the components fit together.
 Nothing in the source changes. `main.py` picks a preset:
 
 ```bash
-python main.py            # SITL on the Mac
-python main.py --pi       # the real Pi, via mavlink-router
+python main.py            # the real aircraft, via mavlink-router  ← the DEFAULT
+python main.py --sim      # SITL on the Mac
 ```
+
+> **The real aircraft is the default; simulation is opt-in.** This is a safety property,
+> not a preference. The two possible mistakes are not equally bad:
+>
+> | Mistake | What happens |
+> |---|---|
+> | Real aircraft runs **simulation** values | **Silent and dangerous.** `battery_min_voltage` 10.8 V is *below* the 4S Li-Ion's 11.2 V empty voltage → the low-battery abort can never fire. The drop is commanded on an FC output with no servo. `SimCamera` reports a target that is not there, so the aircraft flies to an empty spot and drops. |
+> | Simulation runs **real** values | **Immediate and harmless.** `PiServo` raises "needs gpiozero (Raspberry Pi only)" before takeoff. |
+>
+> So the dangerous direction needs the flag. `main.py` also logs the active profile on
+> every start, with the simulation banner deliberately loud — seeing it next to an armed
+> aircraft means stop.
 
 > **The Pi link is UDP, not serial** — this surprises people. `mavlink-router` runs as a
 > systemd service on the Pi, owns `/dev/serial0` and forwards the FC stream to
@@ -20,13 +32,16 @@ python main.py --pi       # the real Pi, via mavlink-router
 > UDP endpoint it uses against SITL. `Config.pi_serial()` (`python main.py --pi-serial`)
 > exists only for a setup **without** a router.
 
-Everything else (drone / mission / failsafe / camera) is identical. `Config.sitl()` and
-`Config.pi()` also carry the two genuine hardware differences, so they stay in one place:
+Everything else (drone / mission / failsafe / camera) is identical. The **dataclass
+defaults in `config.py` are the flight configuration** — reading that file tells you how
+the real aircraft is set up. `Config.pi()` therefore overrides *nothing* but the
+endpoint, and every deviation from reality lives in exactly one place, `Config.sitl()`:
 
-| | `Config.sitl()` | `Config.pi()` |
+| | `Config.sitl()` (the deviation) | `Config.pi()` = the defaults |
 |---|---|---|
-| `release_mechanism` | `"fc"` — servo on an FC output (there is no GPIO on a Mac) | `"pi"` — servo on a Pi GPIO pin |
-| `battery_min_voltage` | `10.8 V` — matches SITL's simulated ~12.6 V pack | `12.8 V` — our 4S Li-Ion (16.4 V full, 11.2 V empty) |
+| `release_mechanism` | `"fc"` — servo on an FC output (there is no GPIO on a Mac), and SITL echoes the value back so the drop can be verified | `"pi"` — servo on a Pi GPIO pin |
+| `battery_min_voltage` | `10.8 V` — matches SITL's simulated ~12.6 V pack; the real threshold would abort on the first reading | `12.8 V` — our 4S Li-Ion (16.4 V full, 11.2 V empty) |
+| `camera_source` | `"auto"` — resolves to `SimCamera`/`MockCamera` | `"timed"` — honest camera-less default; `"real"` once an `.rpk` is on board |
 
 ## What stays the same vs what changes
 
@@ -36,7 +51,7 @@ Everything else (drone / mission / failsafe / camera) is identical. `Config.sitl
 | Mission logic | identical | identical |
 | Pre-arm | GPS/EKF converge in seconds | real GPS fix / EKF / compass must be healthy |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
-| Camera | Mock / Sim / Timed | RealCamera (AI camera) |
+| Camera | Mock / Sim / Timed | `RealCamera` — IMX500, model runs on the sensor NPU (§3a) |
 | Drop servo | `FcServo` (FC output, value echoed back) | `PiServo` (servo on Pi GPIO) — **calibrate PWM, test on bench** |
 
 ## 1. Physical connection
@@ -117,12 +132,49 @@ assumption (downward-facing camera, image-top = nose):
 conventions.** Calibrate once:
 
 1. Hover and place the target clearly to the drone's **right**.
-2. Read and log the camera's `dx / dy`.
+2. Read and log the camera's `dx / dy` (`RealCamera` logs every detection as
+   `[CAM] '<label>' p=… -> dx=… dy=… m`).
 3. Confirm a positive `dx` makes the drone move **toward** the target (right), not away.
-4. If reversed or swapped, flip the sign / swap the axes in `_nudge_from_offset()`.
+4. If reversed or swapped, set the mounting parameters — **no source edit**:
+
+| Symptom | Fix |
+|---|---|
+| Drone moves left when the pad is right | `cam_invert_x = True` |
+| Drone moves back when the pad is ahead | `cam_invert_y = True` |
+| Left/right and forward/back are interchanged | `cam_swap_axes = True` (camera rotated 90° in its mount) |
 
 Getting this wrong means the drone "corrects" **away** from the target. Verify in SITL
 with `ScriptedCamera`, then re-verify on the real camera (mounting may differ).
+
+### 3a. `RealCamera` (IMX500) — units and the model format
+
+Two things about the real camera are not obvious and both have bitten us:
+
+**The IMX500 cannot run a `.tflite`.** It executes the network on the *sensor's* NPU and
+only loads Sony's packaged **`.rpk`** format. A `.tflite` would have to run on the Pi's
+CPU, and a Zero 2 W cannot do that at a useful rate while also serving MAVLink. Produce
+the `.rpk` from the trained weights:
+
+```bash
+yolo export model=<trained>.pt format=imx data=<dataset>.yaml   # Linux / Docker
+imx500-package -i packerOut.zip -o ~/models/pad                 # on the Pi
+```
+`imx500-package` ships with `imx500-all`, so install that on the Pi first.
+
+**`RealCamera` returns ground METRES, not image fractions.** `SimCamera` — against which
+the whole mission was validated in SITL — reports metres, and `centre_tolerance`,
+`approach_gain` and `max_nudge_m` are tuned for metres. A camera natively reports "30 %
+of the frame to the right", so `RealCamera` converts once, using
+`tan(fraction × FOV/2) × height`. The height comes from the drone; without one it falls
+back to `search_altitude` **and warns**, because every correction is then mis-scaled by
+the ratio of assumed to real height. `cam_hfov_deg` / `cam_vfov_deg` must match the lens
+and the crop actually in use, or the same scaling error appears silently.
+
+> **`camera_source` on the real aircraft.** `Config.pi()` pins it to `"timed"`, not
+> `"auto"`. On the drone `"auto"` resolves to `SimCamera`, which **invents** a target at
+> `sim_target_north/east` and reports it detected — the aircraft would fly to a spot
+> where nothing is and drop there. Set `"real"` only once `camera_model_path` points at
+> a real `.rpk`.
 
 > Related open design question: downward (nadir) vs slightly tilted camera. Nadir keeps
 > this mapping trivial and is the recommended starting point; a forward tilt helps the
@@ -138,10 +190,18 @@ The release lives behind the `ReleaseMechanism` protocol (`release.py`), selecte
 | `"pi"` (our indoor build) | `PiServo` | a **Raspberry Pi GPIO pin** (`config.drop_gpio_pin`, BCM, default 18) | Pi generates the PWM directly; the FC is not involved |
 
 **Our build uses `"pi"`** — the servo hangs off the Pi. On the Pi:
-- Install the GPIO libs: `pip install gpiozero pigpio`. For jitter-free pulses run the
-  pigpio daemon (`sudo apt install pigpio && sudo systemctl enable --now pigpiod`) and
-  export `GPIOZERO_PIN_FACTORY=pigpio`; otherwise gpiozero uses software PWM and the
-  servo may twitch.
+- Install the GPIO libs: `sudo apt install python3-gpiozero python3-lgpio`.
+  > **Do not follow older guides that tell you to install `pigpio`.** The pigpio daemon
+  > was **removed from Debian 13 (trixie)**, which our Raspberry Pi OS is based on —
+  > `apt install pigpio` fails with *"has no installation candidate"*, and setting
+  > `GPIOZERO_PIN_FACTORY=pigpio` would then break the release outright. Verified on the
+  > real Pi: gpiozero already selects **`LGPIOFactory`** by default, which drives the pin
+  > through the kernel's GPIO character device. That is the current, supported backend —
+  > no daemon, no extra configuration. Check with:
+  > ```bash
+  > python3 -c "from gpiozero import Device; Device.ensure_pin_factory(); print(type(Device.pin_factory).__name__)"
+  > # -> LGPIOFactory
+  > ```
 - **Power the servo from a separate 5 V BEC, not the Pi's 5 V pin** — stall/inrush
   current can brown out a Pi Zero 2 W. Only the **signal** wire goes to the GPIO pin,
   with a **common ground** between the BEC and the Pi.

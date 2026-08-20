@@ -11,7 +11,7 @@ The only difference is the `connection_string` in `config.py`.
 |------------------|-------------------------------------------------------------|
 | `config.py`      | Connection + all parameters (SITL vs. Pi in one place)      |
 | `drone.py`       | Heartbeat, telemetry, basic commands, payload release       |
-| `camera.py`      | Camera interface: `MockCamera`, `ScriptedCamera`, `SimCamera`, `TimedCamera` |
+| `camera.py`      | Camera interface: `MockCamera`, `ScriptedCamera`, `SimCamera`, `TimedCamera`, `RealCamera` (IMX500) |
 | `failsafe.py`    | Link loss, telemetry loss, battery, phase timeout, geofence |
 | `mission.py`     | State machine — GPS path + indoor SEARCH/APPROACH path      |
 | `release.py`     | Drop mechanism: `FcServo` (servo on FC) / `PiServo` (servo on Pi GPIO) |
@@ -87,11 +87,14 @@ Fly". Only then are the pre-arm checks (GPS/EKF position) satisfied.
 
 ```bash
 cd Pi-Code
-python main.py
+python main.py --sim
 ```
 
-By default `main.py` connects on port 14550 (`Config.sitl()`), which is the port
-`sim_vehicle.py` outputs to.
+> **`--sim` is not optional.** Without it `main.py` runs the **real-aircraft** profile
+> (see "From SITL to the real drone" below). `--sim` connects on port 14550, which is
+> the port `sim_vehicle.py` outputs to, and switches the drop servo, the battery
+> threshold and the camera to their simulation values. Every run prints which profile it
+> picked, and the simulation banner is deliberately loud.
 
 > **GPS vs indoor path & camera.** `config.gps_denied` defaults to **True**, so `main.py`
 > runs the indoor SEARCH/APPROACH path. The camera is chosen by `config.camera_source`
@@ -179,14 +182,23 @@ mode LOITER          # simulates the pilot taking over -> MODE_CHANGED_LOITER,
                      # and the mission must then command NOTHING further
 ```
 
-## From SITL to the real Pi
+## From SITL to the real drone
 
-**Nothing in the code changes** — you pass a flag:
+**Nothing in the code changes** — and the *default* is the real aircraft:
 
 ```bash
-python main.py            # SITL
-python main.py --pi       # the real Pi (via mavlink-router)
+python main.py            # REAL AIRCRAFT (via mavlink-router)
+python main.py --sim      # simulation against SITL
 ```
+
+> **Why the real drone is the default.** Forgetting a flag must fail on the safe side,
+> and the two mistakes are not equally bad. Simulation values on a real aircraft fail
+> **silently**: `battery_min_voltage` would be 10.8 V — *below* a 4S Li-Ion's empty
+> voltage of 11.2 V — so the low-battery abort could never fire; the drop would be
+> commanded on an FC output that carries no servo; and `SimCamera` would report a target
+> that does not exist, so the aircraft flies to an empty spot and drops there. Real
+> values in simulation fail **immediately and harmlessly**: `PiServo` raises because a
+> Mac has no GPIO. So the dangerous direction is the one that needs the flag.
 
 Note that the Pi link is **UDP, not serial**: `mavlink-router` owns `/dev/serial0` and
 forwards the FC stream to `127.0.0.1:14550`, so the script binds to the same endpoint it

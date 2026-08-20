@@ -133,12 +133,22 @@ the flight-test phase).
 
 ### Phase 4 — Real AI camera *(Pi, developed in parallel)*
 **Goal:** replace the mock camera without touching mission logic.
-- Implement `RealCamera` (IMX500 / YOLO from `yolo-imx500/`) that satisfies the
-  existing `Camera` protocol: turn a detection bounding box into `dx/dy/distance`.
-- Test standalone on the Pi (no flight): point at the target object and print offsets.
+- Implement `RealCamera` (IMX500 / YOLO) that satisfies the existing `Camera` protocol:
+  turn a detection bounding box into `dx/dy/distance`. ☑ *implemented*
+- Test standalone on the Pi (no flight): point at the target object and print offsets. ☐
 
-**Done when:** swapping `MockCamera` → `RealCamera` in `main.py` is the only change
-and the mission code is untouched.
+**Done when:** selecting `config.camera_source = "real"` is the only change and the
+mission code is untouched.
+
+*Status:* `RealCamera` is written and wired in (`camera_source="real"`), the IMX500 is
+detected on the Pi (`imx500 [4056x3040]`), and the mounting calibration is exposed as
+`cam_swap_axes` / `cam_invert_x` / `cam_invert_y` so it needs no source edit between
+test flights. **Blocked on the model:** the trained pad detector exists only as
+`pad_320_int8.tflite` (YOLO11, 320 px, int8), and the IMX500 loads **only** Sony's
+`.rpk` format — a `.tflite` would have to run on the Pi's CPU, which a Zero 2 W cannot
+sustain alongside MAVLink. A re-export (`yolo export … format=imx` → `imx500-package`)
+is pending. Also still open: `imx500-all` is not installed on the Pi (needs internet),
+and the axis calibration itself must be flown.
 
 ### Phase 5 — Pi provisioning & hardware-in-the-loop prep
 **Goal:** a reproducible Pi image and a configured flight controller.
@@ -200,7 +210,8 @@ Driven entirely by things that actually went wrong in SITL:
   airborne). RTL climbs to `RTL_ALT` first, which indoors is the ceiling.
 - **FC safety envelope** set + verified before every flight (`FENCE_ACTION`, `RTL_ALT`
   with the 4.6/4.7 name fallback, `WPNAV_SPEED_UP`).
-- **Presets over source edits:** `python main.py --pi`; `Config.sitl()`/`Config.pi()`
+- **Presets over source edits:** `python main.py` runs the **real aircraft**, `--sim`
+  the simulator; `Config.sitl()`/`Config.pi()`
   carry the drop-servo path and battery threshold.
 
 **Done when:** `pytest` covers each of the above (28 tests) and a SITL run logs the
@@ -223,8 +234,20 @@ firmware version, the autopilot's own messages and a named abort reason. ☑
 | 2     | GPS-denied nav + target search | ☑ done (SITL: optical-flow search→approach→drop verified) |
 | 3     | GPS-denied real HW: origin, fence, TimedCamera | ☑ done (SITL on ArduCopter **4.6.3**: origin set + verified by the companion, GPS off, full indoor mission green) |
 | 3b    | Diagnostics & safety hardening | ☑ done (STATUSTEXT logging, companion heartbeat, verified origin/takeoff, mode monitoring, LAND instead of RTL, FC safety envelope) |
-| 4     | Real AI camera                 | ☐     |
-| 5     | Pi provisioning & HIL prep     | ◑ MTF-01P configured + serial verified; Pi image / mavlink-router / systemd still open |
-| 6     | Bench integration (no props)   | ☐     |
-| 7     | Flight tests                   | ☐     |
+| 4     | Real AI camera                 | ◑ `RealCamera` implemented + wired; IMX500 detected on the Pi. Blocked on an `.rpk` model (only `.tflite` exists) and `imx500-all` |
+| 5     | Pi provisioning & HIL prep     | ◑ Pi image, `mavlink-router` (systemd, `/dev/serial0` @ 921600 → `127.0.0.1:14550`), pymavlink, gpiozero/lgpio all **verified on hardware**. **MTF-01P delivers no data** — see below |
+| 6     | Bench integration (no props)   | ◑ Companion↔FC link verified against the real FC (heartbeat, `--tele`, ArduPilot 4.6.3). Servo drop + arm/disarm still open |
+| 7     | Flight tests                   | ☐ **blocked:** `ARMING_CHECK = 0` on the FC (all pre-arm checks disabled) must be restored before any flight |
 | 8     | Documentation & deliverables   | ☐     |
+
+> **Correction (bench session, real hardware).** Phase 5 previously claimed "MTF-01P
+> configured + serial verified". Measured against the actual flight controller, that is
+> **not** the case: `RANGEFINDER` streams a constant `0.00 m` and no `OPTICAL_FLOW`
+> messages arrive at all, so the EKF sits in `CONST_POS_MODE` without `POS_HORIZ_REL` —
+> the indoor mission would abort at `NO_POSITION_ESTIMATE` before ever leaving the
+> ground. The **flight-controller side is provably correct** (`SERIAL5` = MAVLink1 @
+> 115200, `FLOW_TYPE` 5, `RNGFND1_TYPE` 10, `RNGFND1_MIN_CM` 1, `RNGFND1_ORIENT` 25 —
+> every value matches `project-docs/hardware/drone/InitialSetup.md`), so the fault is on
+> the sensor side: the MTF-01P supports both MSP and MAVLink and was, per the team's own
+> week-3 journal, never configured. Next steps: check the sensor's power LED, then an
+> MSP counter-test on the FC, then the CP2102 adapter.

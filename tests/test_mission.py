@@ -585,3 +585,76 @@ def test_camera_less_flight_searches_and_drops():
     assert "set_origin" in actions
     assert "goto_local" in actions   # it flew the search pattern
     assert "drop" in actions
+
+
+# ======================================================================
+# Preset selection: the real aircraft is the DEFAULT, simulation is opt-in
+# ======================================================================
+# These guard a safety property, not a convenience: the two possible mistakes are
+# not equally bad. Simulation values on a real aircraft are silent and dangerous
+# (battery_min_voltage 10.8 V is BELOW a 4S Li-Ion's 11.2 V empty voltage, so the
+# low-battery abort could never fire; the drop goes to an FC output with no servo;
+# SimCamera reports a target that is not there). Real values in simulation fail
+# loudly and harmlessly. So the dangerous direction is the one that needs a flag.
+
+def test_dataclass_defaults_are_the_flight_configuration():
+    """Plain Config() must describe the real aircraft, not the simulator."""
+    config = Config()
+    assert config.release_mechanism == "pi"       # servo on the Pi GPIO
+    assert config.battery_min_voltage == 12.8     # 4S Li-Ion, not SITL's pack
+    assert config.camera_source != "auto"         # "auto" would be SimCamera on a drone
+
+
+def test_no_flag_selects_the_real_aircraft():
+    from main import make_config
+
+    config = make_config(["main.py"])
+    assert config.release_mechanism == "pi"
+    assert config.battery_min_voltage == 12.8
+    assert config.camera_source == "timed"        # honest camera-less default
+
+
+def test_sim_flag_selects_simulation():
+    from main import make_config
+
+    for flag in ("--sim", "--sitl"):
+        config = make_config(["main.py", flag])
+        assert config.release_mechanism == "fc", flag
+        assert config.battery_min_voltage == 10.8, flag
+        assert config.camera_source == "auto", flag
+        assert config.connection_string == "udpin:127.0.0.1:14550", flag
+
+
+def test_sim_flag_honours_a_custom_port():
+    from main import make_config
+
+    config = make_config(["main.py", "--sim", "--port", "14551"])
+    assert config.connection_string == "udpin:127.0.0.1:14551"
+    assert config.release_mechanism == "fc"
+
+
+def test_port_without_sim_does_not_silently_simulate():
+    """--port alone used to imply SITL. It must not: a stray --port on the drone
+    would otherwise hand the real aircraft the simulator's battery threshold."""
+    from main import make_config
+
+    config = make_config(["main.py", "--port", "14551"])
+    assert config.release_mechanism == "pi"
+    assert config.battery_min_voltage == 12.8
+
+
+def test_pi_serial_stays_a_real_aircraft_profile():
+    from main import make_config
+
+    config = make_config(["main.py", "--pi-serial"])
+    assert config.connection_string == "/dev/serial0"
+    assert config.baud == 921600
+    assert config.release_mechanism == "pi"
+    assert config.battery_min_voltage == 12.8
+
+
+def test_pi_flag_still_accepted_as_a_redundant_alias():
+    """--pi is documented in older notes; it must keep meaning 'real aircraft'."""
+    from main import make_config
+
+    assert make_config(["main.py", "--pi"]).release_mechanism == "pi"

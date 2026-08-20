@@ -27,7 +27,7 @@ flowchart TB
         scripted["ScriptedCamera"]
         sim["SimCamera"]
         timed["TimedCamera"]
-        real["RealCamera — Phase 4"]
+        real["RealCamera — IMX500"]
     end
 
     subgraph rel["ReleaseMechanism — Protocol, release.py"]
@@ -60,9 +60,9 @@ flowchart TB
 | Component | Responsibility |
 |-----------|----------------|
 | `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The single line that differs SITL vs Pi lives here. |
-| `Config` | All parameters. `Config.sitl()` / `Config.pi()` / `Config.pi_serial()` encode the whole SITL↔hardware delta (endpoint, drop-servo path, battery threshold); `main.py` picks one from a CLI flag. |
+| `Config` | All parameters. The **dataclass defaults are the flight configuration**, so `Config.pi()` overrides only the endpoint and every simulation deviation is confined to `Config.sitl()` (drop-servo path, battery threshold, camera source). `main.py` defaults to the real aircraft; `--sim` opts into the simulator, and the active profile is logged on every start. |
 | `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. |
-| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera`/`TimedCamera` now; `RealCamera` (AI camera) later — same contract, so the mission never changes. Chosen by `config.camera_source`. |
+| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera`/`TimedCamera` for simulation, `RealCamera` for the IMX500 AI camera (network runs on the sensor's NPU, so the Pi's CPU stays free for MAVLink). Same contract throughout, so the mission never changes. Chosen by `config.camera_source`. `RealCamera` returns **ground metres**, not image fractions — see [SIM_TO_REAL.md §3a](SIM_TO_REAL.md) for why, and for the `cam_*` mounting calibration. |
 | `ReleaseMechanism` | A `Protocol` (`setup/reset/drop/confirm`) for the payload drop. `FcServo` drives a servo on an FC output over MAVLink (SITL); `PiServo` drives a servo on a Pi GPIO pin directly. Chosen by `config.release_mechanism` — the mission never changes. |
 | `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout. Returns a reason string; the mission decides to ABORT. |
 | `DeliveryMission` | The state machine that sequences the delivery and runs the failsafe check before each state. |
