@@ -19,7 +19,7 @@ python main.py --sim      # SITL on the Mac
 >
 > | Mistake | What happens |
 > |---|---|
-> | Real aircraft runs **simulation** values | **Silent and dangerous.** `battery_min_voltage` 10.8 V is *below* the 4S Li-Ion's 11.2 V empty voltage → the low-battery abort can never fire. The drop is commanded on an FC output with no servo. `SimCamera` reports a target that is not there, so the aircraft flies to an empty spot and drops. |
+> | Real aircraft runs **simulation** values | **Silent and dangerous.** `battery_min_voltage` 10.8 V is *below* the 4S Li-Ion's 11.2 V empty voltage → the low-battery **voltage** abort can never fire. Only the 20 % remaining-capacity arm of `battery_critical()` would be left, and that depends on the FC's current sensor and `BATT_CAPACITY` being right (it is skipped entirely when the FC reports `-1`). The drop is commanded on an FC output with no servo. `SimCamera` reports a target that is not there, so the aircraft flies to an empty spot and drops. |
 > | Simulation runs **real** values | **Immediate and harmless.** `PiServo` raises "needs gpiozero (Raspberry Pi only)" before takeoff. |
 >
 > So the dangerous direction needs the flag. `main.py` also logs the active profile on
@@ -49,9 +49,9 @@ endpoint, and every deviation from reality lives in exactly one place, `Config.s
 |------|------|---------------|
 | Connection | `udpin:127.0.0.1:14550` | `udpin:127.0.0.1:14550` (via mavlink-router) |
 | Mission logic | identical | identical |
-| Pre-arm | GPS/EKF converge in seconds | real GPS fix / EKF / compass must be healthy |
+| Pre-arm | GPS/EKF converge in seconds | `ARMING_CHECK = 0` measured on our FC — every autopilot check is off, the companion's `wait_ready_to_arm()` is the only gate left (§2) |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
-| Camera | Mock / Sim / Timed | `RealCamera` — IMX500, model runs on the sensor NPU (§3a) |
+| Camera | Mock / Sim (`Config.sitl()` sets `"auto"`) | `TimedCamera` today (`camera_source="timed"` — no detection at all); `RealCamera` (IMX500, model on the sensor NPU, §3a) once an `.rpk` is aboard |
 | Drop servo | `FcServo` (FC output, value echoed back) | `PiServo` (servo on Pi GPIO) — **calibrate PWM, test on bench** |
 
 ## 1. Physical connection
@@ -64,8 +64,14 @@ adapter to the FC.
 
 ## 2. Pre-arm & EKF (position estimate)
 - **Outdoor / GPS:** `wait_ready_to_arm()` waits for `EKF_POS_HORIZ_ABS` (absolute,
-  from GPS). Pre-arm checks are real now: GPS fix, EKF, compass must be healthy —
-  `arm()` retries with pauses instead of giving up or blocking.
+  from GPS). On our FC `ARMING_CHECK` is currently **0** — all pre-arm checks are
+  disabled, so the autopilot arms with an unhealthy EKF, an unhealthy compass or no
+  position estimate at all. The only gate left is the companion's
+  `wait_ready_to_arm()`, and that is a single `EKF_STATUS_REPORT` bit. Restore
+  `ARMING_CHECK = 1` before any flight, or set the value `786390` (every check except
+  the GPS lock). Set the value by hand — do **not** load `../params/sitl_gps_off.parm`
+  onto the flight controller, it is a SITL file (see `../params/README.md`). `arm()` retries with pauses instead
+  of giving up or blocking.
 - **Indoor / no GPS (Phase 2, implemented):** `config.gps_denied = True` makes
   `wait_ready_to_arm(require_abs=False)` wait for `EKF_POS_HORIZ_REL` (relative, from
   optical flow), and navigation uses `goto_local()` (local NED) instead of `goto()`
@@ -170,8 +176,8 @@ back to `search_altitude` **and warns**, because every correction is then mis-sc
 the ratio of assumed to real height. `cam_hfov_deg` / `cam_vfov_deg` must match the lens
 and the crop actually in use, or the same scaling error appears silently.
 
-> **`camera_source` on the real aircraft.** `Config.pi()` pins it to `"timed"`, not
-> `"auto"`. On the drone `"auto"` resolves to `SimCamera`, which **invents** a target at
+> **`camera_source` on the real aircraft.** It is `"timed"` by the dataclass default —
+> `Config.pi()` does not override it — and deliberately not `"auto"`. On the drone `"auto"` resolves to `SimCamera`, which **invents** a target at
 > `sim_target_north/east` and reports it detected — the aircraft would fly to a spot
 > where nothing is and drop there. Set `"real"` only once `camera_model_path` points at
 > a real `.rpk`.
@@ -230,6 +236,39 @@ Calibration (either path), on the **bench, no props**:
     `0:Disabled, 1:RTL, 3:SmartRTL or RTL, 4:SmartRTL or Land, 5:Land`. Use `5` (Land)
     in a hall, or leave it `0` and rely on the pilot — but then write down that a dead
     Pi has no automatic rescue.
+
+## 5b. Flyaway: why it happens indoors, and what stops it
+
+Another team reported their aircraft going to full power and flying away. That is not a
+random failure — it is the standard end state of a GPS-denied position estimate that has
+lost its height reference, and every precondition for it can be present while the
+aircraft looks healthy.
+
+**The mechanism.** In `GUIDED` the autopilot flies to a *position target*. Optical flow
+measures an **angular** rate; turning it into a velocity needs a height, which comes from
+the rangefinder. With no valid height the flow cannot be scaled, the position estimate
+drifts, and the controller sees a large and growing error to its target — so it
+accelerates to correct it. The aircraft is not malfunctioning; it is chasing an error
+that exists only in the filter. `../params/README.md` records **366 m of drift measured
+while the vehicle stood still**, from a rangefinder stuck at `0.00 m`.
+
+**Why nothing catches it by default.** `EKF_POS_HORIZ_REL` can come up on a drifting
+estimate, so `wait_ready_to_arm()` passes. `ARMING_CHECK = 0` (measured on our FC, §2)
+removes the autopilot's own "Need Position Estimate" refusal. And the geofence we can set
+indoors is **altitude-only** (`FENCE_TYPE = 1`) — it guards the ceiling, not the walls.
+
+**What the companion now does about it:**
+
+| Guard | Where | What it catches |
+|---|---|---|
+| `verify_position_sensors()` | before arming | The rangefinder or the flow produce **no messages at all**. Note it does **not** abort on a reading of `0.00 m`: on the floor a healthy sensor reads zero too, so the value proves nothing there. |
+| `verify_rangefinder_tracks_altitude()` | right after the climb | The rangefinder does not follow the height — at 1 m it still reads `0.00`. **This is the check that catches the flyaway precondition**, and it runs at takeoff altitude where an abort is a short descent instead of after a whole search pattern's worth of drift. |
+| `position_implausible()` | every failsafe check in flight | The reported position leaves `max_position_radius_m` (15 m). This is the software stand-in for the horizontal fence we cannot set. Whether the aircraft is running away or the estimate is, the answer is the same: land. |
+| `WPNAV_SPEED` | safety envelope | Caps horizontal speed at `cruise_speed_cms` (100 cm/s). The firmware default is **1000 cm/s** — a hall crossed in under a second, and the difference between a drift you can take over from and one you cannot. |
+
+**What they do not replace.** A pilot with a kill switch, and `ARMING_CHECK` restored.
+The guards make the failure survivable and diagnosable; they do not make an
+unconfigured MTF-01P safe to fly.
 
 ## 5a. The safety envelope the companion enforces
 `failsafe.setup_safety_envelope()` writes three FC parameters before every flight,
@@ -291,6 +330,8 @@ log should state what it was flown against.
 - [ ] First flights **without propellers**.
 - [ ] Independent kill switch on the transmitter (mode switch / disarm). The companion
       failsafe does **not** replace it.
+- [ ] `ARMING_CHECK` restored on the FC — measured as **0**, i.e. every pre-arm check is
+      disabled and the autopilot would arm with an unhealthy EKF or compass (§2).
 - [ ] ArduPilot's own failsafes set: `BATT_LOW_VOLT`, `BATT_FS_LOW_ACT` (Land, not RTL),
       `FS_GCS_ENABLE` (Land, or 0 — see §5), radio failsafe (`FS_THR_ENABLE = 3`, Land).
 - [ ] `RNGFND1_MIN_CM` low enough (**1**, not the 20 cm default) — otherwise the

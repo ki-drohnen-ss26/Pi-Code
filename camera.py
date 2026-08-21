@@ -1,19 +1,34 @@
 """
 camera.py
 =========
-Mock of the camera interface. What matters here is not the implementation but
-the CONTRACT (the data structure). Your colleague later replaces only the body
-of get_target_offset() with real inference (AI camera module / IMX500). The
-signature and the returned dict stay the same -> the mission logic needs no
-changes.
+The camera CONTRACT and every implementation of it. What matters is the returned
+dict: the mission programs against that and never against a particular camera, so
+swapping detectors changes nothing in mission.py.
+
+    MockCamera      always centred - the simplest stand-in
+    ScriptedCamera  a fixed sequence of frames, for the correction loop in tests
+    SimCamera       a target at a known local NED position (SITL)
+    TimedCamera     "finds" after a set time, no detection at all. This is the REAL
+                    aircraft's current default (config.camera_source = "timed"), for
+                    camera-less flight tests.
+    RealCamera      Raspberry Pi AI Camera (Sony IMX500) - the network runs on the
+                    sensor's NPU
+
+config.camera_source selects one (ScriptedCamera is wired manually in main.py).
 
 Return format:
     {
-        "detected": bool,    # target detected in the image?
-        "dx": float,         # horizontal offset from image centre (m or normalised)
-        "dy": float,         # vertical offset from image centre
-        "distance": float,   # estimated distance to target in metres
+        "detected": bool,    # target detected?
+        "dx": float,         # GROUND offset to the target, body-right positive [m]
+        "dy": float,         # GROUND offset to the target, body-forward positive [m]
+        "distance": float,   # estimated distance to the target [m]
     }
+
+dx/dy are METRES, not image fractions - that is a hard requirement, not a preference.
+config.centre_tolerance (0.15 = 15 cm) and config.approach_gain are calibrated in
+metres, so a camera reporting image fractions would silently change what every one of
+those numbers means. RealCamera converts image angles with the pinhole relation to
+keep the contract.
 """
 
 import logging
@@ -23,8 +38,9 @@ from typing import Protocol
 
 
 class Camera(Protocol):
-    """Interface the mission programs against. Both implementations (mock now,
-    real later) satisfy this protocol type."""
+    """Interface the mission programs against. Every implementation in this module -
+    MockCamera, ScriptedCamera, SimCamera, TimedCamera and RealCamera - satisfies this
+    protocol type."""
 
     def get_target_offset(self) -> dict:
         ...
@@ -157,8 +173,10 @@ class RealCamera:
     `docs/SIM_TO_REAL.md` §3 requires the image→body axis mapping to be *calibrated* on
     the real airframe, because it depends on how the camera is physically rotated in its
     mount. Hard-coding it would mean editing source on a drone between test flights. The
-    four `cam_*` settings in `config.py` cover every 90° mounting and both sign
-    conventions, so calibration is a parameter change.
+    three mounting settings in `config.py` - `cam_swap_axes`, `cam_invert_x` and
+    `cam_invert_y` - cover every 90° mounting and both sign conventions, so calibration
+    is a parameter change. (`cam_hfov_deg`/`cam_vfov_deg` are the separate lens values
+    used by the metre conversion above.)
     """
 
     def __init__(self, config, drone=None, model_path: str | None = None):

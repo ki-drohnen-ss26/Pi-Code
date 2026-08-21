@@ -70,10 +70,15 @@ class PiServo:
       * Only the SIGNAL wire goes to the GPIO pin (`config.drop_gpio_pin`, BCM
         numbering; default 18 = physical pin 12), with a COMMON GROUND between the
         servo's BEC and the Pi.
-      * For jitter-free pulses use the pigpio backend: install it
-        (`sudo apt install pigpio && sudo systemctl enable --now pigpiod`) and set
-        the environment variable `GPIOZERO_PIN_FACTORY=pigpio`. Without it gpiozero
-        falls back to software PWM, which can make the servo twitch.
+      * Install with `sudo apt install python3-gpiozero python3-lgpio`. gpiozero then
+        selects LGPIOFactory by default and drives the pin through the kernel's GPIO
+        character device - no daemon, no extra configuration.
+        DO NOT install pigpio or export `GPIOZERO_PIN_FACTORY=pigpio`. The pigpio
+        package was REMOVED from Debian 13 (trixie), which our Raspberry Pi OS is
+        based on: `apt install pigpio` fails outright, and forcing that pin factory
+        makes Servo() raise BadPinFactory - inside setup(), which the mission calls
+        from IDLE, so the aircraft would die on the ground before ever arming.
+        Older guides still recommend pigpio; they predate trixie.
 
     The release is OPEN-LOOP (a GPIO output has no read-back), so confirm() trusts
     the commanded pulse.
@@ -94,7 +99,9 @@ class PiServo:
         except ImportError as exc:  # not on a Pi / lib missing
             raise RuntimeError(
                 "PiServo needs gpiozero (Raspberry Pi only). Install it on the Pi: "
-                "pip install gpiozero pigpio. For SITL keep config.release_mechanism='fc'."
+                "sudo apt install python3-gpiozero python3-lgpio. "
+                "For simulation run `python main.py --sim`, which selects "
+                "release_mechanism='fc'."
             ) from exc
 
         self._servo = Servo(

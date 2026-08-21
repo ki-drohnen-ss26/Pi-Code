@@ -10,6 +10,8 @@ config.gps_denied:
         IDLE -> TAKEOFF -> SEARCH -> APPROACH -> DROP -> RECOVER -> DONE
                               ^_________|  (target lost)
                                                       (ABORT on failsafe)
+    Bring-up hover (config.hover_test_s > 0), short-circuits both:
+        IDLE -> TAKEOFF -> HOVER -> RECOVER -> DONE
 
 Each state does exactly one thing and returns the next state. The failsafe is
 checked before every step - if it fires, the machine jumps to ABORT.
@@ -43,6 +45,7 @@ log = logging.getLogger(__name__)
 class State(Enum):
     IDLE = auto()
     TAKEOFF = auto()
+    HOVER = auto()        # bring-up: climb, hold still, come down (no search, no drop)
     SEARCH = auto()       # indoor: fly a pattern, look for the target
     APPROACH = auto()     # indoor: visual servoing onto a detected target
     ENROUTE = auto()      # GPS: fly to known coordinates
@@ -75,6 +78,7 @@ class DeliveryMission:
         dispatch = {
             State.IDLE: self._idle,
             State.TAKEOFF: self._takeoff,
+            State.HOVER: self._hover,
             State.SEARCH: self._search,
             State.APPROACH: self._approach,
             State.ENROUTE: self._enroute,
@@ -106,6 +110,13 @@ class DeliveryMission:
             self._emergency_land()
             raise
         finally:
+            # Whatever happened - clean exit, abort, crash, Ctrl+C - the flight
+            # controller must not keep this run's geofence. It outlives the process and
+            # would land the next MANUAL flight without any visible connection to us.
+            try:
+                self.failsafe.restore_geofence()
+            except Exception:
+                log.exception("[MISSION] Could not restore the geofence")
             log.info("\n=== MISSION END ===")
 
     def _emergency_land(self) -> None:
@@ -138,6 +149,19 @@ class DeliveryMission:
         self.release.setup()
         self.release.reset()
 
+        # Prove the sensors that FEED the position estimate before trusting the estimate
+        # itself. EKF_POS_HORIZ_REL can come up on a rangefinder stuck at 0.00 m, and
+        # then nothing stops the mission until the drifting estimate is being chased at
+        # full throttle. This gate runs on the ground, where a refusal is free.
+        sensor_problem = self.failsafe.verify_position_sensors()
+        if sensor_problem:
+            return self._fail(sensor_problem)
+
+        # Pilot-assisted start: the human flies it off the ground, the companion takes
+        # over in the air. See _wait_for_pilot() for why that is sometimes the only way.
+        if self.config.takeover_mode:
+            return self._wait_for_pilot()
+
         # Indoor (GPS-denied) needs only the RELATIVE EKF position (optical flow);
         # outdoor needs the ABSOLUTE one (GPS).
         if not self.drone.wait_ready_to_arm(require_abs=not self.config.gps_denied):
@@ -154,6 +178,80 @@ class DeliveryMission:
         self.failsafe.start_phase("TAKEOFF")
         return State.TAKEOFF
 
+    def _wait_for_pilot(self) -> State:
+        """Wait for the PILOT to arm and fly the aircraft up, then take over in GUIDED.
+
+        Two reasons this exists, and the second is the important one:
+
+        1. A flow-only vehicle may not offer `EKF_POS_HORIZ_REL` while it sits on the
+           floor. Optical flow needs height before the filter will trust it, so a
+           companion that insists on a position estimate BEFORE arming can deadlock:
+           no height without a takeoff, no takeoff without a position estimate. Flying
+           the first metre by hand breaks that circle.
+        2. It puts the human in charge of the riskiest moment. The companion never arms
+           and never leaves the ground - it inherits an aircraft that is already stable
+           in the air, with a pilot whose hands are already on the sticks.
+
+        We do NOT arm, do NOT command a takeoff, and do NOT touch the throttle. We wait
+        until the vehicle is armed, above `takeover_min_alt_m` and reporting a usable
+        position estimate, and only then ask for GUIDED.
+        """
+        log = logging.getLogger(__name__)
+        log.warning("=" * 62)
+        log.warning("[TAKEOVER] Waiting for the PILOT to arm and climb to "
+                    f"{self.config.takeover_min_alt_m:.1f} m.")
+        log.warning("[TAKEOVER] The companion will NOT arm and will NOT take off.")
+        log.warning("[TAKEOVER] Keep the throttle stick near centre: if you switch back "
+                    "to a manual mode, that stick position takes effect immediately.")
+        log.warning("=" * 62)
+
+        need_flag = 0x08 if self.config.gps_denied else 0x10
+        deadline = time.time() + self.config.takeover_timeout_s
+        announced = False
+        while time.time() < deadline:
+            self.drone.tick()
+
+            if not self.drone.is_armed():
+                time.sleep(0.5)
+                continue
+            if not announced:
+                log.info("[TAKEOVER] Pilot has armed. Waiting for altitude ...")
+                announced = True
+
+            pos = self.drone.get_position()
+            altitude = pos["rel_alt"] if pos else 0.0
+            if altitude < self.config.takeover_min_alt_m:
+                time.sleep(0.5)
+                continue
+
+            # Only hand over onto a position estimate we would have accepted on the
+            # ground. Taking over without one is exactly the flyaway setup.
+            msg = self.drone.wait_ekf_flag(need_flag, timeout=self.config.takeover_ekf_wait_s)
+            if not msg:
+                log.warning("[TAKEOVER] Airborne at "
+                            f"{altitude:.2f} m but still no position estimate - NOT "
+                            "taking over. Land manually.")
+                return self._fail("NO_POSITION_ESTIMATE_IN_AIR")
+
+            log.info(f"[TAKEOVER] Airborne at {altitude:.2f} m with a position estimate "
+                     f"- taking over")
+            if not self.drone.set_mode("GUIDED"):
+                return self._fail("MODE_GUIDED_REFUSED")
+            self.failsafe.watch_mode()
+            self._airborne = True
+            # The pilot already did the climb, so skip TAKEOFF entirely and go straight
+            # to what this run is actually testing.
+            if self.config.hover_test_s > 0:
+                self.failsafe.start_phase("HOVER", budget_s=self.config.hover_test_s + 30.0)
+                return State.HOVER
+            if self.config.gps_denied:
+                self.failsafe.start_phase("SEARCH", budget_s=self.config.search_timeout_s)
+                return State.SEARCH
+            self.failsafe.start_phase("ENROUTE")
+            return State.ENROUTE
+
+        return self._fail("PILOT_NEVER_TOOK_OFF")
+
     def _fail(self, reason: str) -> State:
         """Record why we are aborting, then go to ABORT.
 
@@ -166,14 +264,87 @@ class DeliveryMission:
         return State.ABORT
 
     def _takeoff(self) -> State:
-        altitude = self.config.search_altitude if self.config.gps_denied else self.config.cruise_alt
+        altitude = self.takeoff_altitude()
         if not self.drone.takeoff(altitude):
             return self._fail("TAKEOFF_FAILED")
+
+        # Now that we are off the ground, the rangefinder has to prove itself: on the
+        # floor a dead sensor and a healthy one both read 0.00 m, at altitude they do
+        # not. Checking here means a failure aborts at takeoff height, before the
+        # position estimate has a whole search pattern in which to drift.
+        sensor_problem = self.failsafe.verify_rangefinder_tracks_altitude(altitude)
+        if sensor_problem:
+            return self._fail(sensor_problem)
+        # Bring-up mode: climb, hold, come down. Nothing else is exercised, which is the
+        # point - it isolates "can the aircraft hold a position under companion control"
+        # from every later unknown (search pattern, camera, drop).
+        if self.config.hover_test_s > 0:
+            self.failsafe.start_phase("HOVER", budget_s=self.config.hover_test_s + 30.0)
+            return State.HOVER
         if self.config.gps_denied:
             self.failsafe.start_phase("SEARCH", budget_s=self.config.search_timeout_s)
             return State.SEARCH
         self.failsafe.start_phase("ENROUTE")
         return State.ENROUTE
+
+    def takeoff_altitude(self) -> float:
+        """Altitude the mission climbs to. Indoor uses search_altitude (a hall ceiling
+        is metres, not tens of metres), the GPS path uses cruise_alt.
+        hover_test_alt overrides both when set, so a bring-up hover can be flown lower
+        than the search altitude without touching the rest of the configuration."""
+        if self.config.hover_test_s > 0 and self.config.hover_test_alt > 0:
+            return self.config.hover_test_alt
+        return self.config.search_altitude if self.config.gps_denied else self.config.cruise_alt
+
+    def _hover(self) -> State:
+        """Hold the takeoff position for `hover_test_s`, then land.
+
+        This is milestone 1 of hardware bring-up: it answers exactly one question — can
+        the aircraft hold height and position on companion commands? — and answers it
+        without a search pattern, a camera or a payload release in the way.
+
+        It also logs the horizontal DRIFT from the position it started at, once per
+        second. That number is the actual result of the test: a stable optical-flow hold
+        stays within a few tens of centimetres, while a drifting one walks away steadily
+        and tells you the flow or the rangefinder is not really working, even though the
+        aircraft is technically flying.
+
+        The camera is polled too but never acted upon, so the same run doubles as
+        milestone 2 (does the detector see a pad directly below?) as soon as
+        camera_source is set to "real".
+        """
+        start = self.drone.get_local_position()
+        origin_n = start["north"] if start else 0.0
+        origin_e = start["east"] if start else 0.0
+        log.info(f"[HOVER] Holding for {self.config.hover_test_s:.0f} s "
+                 f"at ({origin_n:.2f}, {origin_e:.2f}) ...")
+
+        deadline = time.time() + self.config.hover_test_s
+        worst_drift = 0.0
+        while time.time() < deadline:
+            reason = self.failsafe.check()
+            if reason:
+                self.abort_reason = reason
+                log.info(f"[HOVER] Failsafe during hover: {reason}")
+                return State.ABORT
+
+            pos = self.drone.get_local_position()
+            if pos:
+                drift = math.hypot(pos["north"] - origin_n, pos["east"] - origin_e)
+                worst_drift = max(worst_drift, drift)
+                log.info(f"[HOVER] alt={-pos['down']:.2f} m  drift={drift:.2f} m  "
+                         f"(worst {worst_drift:.2f} m)")
+
+            offset = self.camera.get_target_offset()
+            if offset["detected"]:
+                log.info(f"[HOVER] Camera sees the target: dx={offset['dx']:+.2f} "
+                         f"dy={offset['dy']:+.2f} m (not acting on it)")
+
+            time.sleep(1.0)
+
+        log.info(f"[HOVER] Done. Worst horizontal drift: {worst_drift:.2f} m")
+        self.failsafe.start_phase("RECOVER")
+        return State.RECOVER
 
     def _enroute(self) -> State:
         self.drone.goto(self.config.target_lat, self.config.target_lon, self.config.cruise_alt)
@@ -190,9 +361,9 @@ class DeliveryMission:
 
     def _over_target(self) -> State:
         """
-        Fine alignment over the target by visual servoing. Reads the camera's
-        image offset (dx, dy) and nudges the drone in the body frame until it is
-        centred, then drops.
+        Fine alignment over the target by visual servoing. Reads the camera's ground
+        offset to the target (dx, dy, in METRES) and nudges the drone in the body frame
+        until it is centred, then drops.
 
         Axis mapping (downward-facing camera): dx -> body 'right', dy -> body
         'forward'. Each step is scaled by approach_gain and clamped to max_nudge_m,
@@ -203,6 +374,21 @@ class DeliveryMission:
         deadline = time.time() + self.config.phase_timeout_s
 
         while time.time() < deadline:
+            # Keep the GCS heartbeat alive: this loop can run for the whole phase
+            # timeout, and a silence longer than FS_GCS_TIMEOUT (5 s) makes the FC fire
+            # its own GCS failsafe on a companion that is merely centring.
+            self.drone.tick()
+            # Cheap mode check every iteration. The full failsafe.check() would block
+            # on a battery read, but noticing that the PILOT has taken over must not
+            # wait for the phase to end: from the moment the FC leaves GUIDED our
+            # setpoints are discarded anyway, and the flight log needs the moment the
+            # human took control, not the moment we got around to looking.
+            mode_reason = self.failsafe.mode_lost()
+            if mode_reason:
+                self.abort_reason = mode_reason
+                log.warning(f"[CAM] {mode_reason} - the pilot or an FC failsafe has "
+                            f"control, stopping")
+                return State.ABORT
             offset = self.camera.get_target_offset()
             if not offset["detected"]:
                 log.info("[CAM] No target detected, waiting ...")
@@ -226,8 +412,10 @@ class DeliveryMission:
     def _search(self) -> State:
         """
         Fly a search pattern in local NED and look for the target with the camera.
-        On detection -> APPROACH; if the whole pattern is exhausted without a
-        detection -> ABORT (return home).
+        On detection -> APPROACH; if the whole pattern is exhausted without a detection
+        -> ABORT -> RECOVER, which LANDS where the drone is (config.recovery_action,
+        default "land"). Only recovery_action="rtl" returns to launch, and that is an
+        outdoor choice: RTL climbs to RTL_ALT first, which indoors is the ceiling.
         """
         pattern = make_search_pattern(self.config)
         waypoints = pattern.waypoints()
@@ -283,6 +471,7 @@ class DeliveryMission:
         """
         deadline = time.time() + self.config.phase_timeout_s
         while time.time() < deadline:
+            self.drone.tick()   # see _over_target: keeps FS_GCS_* from firing on us
             if self.camera.get_target_offset()["detected"]:
                 log.info("[SEARCH] Target detected en route")
                 return True
@@ -302,6 +491,18 @@ class DeliveryMission:
         lost = 0
 
         while time.time() < deadline:
+            self.drone.tick()   # see _over_target: keeps FS_GCS_* from firing on us
+            # Cheap mode check every iteration. The full failsafe.check() would block
+            # on a battery read, but noticing that the PILOT has taken over must not
+            # wait for the phase to end: from the moment the FC leaves GUIDED our
+            # setpoints are discarded anyway, and the flight log needs the moment the
+            # human took control, not the moment we got around to looking.
+            mode_reason = self.failsafe.mode_lost()
+            if mode_reason:
+                self.abort_reason = mode_reason
+                log.warning(f"[APPROACH] {mode_reason} - the pilot or an FC failsafe has "
+                            f"control, stopping")
+                return State.ABORT
             offset = self.camera.get_target_offset()
             if not offset["detected"]:
                 lost += 1
@@ -326,8 +527,13 @@ class DeliveryMission:
     # Shared helpers
     # ------------------------------------------------------------------
     def _nudge_from_offset(self, dx: float, dy: float) -> None:
-        """Turn an image offset (dx -> body right, dy -> body forward) into a clamped
-        body-frame nudge. Shared by OVER_TARGET and APPROACH."""
+        """Turn a ground offset in METRES (dx -> body right, dy -> body forward) into a
+        clamped body-frame nudge. Shared by OVER_TARGET and APPROACH.
+
+        Both are metres, which is why approach_gain is a dimensionless P gain (body
+        metres moved per metre of ground error) and centre_tolerance is 15 cm - not
+        15 % of the image. Every Camera implementation reports metres; RealCamera
+        converts the image angle with the pinhole relation to keep it that way."""
         right = self._clamp(self.config.approach_gain * dx, self.config.max_nudge_m)
         forward = self._clamp(self.config.approach_gain * dy, self.config.max_nudge_m)
         log.info(f"[ALIGN] nudge fwd={forward:+.2f} right={right:+.2f}")
@@ -339,7 +545,20 @@ class DeliveryMission:
         return max(-limit, min(limit, value))
 
     def _drop(self) -> State:
-        """Perform the release and verify it (FC: servo read-back; Pi: open-loop)."""
+        """Perform the release and verify it (FC: servo read-back; Pi: open-loop).
+
+        `config.skip_drop` runs the whole approach without actually releasing. That is
+        milestone 4 of bring-up: prove the drone finds the pad and centres over it,
+        while nothing can fall out of the aircraft and nothing needs the drop mechanism
+        to be calibrated yet. The state machine is otherwise identical, so a green
+        skip_drop run means only the release itself is still untested.
+        """
+        if self.config.skip_drop:
+            log.warning("[DROP] skip_drop is set - centred over the target, "
+                        "releasing NOTHING (bring-up mode)")
+            self.failsafe.start_phase("RECOVER")
+            return State.RECOVER
+
         self.release.drop()
         time.sleep(0.5)  # brief wait so the new value reaches the telemetry
         if self.release.confirm():

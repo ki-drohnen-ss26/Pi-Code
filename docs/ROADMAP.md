@@ -8,13 +8,18 @@ mechanical step — **not** a debugging session on a flying aircraft.
 
 > Everything that can be developed and tested against **SITL** on the Mac is finished
 > there. On the real hardware only the following remains: flash the Pi → clone the
-> code → run it with `--pi` → wire the Pi to the flight controller → run incremental
-> flight tests. No logic debugging on the flying object.
+> code → run `python main.py` (no flag = the real aircraft) → wire the Pi to the
+> flight controller → run incremental flight tests. No logic debugging on the flying
+> object.
 
-The architecture already supports this: `config.py` isolates the only SITL ↔ Pi
-difference (the `connection_string`), `drone.py` is hardware-agnostic, `camera.py`
-is a `Protocol` (mock now, real camera later), and `mission.py` is a clean state
-machine. The roadmap builds on exactly these seams.
+The architecture already supports this: the dataclass defaults in `config.py` **are**
+the real-aircraft configuration, and apart from the endpoint the simulation deviates in
+exactly three named ways — the drop servo (`release_mechanism`), the battery threshold
+and the camera source — all confined to `Config.sitl()`. `drone.py` is
+hardware-agnostic, `camera.py` is a `Protocol` that several implementations satisfy
+(the mock/scripted/simulated cameras, the camera-less `TimedCamera`, and `RealCamera`
+for the IMX500), and `mission.py` is a clean state machine. The roadmap builds on
+exactly these seams.
 
 ## Target scenario (decided)
 
@@ -55,8 +60,9 @@ is the real target.
 **Goal:** validate the whole pipeline end-to-end with the least friction. This is a
 deliberate stepping stone, not the final scenario.
 - Harden the failsafe: heartbeat / link-loss detection, and define behaviour when
-  telemetry is missing (today `battery_critical()` returns `False` on `None` — a blind
-  spot).
+  telemetry is missing (the old `battery_critical()` returned `False` when telemetry was
+  missing, so no data silently meant "all good"; `check()` now counts consecutive misses
+  and aborts with `NO_TELEMETRY`).
 - Implement the **real `OVER_TARGET` correction loop** using
   `SET_POSITION_TARGET_LOCAL_NED` in the body frame, exercised by a *scriptable* mock
   camera that feeds changing `dx/dy`.
@@ -92,7 +98,9 @@ IDLE → TAKEOFF → SEARCH → APPROACH → DROP → RECOVER
 *Target search & approach:*
 - **`SearchPattern`** (`search.py`): generates local-NED waypoints relative to launch.
   - `ExpandingSquare` (**default**): spirals outward; needs only a step size + max
-    radius (bounded by the geofence), not the hall dimensions.
+    radius, not the hall dimensions — but size that radius for the hall by hand. The
+    configured geofence is altitude-only (`FENCE_TYPE=1`) and will not stop a
+    horizontal excursion, and the pattern reaches one `step` beyond `max_radius`.
   - `Lawnmower`: back-and-forth over a configured rectangle (even full coverage).
   - Selected via `config.py` (`search_pattern`).
 - **Detection cadence** (config-selected): `stop_and_look` (**default** — fly to a
@@ -171,14 +179,26 @@ LiDAR + companion link.
 **Done when:** every companion action works against the real FC on the bench, props off.
 
 ### Phase 7 — Flight tests *(incremental, props on, in the hall)*
-**Goal:** earn trust step by step.
+**Goal:** earn trust step by step. Each stage adds exactly ONE unknown, selected from
+the command line with `--milestone N` so no source is edited between flights.
+
 1. Manual `AltHold` → confirms LiDAR altitude hold.
 2. Manual `PosHold` → confirms optical-flow position hold.
-3. `GUIDED` hover → `goto_local` → short delivery.
-4. **Camera-less search test:** `set_origin` → arm → fly the search pattern →
-   `TimedCamera` "finds" after a set time → timed drop → RTL (enabled by Phase 3).
-5. Full indoor delivery mission with the real AI camera.
+3. `--milestone 1` — companion hover at 1 m. The logged **drift** is the result, not the
+   fact that it hovered: a broken flow setup still flies, it just walks away.
+4. `--milestone 2` — same flight with the detector running, logging only. Verify the
+   **sign** of `dx`/`dy` here (pad to the right → positive `dx`), on the ground first.
+5. `--milestone 3` — the search pattern, no detector. Ends in `TARGET_NOT_FOUND`; that
+   is the pass condition. Note the spiral reaches `search_max_radius_m` **plus one**
+   `search_step_m` and nothing bounds it horizontally.
+6. `--milestone 4` — search, detect and centre with nothing able to fall out.
+7. `--milestone 5` — the full indoor delivery.
 
+Flyaway guards run throughout (`SIM_TO_REAL.md` §5b): the rangefinder must track altitude
+after the climb, the reported position must stay inside `max_position_radius_m`, and
+`WPNAV_SPEED` caps horizontal speed at 1 m/s instead of the firmware's 10 m/s.
+
+**Blocker for all of it:** `ARMING_CHECK = 0` on the FC must be restored first.
 Every test is logged and documented (what was tested, parameters, outcome).
 
 ### Phase 8 — Documentation & deliverables *(continuous, finalised here)*
@@ -211,10 +231,11 @@ Driven entirely by things that actually went wrong in SITL:
 - **FC safety envelope** set + verified before every flight (`FENCE_ACTION`, `RTL_ALT`
   with the 4.6/4.7 name fallback, `WPNAV_SPEED_UP`).
 - **Presets over source edits:** `python main.py` runs the **real aircraft**, `--sim`
-  the simulator; `Config.sitl()`/`Config.pi()`
-  carry the drop-servo path and battery threshold.
+  the simulator; the dataclass defaults carry the aircraft's drop-servo path and
+  battery threshold, and `Config.sitl()` overrides both for the simulator
+  (`release_mechanism="fc"`, 10.8 V).
 
-**Done when:** `pytest` covers each of the above (28 tests) and a SITL run logs the
+**Done when:** `pytest` covers each of the above and a SITL run logs the
 firmware version, the autopilot's own messages and a named abort reason. ☑
 
 ## Cross-cutting

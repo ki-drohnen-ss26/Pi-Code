@@ -33,9 +33,15 @@ class ExpandingSquare:
     """Expanding-square spiral around the launch point (0, 0).
 
     Legs go East, North, West, South (turning left), with the leg length growing
-    every two legs: 1, 1, 2, 2, 3, 3, ... times `step`. Generation stops once a
-    waypoint lies beyond `max_radius` (Chebyshev distance), so the spiral stays
-    inside the geofence.
+    every two legs: 1, 1, 2, 2, 3, 3, ... times `step`. Generation stops at the FIRST
+    waypoint beyond `max_radius` (Chebyshev distance) - and that waypoint is still
+    included, so the pattern reaches up to one `step` PAST `max_radius`. With the
+    defaults (step 1.0, max_radius 6.0) the last point is (-6.0, 7.0).
+
+    Size `max_radius` with that overshoot in mind and against the actual hall: the
+    configured geofence is ALTITUDE-ONLY (`config.fence_type = 1`, and
+    `setup_geofence()` never writes `FENCE_RADIUS`), so nothing stops a horizontal
+    excursion. The fence protects the ceiling, not the walls.
 
     Schematic (N = up, E = right; S = launch at 0,0). One continuous path that
     spirals outward; the boxes show how each loop is `step` wider:

@@ -52,17 +52,17 @@ flowchart TB
     fs --> drone
     fs -.->|reads| cfg
     drone -.->|reads| cfg
-    drone <-->|"MAVLink: UDP in SITL, UART on Pi"| fc
+    drone <-->|"MAVLink: UDP — SITL directly, Pi via mavlink-router"| fc
     fcservo -->|"DO_SET_SERVO"| drone
     piservo -->|"PWM"| gpio
 ```
 
 | Component | Responsibility |
 |-----------|----------------|
-| `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The single line that differs SITL vs Pi lives here. |
+| `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The SITL-vs-aircraft choice is made here from the command line (`make_config(sys.argv)`), not by editing `config.py`, so the same checked-out code runs on the Mac and on the drone. |
 | `Config` | All parameters. The **dataclass defaults are the flight configuration**, so `Config.pi()` overrides only the endpoint and every simulation deviation is confined to `Config.sitl()` (drop-servo path, battery threshold, camera source). `main.py` defaults to the real aircraft; `--sim` opts into the simulator, and the active profile is logged on every start. |
-| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. |
-| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera`/`TimedCamera` for simulation, `RealCamera` for the IMX500 AI camera (network runs on the sensor's NPU, so the Pi's CPU stays free for MAVLink). Same contract throughout, so the mission never changes. Chosen by `config.camera_source`. `RealCamera` returns **ground metres**, not image fractions — see [SIM_TO_REAL.md §3a](SIM_TO_REAL.md) for why, and for the `cam_*` mounting calibration. |
+| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. The link is UDP in **both** worlds: against SITL directly, on the Pi through mavlink-router, which owns the UART to the FC and fans the stream out to us and to a ground station. A direct UART link is only the `--pi-serial` fallback for setups without the router. |
+| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera` for simulation, `TimedCamera` for camera-less **real** flight tests — it is the current default on the aircraft (`camera_source="timed"`) and does no detection at all, it just reports "centred" after a fixed time so the search and drop can be flown without the AI camera — and `RealCamera` for the IMX500 AI camera (network runs on the sensor's NPU, so the Pi's CPU stays free for MAVLink). Same contract throughout, so the mission never changes. Chosen by `config.camera_source`. `RealCamera` returns **ground metres**, not image fractions — see [SIM_TO_REAL.md §3a](SIM_TO_REAL.md) for why, and for the `cam_*` mounting calibration. |
 | `ReleaseMechanism` | A `Protocol` (`setup/reset/drop/confirm`) for the payload drop. `FcServo` drives a servo on an FC output over MAVLink (SITL); `PiServo` drives a servo on a Pi GPIO pin directly. Chosen by `config.release_mechanism` — the mission never changes. |
 | `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout. Returns a reason string; the mission decides to ABORT. |
 | `DeliveryMission` | The state machine that sequences the delivery and runs the failsafe check before each state. |
@@ -162,8 +162,54 @@ stateDiagram-v2
   body frame from the camera's `dx/dy` until centred, then `DROP`. If the target is lost
   for too many frames in a row it falls back to `SEARCH`.
 - The indoor path goes **`APPROACH → DROP` directly**; `OVER_TARGET` is the GPS path's
-  fine-centring state. The `Camera` contract is unchanged, so Phase 4 only swaps the
-  detector (`SimCamera` → `RealCamera`).
+  fine-centring state. The `Camera` contract is unchanged, so the detector can be
+  swapped (`SimCamera` → `RealCamera`) without touching the mission.
+
+## Staged bring-up: `HOVER` and `skip_drop`
+
+A new aircraft has four unknowns at once — position hold, search pattern, detector,
+release. Two config switches peel them apart so a failure names its own cause instead of
+leaving four candidates open. Both are off by default (`hover_test_s = 0.0`,
+`skip_drop = False`), so the flows above are what a normal mission flies.
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> TAKEOFF: GUIDED + armed
+    TAKEOFF --> HOVER: hover_test_s > 0
+    HOVER --> RECOVER: held for hover_test_s
+    HOVER --> ABORT: failsafe
+    RECOVER --> [*]
+```
+
+| Milestone | Command | Adds | Pass condition |
+|---|---|---|---|
+| 1 | `--milestone 1` | position hold | `[HOVER] Done. Worst horizontal drift: …` — tens of centimetres, not metres |
+| 2 | `--milestone 2` | the detector | `[HOVER] Camera sees the target: dx=… dy=…` with the right **sign** |
+| 3 | `--milestone 3` | search pattern | pattern flown to the end, `TARGET_NOT_FOUND` (no detector in the loop — that abort *is* the pass) |
+| 4 | `--milestone 4` | approach + centring | `[DROP] skip_drop is set — releasing NOTHING` |
+| 5 | `--milestone 5` | the release | `[DROP] Release confirmed` |
+
+`--sim --milestone N` rehearses a stage in the simulator; the simulated detector is
+substituted for the IMX500 and the substitution is logged, so a rehearsal can never
+quietly use a different camera than the milestone names.
+
+Two guards run alongside these and exist because of one specific failure — a GPS-denied
+position estimate that loses its height reference does not stop, it *drifts*, and the
+position controller then chases it at full throttle (see
+[SIM_TO_REAL.md §5b](SIM_TO_REAL.md)):
+
+- `failsafe.verify_rangefinder_tracks_altitude()` runs right after the climb. On the
+  ground a dead rangefinder and a healthy one both read `0.00 m`; at 1 m they do not.
+- `failsafe.position_implausible()` lands the aircraft if the reported position leaves
+  `max_position_radius_m`. It is the software stand-in for the horizontal fence that an
+  altitude-only `FENCE_TYPE = 1` cannot give us.
+
+`mission.takeoff_altitude()` lets stage 1 fly lower than `search_altitude` via
+`hover_test_alt`, so a 1 m bring-up hover needs no other configuration change. Both
+switches are announced by `main.log_profile()` at startup for the same reason the
+simulation banner is: a mode that changes what the flight *does* must not be discoverable
+only by reading a config file nobody re-reads before a flight.
 
 ## Call sequence 1 — GPS / outdoor (Phase 1, WITH GPS)
 
@@ -197,6 +243,13 @@ sequenceDiagram
     FS-->>Mis: None or "LINK_LOSS"/"NO_TELEMETRY"/"LOW_BATTERY"/"TIMEOUT_x"
 
     note over Mis: IDLE
+    Mis->>FS: setup_safety_envelope()
+    FS->>Dr: set_param("WPNAV_SPEED_UP", climb_rate_cms=50)
+    Dr->>FC: PARAM_SET WPNAV_SPEED_UP=50
+    FS->>Dr: set_param("FENCE_ACTION", fence_action=2)
+    Dr->>FC: PARAM_SET FENCE_ACTION=2 (Always Land)
+    FS->>Dr: set_param("RTL_ALT", rtl_alt_m * 100)
+    Dr->>FC: PARAM_SET RTL_ALT=200 (centimetres)
     Mis->>FS: setup_geofence()
     FS->>Dr: set_param("FENCE_TYPE", 1)
     Dr->>FC: PARAM_SET FENCE_TYPE=1
@@ -252,9 +305,26 @@ sequenceDiagram
 > the current state to `ABORT`, which either ends the mission outright (never armed, or
 > the FC left our mode) or goes to `RECOVER` — see the state diagram above.
 >
-> Not drawn: `Drone.tick()` runs inside every polling loop and before every failsafe
-> check. It sends our 1 Hz GCS heartbeat (without which the FC's `FS_GCS_*` failsafe can
-> never trigger) and logs the autopilot's `STATUSTEXT` messages.
+> The safety-envelope and the geofence block are both config-gated
+> (`enforce_safety_envelope` / `geofence_enable`, both default true). `RTL_ALT` is in
+> **centimetres** on our ArduCopter 4.6.3; 4.7 renamed it to `RTL_ALT_M` in metres, so
+> `_set_rtl_altitude()` tries `RTL_ALT` first and only then the new name. In the
+> safety-envelope block a parameter the firmware does not know is logged as a warning
+> instead of aborting (`_try_param`) — but it then keeps the autopilot's outdoor default.
+> The geofence block sets its three parameters unguarded, so an unconfirmed `FENCE_*`
+> ends the mission — on the ground, before arming, which is where that failure belongs.
+>
+> Not drawn: `Drone.tick()`. It runs at the start of every `FailsafeMonitor.check()` and
+> inside every loop that waits on the aircraft — the `Drone` waiters
+> (`wait_ready_to_arm`, `arm`, `takeoff`, `wait_arrival`, `wait_local_arrival`,
+> `wait_disarmed`) and the mission's own camera loops (`OVER_TARGET`, `APPROACH` and the
+> `continuous`-cadence poll `_poll_until_arrival_or_detection`). It sends our 1 Hz GCS
+> heartbeat (without which the FC's `FS_GCS_*` failsafe can never trigger) and logs the
+> autopilot's `STATUSTEXT` messages. It has to be in **every** one of them: `run()` checks
+> the failsafe only *between* states, so a single leg or centring loop can occupy the
+> whole `phase_timeout_s` (60 s), and a heartbeat silence longer than `FS_GCS_TIMEOUT`
+> (5 s) makes the autopilot fire its own GCS failsafe on a companion that is merely busy
+> flying the leg it was told to fly.
 >
 > **Convention:** each `Dr->>FC` is a method's *primary* MAVLink interaction — a command
 > for the "doers" (`takeoff`, `goto`, `arm`, `set_mode`, `drop`, …) or a read for the
@@ -269,9 +339,11 @@ machine, same components, same `Camera` interface as sequence 1 — only the nav
 differs.
 
 **Unchanged from sequence 1:** `connect()` / heartbeat, the failsafe `check()` before
-every state, the rest of IDLE (geofence, release `setup()`/`reset()`, GUIDED, arm),
-TAKEOFF, and the final DROP → RTL block — the mission calls are identical, so they are not
-redrawn below. (IDLE also gains the optional `set_origin()` — see the Changed table.)
+every state, the rest of IDLE (safety envelope, geofence, release `setup()`/`reset()`,
+GUIDED, arm), and the final DROP → RECOVER (LAND) block — the mission calls are identical,
+so they are not redrawn below. (IDLE also gains the optional `set_origin()` — see the
+Changed table.) `TAKEOFF` is **not** in this list: the state is the same call, but it
+climbs to a different altitude — see the Changed table.
 
 > The drop still goes through the `ReleaseMechanism` protocol, but on the **real indoor
 > build** `config.release_mechanism = "pi"`, so `PiServo` drives the servo on a Pi GPIO
@@ -284,11 +356,13 @@ redrawn below. (IDLE also gains the optional `set_origin()` — see the Changed 
 |------|------------------|----------------------|
 | Pre-flight (IDLE) | — | (optional) `set_origin()` → `SET_GPS_GLOBAL_ORIGIN` when `set_origin_on_start`, since there is no GPS to seed the EKF origin/home |
 | Pre-arm | `wait_ready_to_arm()` → `EKF_POS_HORIZ_ABS` | `wait_ready_to_arm(require_abs=False)` → `EKF_POS_HORIZ_REL` |
+| Climb (TAKEOFF) | `takeoff(config.cruise_alt = 10.0)` | `takeoff(config.search_altitude = 2.0)` — the hall height, and below `fence_alt_max_m` (4.0); climbing the outdoor 10 m indoors would breach the fence and hit the ceiling |
 | Go to target | `ENROUTE`: `goto(lat, lon)` (global) | `SEARCH`: `make_search_pattern` + `goto_local(north, east)` (local NED) + camera polling |
 | Centre & drop | `OVER_TARGET`: `move_body_offset` until centred | `APPROACH`: same `move_body_offset`, but falls back to `SEARCH` if the target is lost |
 
 The diagram below shows only the **changed** part (SEARCH + APPROACH); `make_search_pattern`
-builds the waypoints and the camera here is `SimCamera` (later `RealCamera`). It shows the
+builds the waypoints and the camera here is `SimCamera` (in SITL); on the aircraft the same
+loop runs with `TimedCamera` (the default, camera-less) or `RealCamera`. It shows the
 default `stop_and_look` cadence; `continuous` instead polls the camera while flying each
 leg (`_poll_until_arrival_or_detection`). Because SEARCH is long-running, it re-checks the
 failsafe on **every leg** (in addition to the per-state check from `run()`).
@@ -303,7 +377,7 @@ sequenceDiagram
     participant Cam as Camera
     participant FC as FC / SITL
 
-    note over Mis: TAKEOFF (gps_denied) -> SEARCH
+    note over Mis: TAKEOFF (gps_denied, search_altitude=2.0 m) -> SEARCH
     Mis->>Sp: make_search_pattern(config)
     Sp-->>Mis: waypoints [(north, east), ...]
 

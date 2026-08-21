@@ -5,16 +5,19 @@ Central configuration. Everything that differs between "test against SITL" and
 "real flight on the Pi" lives HERE and nowhere else - drone.py, mission.py,
 failsafe.py and the state machine are identical either way.
 
-Use the convenience constructors at the bottom rather than editing fields by hand;
-they encode the whole SITL/Pi delta:
+The DEFAULTS BELOW ARE THE FLIGHT CONFIGURATION. Reading this file tells you how the
+real aircraft is set up - drop servo on a Pi GPIO, the 4S Li-Ion threshold, the
+camera-less "timed" source. The constructors at the bottom only pick an endpoint:
 
-    Config.sitl()  -> UDP to the simulator, drop servo on an FC output, SITL battery
-    Config.pi()    -> UDP to mavlink-router on the Pi, drop servo on a GPIO pin,
-                      4S Li-Ion battery threshold
+    Config.pi()         -> UDP to mavlink-router on the Pi (the default profile)
+    Config.pi_serial()  -> direct UART, for a setup WITHOUT mavlink-router
+    Config.sitl()       -> UDP to the simulator
 
-(It used to be true that the connection string was the *only* difference. It no
-longer is - the drop servo and the battery pack are genuinely different hardware -
-so the presets exist to keep that difference in one place.)
+Every deviation from reality lives in exactly ONE place, Config.sitl(), and there are
+three of them: the drop servo ("fc" - a Mac has no GPIO), the battery threshold
+(10.8 V - SITL's simulated pack sits at 12.6 V) and the camera source ("auto" ->
+SimCamera). That asymmetry is deliberate: main.py flies the real aircraft by default
+and needs --sim to simulate, so a forgotten flag fails on the safe side.
 """
 
 from dataclasses import dataclass
@@ -68,11 +71,11 @@ class Config:
     # ------------------------------------------------------------------
     # Failsafe / safety
     # ------------------------------------------------------------------
-    # Abort threshold [V]. NOTE: this depends on the pack and is therefore set by the
-    # convenience constructors, not here: our drone flies 4S Li-Ion (4.1 V/cell full =
-    # 16.4 V, 2.8 V/cell empty = 11.2 V), so a real abort threshold is ~12.8 V. SITL's
-    # simulated pack sits at 12.6 V, which would trip that instantly - Config.sitl()
-    # therefore lowers it. The value below is only the dataclass default.
+    # Abort threshold [V] for the REAL pack: 4S Li-Ion (4.1 V/cell full = 16.4 V,
+    # 2.8 V/cell empty = 11.2 V) -> ~12.8 V. DEFAULT = the real aircraft. SITL's
+    # simulated pack sits at 12.6 V and would trip this on the first reading, so
+    # Config.sitl() lowers it to 10.8 V. Note that only the VOLTAGE arm is relaxed
+    # there - battery_min_percent below stays active in every profile.
     battery_min_voltage: float = 12.8
     battery_min_percent: int = 20       # abort threshold, remaining capacity [%]
     # A single sagging reading is not an empty battery: Li-Ion dips hard under load.
@@ -92,7 +95,7 @@ class Config:
 
     # Abort if the FC leaves this mode. The pilot flipping out of GUIDED, a fence
     # breach or an EKF failsafe all change the mode behind our back - from that moment
-    # every setpoint we send is ignored, and commanding RTL would OVERRIDE the human.
+    # every setpoint we send is ignored, and commanding any mode would OVERRIDE the human.
     # So we notice and stop sending. Empty string disables the check.
     expect_mode: str = "GUIDED"
 
@@ -117,12 +120,50 @@ class Config:
     rtl_alt_m: float = 2.0          # RTL altitude [m], in case RTL is triggered anyway
     climb_rate_cms: float = 50.0    # WPNAV_SPEED_UP [cm/s]. The default 250 overshoots
                                     # a 2 m takeoff by >2 m and trips a low fence.
+    # WPNAV_SPEED [cm/s] - HORIZONTAL speed. The firmware default is 1000 (10 m/s), which
+    # is a hall crossed in under a second. This is also the single most effective brake on
+    # a flyaway: when a diverging position estimate makes the controller chase a huge
+    # error, this caps how fast it can chase it.
+    cruise_speed_cms: float = 100.0
+
+    # ------------------------------------------------------------------
+    # Flyaway protection (GPS-denied)
+    # ------------------------------------------------------------------
+    # An optical-flow position estimate that loses its height reference does not fail
+    # loudly - it DRIFTS, and the position controller then flies full-throttle after an
+    # error that exists only in the filter. Our own params/README.md records 366 m of
+    # drift measured while the vehicle stood still, caused by a rangefinder stuck at
+    # 0.00 m. The altitude geofence does not help: it guards the ceiling, not the walls.
+    #
+    # Two guards, both cheap:
+    #   1. Before arming, prove the sensors that feed the estimate actually produce data.
+    #   2. In flight, abort if the reported position leaves a plausible envelope.
+    #
+    # Two checks, because the ground cannot tell you everything: before arming we only
+    # prove the sensors STREAM (on the floor a healthy rangefinder reads ~0 m, so its
+    # value proves nothing there), and right after the climb we prove the rangefinder
+    # actually FOLLOWS the height. That second one is the real gate, and it runs at
+    # takeoff altitude where an abort is a short descent.
+    verify_position_sensors: bool = True
+    sensor_check_s: float = 5.0         # how long to listen before deciding
+    rangefinder_min_valid_m: float = 0.02   # below this counts as "no reading"
+    # In the air the rangefinder must report at least this fraction of the commanded
+    # altitude. Loose on purpose - the question is "does it respond to height at all",
+    # not "is it accurate".
+    rangefinder_track_fraction: float = 0.4
+    # Abort if the local position estimate leaves this radius of the EKF origin. Sized
+    # from the search pattern, not the hall: the spiral reaches search_max_radius_m plus
+    # one search_step_m, so anything well beyond that is the filter running away rather
+    # than the aircraft flying. 0 disables the check.
+    max_position_radius_m: float = 15.0
 
     # ------------------------------------------------------------------
     # Target alignment (visual servoing over the target before the drop)
     # ------------------------------------------------------------------
-    centre_tolerance: float = 0.15  # |dx|,|dy| below this counts as "centred"
-    approach_gain: float = 0.5      # body metres to nudge per unit of image offset
+    # dx/dy from every Camera are GROUND METRES, so these are metres too - 0.15 means
+    # 15 cm, not 15 % of the image.
+    centre_tolerance: float = 0.15  # |dx|,|dy| below this counts as "centred" [m]
+    approach_gain: float = 0.5      # P gain: body metres moved per metre of ground error
     max_nudge_m: float = 0.3        # clamp for a single correction step [m]
     nudge_settle_s: float = 0.5     # wait after each nudge so the move settles
     approach_lost_max: int = 5      # consecutive "target lost" frames before back to SEARCH
@@ -151,6 +192,43 @@ class Config:
     origin_lat: float = 50.13119602511582   # hall latitude  [deg]
     origin_lon: float = 8.692972038286195   # hall longitude [deg]
     origin_alt: float = 112.0               # approx hall altitude [m AMSL]; indoor height comes from LiDAR
+
+    # ------------------------------------------------------------------
+    # Hardware bring-up (staged first flights, Phase 7)
+    # ------------------------------------------------------------------
+    # The full mission has four unknowns at once on a new aircraft: position hold,
+    # search pattern, detector and release. These two switches let you add them ONE at
+    # a time, so a failure names its own cause instead of leaving you guessing.
+    #
+    #   1. hover_test_s > 0                 -> climb, hold, land. Position hold only.
+    #   2. + camera_source = "real"         -> same flight, but log what the detector
+    #                                          sees directly below (it is not acted on).
+    #   3. hover_test_s = 0                 -> fly the search pattern.
+    #   4. + skip_drop = True               -> search, detect, centre - release nothing.
+    #   5. skip_drop = False                -> the full delivery.
+    #
+    # hover_test_s: seconds to hold position after takeoff before landing. 0 = off.
+    hover_test_s: float = 0.0
+    # Altitude for the hover test [m]. 0 = use the normal takeoff altitude. Set this to
+    # fly the bring-up hover lower than the search altitude without touching the rest.
+    hover_test_alt: float = 0.0
+    # Run the approach but do NOT release. The mission goes APPROACH -> RECOVER.
+    skip_drop: bool = False
+
+    # ------------------------------------------------------------------
+    # Pilot-assisted start (takeover)
+    # ------------------------------------------------------------------
+    # The companion does not arm and does not take off: the PILOT flies the first metre
+    # by hand, the companion inherits an aircraft that is already stable in the air.
+    #
+    # This is not only a safety preference. A flow-only vehicle may not report
+    # EKF_POS_HORIZ_REL while it sits on the floor - optical flow needs height before
+    # the filter trusts it - which deadlocks a companion that insists on a position
+    # estimate BEFORE arming. Flying the first metre by hand breaks that circle.
+    takeover_mode: bool = False
+    takeover_min_alt_m: float = 0.8     # hand over above this height [m]
+    takeover_timeout_s: float = 120.0   # give up waiting for the pilot after this
+    takeover_ekf_wait_s: float = 10.0   # how long to wait for the EKF bit once airborne
 
     # ------------------------------------------------------------------
     # Search pattern (Phase 2)
@@ -186,7 +264,9 @@ class Config:
     # "auto" = SimCamera when gps_denied else MockCamera; "sim" / "mock" force one;
     # "timed" = TimedCamera (finds the target after a set time, no real detection) to
     # flight-test the search pattern + drop without the AI camera (Phase 3);
-    # "real" = RealCamera (Raspberry Pi AI Camera / IMX500, Phase 4).
+    # "real" = RealCamera (Raspberry Pi AI Camera / IMX500, Phase 4);
+    # "none" = a camera that never detects anything - flies the pattern to the end
+    #          without ever triggering APPROACH (bring-up milestones 1 and 3).
     #
     # DEFAULT = "timed", the honest camera-less default for the real aircraft. It must
     # NOT be "auto" here: on the drone "auto" resolves to SimCamera, which invents a
@@ -194,6 +274,12 @@ class Config:
     # to a spot where nothing is and drop the payload there. Set "real" once
     # camera_model_path points at a real .rpk. Config.sitl() switches this to "auto".
     camera_source: str = "timed"
+    # Which bring-up milestone this run is (set by --milestone, 0 = a normal mission).
+    # Recorded so the flight log says which stage produced it.
+    milestone: int = 0
+    # Set when a milestone asked for the real camera but the run is a simulation, so
+    # the simulated detector was substituted. Logged, never silent.
+    milestone_camera_substituted: bool = False
     timed_camera_after_s: float = 20.0  # TimedCamera: declare "found" after this many seconds
 
     # ------------------------------------------------------------------
@@ -223,10 +309,13 @@ class Config:
     cam_invert_x: bool = False       # positive dx must mean "target is to the right"
     cam_invert_y: bool = False       # positive dy must mean "target is ahead"
     # Field of view of the IMX500 lens, used to turn image angles into ground metres.
-    # The Raspberry Pi AI Camera has a ~66°x49° FOV over the full sensor area; correct
-    # these if you crop or change the lens, otherwise every correction is mis-scaled.
+    # Raspberry Pi AI Camera, stock lens, full sensor area: 66° x 52.3° (78.3° diagonal).
+    # Correct these if you crop, switch sensor mode or change the lens - RealCamera scales
+    # every correction with them, so a wrong FOV mis-scales the whole approach loop.
+    # Both assume a NADIR (straight-down) mount: the metre conversion treats the ground as
+    # perpendicular to the optical axis. A tilted camera needs the tilt angle folded in.
     cam_hfov_deg: float = 66.0
-    cam_vfov_deg: float = 49.0
+    cam_vfov_deg: float = 52.3
 
     # ------------------------------------------------------------------
     # Logging

@@ -10,6 +10,17 @@ Usage:
     python main.py --sim --port 14551 # SITL on a second MAVProxy output (QGC keeps 14550)
     python main.py --tele             # only print telemetry (no flight), any of the above
 
+Staged bring-up on a new aircraft - each stage adds exactly ONE unknown:
+    python main.py --milestone 1   # climb to 1 m, hold, land        (position hold)
+    python main.py --milestone 2   # same + the detector, logging only (detector)
+    python main.py --milestone 3   # fly the search pattern            (pattern)
+    python main.py --milestone 4   # search + detect + centre, no drop (approach)
+    python main.py --milestone 5   # the full delivery                 (release)
+
+Rehearse any of them in the simulator first with `--sim --milestone N`; the simulated
+detector is substituted for the IMX500 and the substitution is logged. Individual
+switches (--hover / --alt / --no-drop) still work and override a milestone.
+
 The preset is chosen here, not by editing config.py - so the same checked-out code
 runs on the Mac and on the drone.
 
@@ -37,6 +48,7 @@ def make_camera(config: Config, drone: Drone):
     "auto"  -> SimCamera when indoor (gps_denied) else MockCamera
     "sim"   -> SimCamera (simulated target at a known local position)
     "mock"  -> MockCamera (always centred)
+    "none"  -> MockCamera that never detects (bring-up: no detector in the loop)
     "timed" -> TimedCamera (finds after a set time, no real detection)
     "real"  -> RealCamera (Raspberry Pi AI Camera / IMX500, Phase 4)
 
@@ -53,6 +65,11 @@ def make_camera(config: Config, drone: Drone):
         return TimedCamera(config.timed_camera_after_s)
     if src == "mock":
         return MockCamera()
+    if src == "none":
+        # Never detects. Milestone 1 and 3 fly without a detector in the loop, so the
+        # run tests position hold and the search pattern and nothing else. Expect the
+        # pattern to end in TARGET_NOT_FOUND - that IS the pass condition here.
+        return MockCamera(detected=False)
     if src == "real":
         camera = RealCamera(config, drone)
         camera.start()
@@ -98,11 +115,86 @@ def make_config(argv: list) -> Config:
         # QGroundControl also binds 14550. To run both, add a second output in the
         # MAVProxy console (`output add 127.0.0.1:14551`) and start with --port 14551.
         if "--port" in argv:
-            return Config.sitl(port=int(argv[argv.index("--port") + 1]))
-        return Config.sitl()
-    if "--pi-serial" in argv:      # direct UART, only without mavlink-router
-        return Config.pi_serial()
-    return Config.pi()             # --pi is accepted but redundant: it is the default
+            config = Config.sitl(port=int(argv[argv.index("--port") + 1]))
+        else:
+            config = Config.sitl()
+    elif "--pi-serial" in argv:    # direct UART, only without mavlink-router
+        config = Config.pi_serial()
+    else:
+        config = Config.pi()       # --pi is accepted but redundant: it is the default
+
+    _apply_bringup_flags(config, argv)
+    return config
+
+
+# Staged bring-up. Each milestone adds exactly ONE unknown to the previous one, so a
+# failure names its own cause instead of leaving four candidates open. The numbers are
+# the flight-test order, not a preference - do not skip ahead.
+MILESTONES = {
+    1: dict(label="hover only — position hold",
+            hover_test_s=20.0, hover_test_alt=1.0, camera_source="none"),
+    2: dict(label="hover + detector (logs only, acts on nothing)",
+            hover_test_s=20.0, hover_test_alt=1.0, camera_source="real"),
+    3: dict(label="search pattern, no detection",
+            hover_test_s=0.0, camera_source="none"),
+    4: dict(label="search + detect + centre, release nothing",
+            hover_test_s=0.0, camera_source="real", skip_drop=True),
+    5: dict(label="full delivery",
+            hover_test_s=0.0, camera_source="real", skip_drop=False),
+}
+
+
+def _apply_bringup_flags(config: Config, argv: list) -> None:
+    """Staged bring-up switches, so a first flight needs no source edit on the drone.
+
+        --milestone N   apply bring-up stage N (1-5), see MILESTONES above
+        --hover [s]     climb, hold for s seconds (default 20), land. No search, no drop.
+        --alt [m]       takeoff altitude for that hover, overriding search_altitude.
+        --no-drop       fly the full search + approach but release nothing.
+        --takeover      do NOT arm or take off - wait for the pilot to fly it up, then
+                        take over in GUIDED (see mission._wait_for_pilot)
+
+    --milestone sets a whole coherent stage; the individual flags are applied AFTER it so
+    a single value can still be overridden (e.g. `--milestone 1 --alt 0.8`).
+    """
+    def _value_after(flag: str, default: float) -> float:
+        i = argv.index(flag)
+        if i + 1 < len(argv):
+            try:
+                return float(argv[i + 1])
+            except ValueError:
+                pass                      # next token is another flag, not a number
+        return default
+
+    if "--milestone" in argv:
+        number = int(_value_after("--milestone", 0))
+        if number not in MILESTONES:
+            raise SystemExit(
+                f"Unknown milestone {number}. Available: "
+                + ", ".join(f"{n} ({m['label']})" for n, m in sorted(MILESTONES.items()))
+            )
+        for key, value in MILESTONES[number].items():
+            if key != "label":
+                setattr(config, key, value)
+        config.milestone = number
+
+        # There is no IMX500 in the simulator, and rehearsing a milestone in SITL before
+        # flying it is exactly the right thing to do - so substitute the simulated
+        # detector instead of refusing to run. The substitution is logged, because a
+        # milestone that silently used a different camera than the one it names would be
+        # worse than no rehearsal at all.
+        if config.release_mechanism == "fc" and config.camera_source == "real":
+            config.camera_source = "auto"
+            config.milestone_camera_substituted = True
+
+    if "--hover" in argv:
+        config.hover_test_s = _value_after("--hover", 20.0)
+    if "--alt" in argv:
+        config.hover_test_alt = _value_after("--alt", 0.0)
+    if "--no-drop" in argv:
+        config.skip_drop = True
+    if "--takeover" in argv:
+        config.takeover_mode = True
 
 
 def log_profile(config: Config) -> None:
@@ -124,6 +216,24 @@ def log_profile(config: Config) -> None:
         f"battery_min={config.battery_min_voltage} V  camera={config.camera_source}  "
         f"gps_denied={config.gps_denied}"
     )
+    # Bring-up modes change what the flight actually does, so they must be as visible as
+    # the profile itself - not buried in a config file nobody re-reads before a flight.
+    if config.milestone:
+        log.warning(f"[PROFILE] BRING-UP MILESTONE {config.milestone}: "
+                    f"{MILESTONES[config.milestone]['label']}")
+        if config.milestone_camera_substituted:
+            log.warning("[PROFILE] ... but this is SIMULATION: the milestone asks for "
+                        "the IMX500, the run uses the simulated detector instead")
+    if config.hover_test_s > 0:
+        alt = config.hover_test_alt if config.hover_test_alt > 0 else (
+            config.search_altitude if config.gps_denied else config.cruise_alt)
+        log.warning(f"[PROFILE] BRING-UP HOVER: climb to {alt} m, hold "
+                    f"{config.hover_test_s:.0f} s, land. No search, no drop.")
+    if config.skip_drop:
+        log.warning("[PROFILE] BRING-UP: skip_drop is set - the payload will NOT be released")
+    if config.takeover_mode:
+        log.warning(f"[PROFILE] TAKEOVER: the companion will NOT arm and will NOT take "
+                    f"off. The pilot flies it to {config.takeover_min_alt_m} m first.")
 
 
 def main() -> None:

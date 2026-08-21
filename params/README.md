@@ -1,8 +1,11 @@
 # Flight-controller parameters
 
 A reproducible flight needs a known flight-controller (FC) parameter set. This
-folder holds the baseline so a run can always be restored to a defined state — in
-SITL and, later, on the real FC.
+folder holds the SITL baseline so a simulated run can always be restored to a defined
+state. Every `.parm` file here is a SITL artefact and belongs in SITL — the full dumps
+were captured from a simulator run, the three overlays were hand-written for one. The
+equivalent baseline for the real FC still has to be captured (see the warning under
+*Files*).
 
 > ## ⚠️ Parameter names are firmware-specific
 >
@@ -20,6 +23,10 @@ SITL and, later, on the real FC.
 > leaving the rangefinder unusable. Always check the firmware banner
 > (`ArduCopter V4.6.3`) before loading anything; `Drone.log_autopilot_version()` also
 > records it in every mission log.
+>
+> This check is about *names*, not about *targets*: a matching banner does not make a
+> file safe to load, because the real FC and SITL both run 4.6.3. See the second
+> warning below — no file in this folder goes onto the real aircraft.
 
 ## Files
 
@@ -28,16 +35,39 @@ SITL and, later, on the real FC.
 | `sitl_flow_phaseA.parm` | 4.6.x | SITL: enable simulated optical flow + rangefinder (load, then reboot). |
 | `sitl_flow_phaseB.parm` | 4.6.x | SITL: configure flow/rangefinder + point the EKF at flow (load after phase A reboot, then reboot again). |
 | `sitl_gps_off.parm`     | 4.6.x | SITL: GPS truly off (`GPS1_TYPE 0`) + an `ARMING_CHECK` mask without the GPS bit (Phase 3). |
-| `sitl_indoor_463.parm`  | 4.6.3 | **Restore point.** Full dump captured from the first fully green indoor mission on 4.6.3. Load this to get back to a known-good state in one step. |
+| `sitl_indoor_463.parm`  | 4.6.3 | **SITL restore point — never load onto the real FC.** Full dump captured from the first fully green indoor *SITL* mission on 4.6.3; carries the SITL airframe tuning, sensor backends and serial config (see the warning below). Load this to get the *simulator* back to a known-good state in one step. |
 | `default.parm` | 4.8.0-dev | *Historical.* Full dump from the old master-branch SITL. **Not loadable on 4.6.3.** |
 | `gps_denied_sitl.parm`  | 4.8.0-dev | *Historical*, indoor set with GPS still ON (Phase 2). |
 | `gps_off_sitl.parm`     | 4.8.0-dev | *Historical*, indoor set with GPS off (Phase 3). |
 
-The three overlays are the ones to use; they are small, commented and version-checked.
-The full dumps document the old 4.8-dev runs and are kept for the record only — they
-also contain the SITL airframe's PID tuning, which must **never** go onto the real
-aircraft. A fresh baseline captured from the real FC is still missing and is the most
-valuable file this folder could have.
+The three overlays are the ones to use in SITL; they are small, commented and
+version-checked. The full dumps document the old 4.8-dev runs and are kept for the
+record only.
+
+> ## ⚠️ Every file in this folder is a SITL artefact
+>
+> Not just the historical 4.8-dev dumps — `sitl_indoor_463.parm` and the three overlays
+> too. **None of them may be loaded onto the real flight controller.** They carry:
+>
+> - the SITL airframe's PID tuning (`ATC_RAT_RLL_P`/`ATC_RAT_PIT_P 0.135`) and 364
+>   `SIM_*` parameters, plus simulated compass IDs;
+> - SITL sensor backends — `RNGFND1_TYPE 100` ("SITL"), `FLOW_TYPE 10`,
+>   `SIM_FLOW_ENABLE 1` — where the real aircraft reads an MTF-01P over MAVLink
+>   (`RNGFND1_TYPE 10`, `FLOW_TYPE 5`);
+> - SITL's untouched serial ports — `SERIAL4_PROTOCOL 5` / `SERIAL4_BAUD 230` and
+>   `SERIAL5_PROTOCOL -1` (disabled) — where the real FC has the Pi on SERIAL4 (MAVLink2
+>   @921600) and the MTF-01P on SERIAL5 (MAVLink1 @115200). Loading this would sever the
+>   companion link and switch off the sensor port in one go;
+> - `BATT_LOW_VOLT 10.5`, below the empty voltage of our 4S Li-Ion pack — the table
+>   further down asks for `12.8` on the real FC for exactly that reason.
+>
+> **A matching firmware version is not a guard.** The real FC and SITL both run
+> ArduCopter 4.6.3, so these files load *cleanly* onto the aircraft and silently replace
+> its tuning, sensor backends and serial wiring. The version check at the top of this
+> file protects against the 4.8-dev dumps only; nothing protects against this.
+>
+> A fresh baseline captured from the real FC is still missing and is the most valuable
+> file this folder could have.
 
 > Full dumps are captured from a working run, not hand-written. The list below
 > documents the parameters our companion code relies on, so you know what must be
@@ -65,7 +95,7 @@ failsafe — both should coexist):
 
 | Parameter        | Suggested | Why                                                       |
 |------------------|-----------|-----------------------------------------------------------|
-| `BATT_LOW_VOLT`  | `12.8`    | FC-side low-battery failsafe. Our pack is **4S Li-Ion** (4.1 V/cell full = 16.4 V, 2.8 V/cell empty = 11.2 V), so the old 10.8 V — below empty — would never have fired. Mirrors `Config.pi().battery_min_voltage`. |
+| `BATT_LOW_VOLT`  | `12.8`    | FC-side low-battery failsafe. Our pack is **4S Li-Ion** (4.1 V/cell full = 16.4 V, 2.8 V/cell empty = 11.2 V), so the old 10.8 V — below empty — would never have fired. Mirrors `config.battery_min_voltage`, whose default of `12.8` **is** the real-aircraft value; only `Config.sitl()` lowers it to 10.8 V for the simulated pack. |
 | `BATT_FS_LOW_ACT`| `1` (Land)| What the FC does on low battery. **Not `2` (RTL)** indoors: RTL climbs to `RTL_ALT` first. |
 | `FS_GCS_ENABLE`  | `5` (Land) or `0` | FC reacts if it stops hearing from the companion. Two catches: it only ever fires **after** it has seen a HEARTBEAT from `SYSID_MYGCS` (`Drone.tick()` now sends one every second — before that this option was silently dead), and its action must not be RTL indoors. `0` is defensible in a hall, but then note that a dead Pi has no automatic rescue. |
 | `FS_THR_ENABLE`  | `3` (Land)| Radio failsafe. Same reasoning — the default `1` is RTL. |
@@ -87,20 +117,30 @@ The file lands in MAVProxy's working directory (`Simulation/ardupilot/`) — cop
 MAVProxy also keeps a live cache in `mav.parm` in the same directory, which is usually
 already up to date.
 
-`sitl_indoor_463.parm` in this folder is such a capture: the state of the **first fully
-green indoor mission on 4.6.3** (origin set by the companion, GPS off, optical flow +
-rangefinder, search → approach → drop → land). It includes the three parameters the
-companion sets at runtime (`FENCE_ACTION`, `RTL_ALT`, `WPNAV_SPEED_UP`), which is
-intentional — it is a restore point for a known-good run, not a minimal overlay.
+`sitl_indoor_463.parm` in this folder is such a capture: the SITL state of the **first
+fully green indoor mission on 4.6.3** (origin set by the companion, GPS off, optical flow +
+rangefinder, search → approach → drop → land). It includes the three safety-envelope
+parameters the companion sets at runtime (`FENCE_ACTION`, `RTL_ALT`, `WPNAV_SPEED_UP`)
+as well as the geofence parameters (`FENCE_TYPE`, `FENCE_ALT_MAX`, `FENCE_ENABLE`) and
+— this being a SITL capture — `SERVO9_FUNCTION`, which the code only sets when
+`release_mechanism="fc"`. That is intentional: it is a restore point for a known-good
+run, not a minimal overlay.
 
 ## Restore a baseline
 
-- **MAVProxy:** `param load sitl_indoor_463.parm` (the known-good indoor state), then
-  `reboot`
-- **QGroundControl:** Vehicle Setup → Parameters → Tools → *Load from file*
+**In SITL only.** Every file here is a SITL artefact, so both routes below are for the
+simulator. Never point them at the real flight controller — and do not let a matching
+firmware banner talk you into it, since the aircraft runs the same 4.6.3 and the file
+would load without a single complaint (see the warning under *Files*).
 
-Check the firmware version first — a dump only loads cleanly onto the release it was
-taken from (see the warning at the top).
+- **MAVProxy:** `param load sitl_indoor_463.parm` (the known-good indoor SITL state),
+  then `reboot`
+- **QGroundControl:** connect to SITL, then Vehicle Setup → Parameters → Tools →
+  *Load from file*
+
+Check the firmware version too — a dump only loads cleanly onto the release it was taken
+from (see the warning at the top). That check catches the 4.8-dev dumps; it does not
+catch loading a SITL file onto the aircraft.
 
 ## Reset SITL to firmware defaults (clean slate)
 
@@ -118,7 +158,10 @@ sim_vehicle.py -v ArduCopter --console -w
 
 Load the three overlays instead of typing parameters one by one — this avoids the
 paste/garbling problems of multi-line input in the MAVProxy console. Reboot after each,
-and wait for MAVProxy to reconnect before the next:
+and wait for MAVProxy to reconnect before the next. **These go into the simulator only:**
+they switch the FC to the simulator's own sensor backends (`RNGFND1_TYPE 100`,
+`FLOW_TYPE 10`, `SIM_FLOW_ENABLE 1`) and would blind the real aircraft, which has a
+physical MTF-01P on SERIAL5. In the MAVProxy console attached to SITL:
 
 ```
 param load /Users/danieleamore/Studium/Drohnen-mit-KI/Pi-Code/params/sitl_flow_phaseA.parm
@@ -164,4 +207,5 @@ sim_vehicle.py -v ArduCopter --console --custom-location=50.131196,8.692972,112,
 follow the actual altitude. In a dataflash log, `RFND.Dist` must track `CTUN.Alt`. A
 rangefinder reading 0.00 m at every altitude means `SIM_TERRAIN` is still on.
 
-Then run `python main.py` (`config.gps_denied = True`, the default).
+Then run `python main.py --sim` (SITL; `python main.py` with no flag is the real
+aircraft). `config.gps_denied = True` is the default.

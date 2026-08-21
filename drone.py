@@ -253,6 +253,26 @@ class Drone:
                 return msg.param_value
         raise TimeoutError(f"No confirmation for parameter {name}")
 
+    def read_param(self, name: str, tries: int = 3, timeout: float = 2.0):
+        """Read one parameter without writing it. Returns the value or None.
+
+        Needed so the companion can put back what it changed: parameters live in the
+        flight controller and outlive this process, so anything we set for a mission
+        has to be remembered before it is overwritten.
+        """
+        for _ in range(tries):
+            self.master.mav.param_request_read_send(
+                self.master.target_system, self.master.target_component,
+                name.encode("utf-8"), -1)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                msg = self.master.recv_match(type="PARAM_VALUE", blocking=True,
+                                             timeout=timeout)
+                if msg and msg.param_id == name:
+                    return msg.param_value
+        log.warning(f"[PARAM] Could not read {name}")
+        return None
+
     # ==================================================================
     # 2. Reading telemetry
     # ==================================================================
@@ -286,6 +306,48 @@ class Drone:
         if not msg:
             return None
         return {"north": msg.x, "east": msg.y, "down": msg.z}
+
+    def read_position_sensors(self, duration: float = 5.0) -> dict:
+        """Listen for the sensors the GPS-denied position estimate is built on.
+
+        Returns {"rangefinder_samples", "rangefinder_min", "rangefinder_max",
+                 "flow_samples", "flow_quality_max"}.
+
+        Why this exists: a broken optical-flow setup does not announce itself. The
+        autopilot keeps streaming RANGEFINDER messages whose distance is simply always
+        0.00, the EKF cannot scale the flow into a velocity, and the position estimate
+        drifts - our params/README.md records 366 m of drift measured while the vehicle
+        stood still. Everything downstream then looks healthy right up to the point where
+        the position controller flies full-throttle after an imaginary error. Reading the
+        raw sensor values before arming is the cheapest way to catch that on the ground.
+
+        Note ArduPilot emits RANGEFINDER (its own message, with distance in metres) as
+        well as DISTANCE_SENSOR (centimetres); we count both so a differently configured
+        backend still registers.
+        """
+        rng: list = []
+        flow_q: list = []
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            msg = self.master.recv_match(
+                type=["RANGEFINDER", "DISTANCE_SENSOR", "OPTICAL_FLOW", "OPTICAL_FLOW_RAD"],
+                blocking=True, timeout=1.0)
+            if msg is None:
+                continue
+            kind = msg.get_type()
+            if kind == "RANGEFINDER":
+                rng.append(msg.distance)                  # metres
+            elif kind == "DISTANCE_SENSOR":
+                rng.append(msg.current_distance / 100.0)  # centimetres -> metres
+            else:
+                flow_q.append(getattr(msg, "quality", 0))
+        return {
+            "rangefinder_samples": len(rng),
+            "rangefinder_min": min(rng) if rng else None,
+            "rangefinder_max": max(rng) if rng else None,
+            "flow_samples": len(flow_q),
+            "flow_quality_max": max(flow_q) if flow_q else None,
+        }
 
     def get_battery(self, timeout: float = 2.0) -> Optional[dict]:
         """Read SYS_STATUS: voltage [V], current [A], remaining capacity [%]."""
@@ -361,6 +423,21 @@ class Drone:
                 log.info("[PREARM] EKF position estimate ready")
                 return True
         log.warning("[PREARM] Timeout: no EKF position estimate")
+        return False
+
+    def wait_ekf_flag(self, flag: int, timeout: float = 10.0) -> bool:
+        """Wait for one EKF_STATUS_REPORT bit. True if it appears within `timeout`.
+
+        Separate from wait_ready_to_arm() because the takeover path asks the same
+        question at a different moment: not "may we arm" but "is the estimate good
+        enough to accept an aircraft that is ALREADY flying".
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.tick()
+            msg = self.master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1.0)
+            if msg and (msg.flags & flag):
+                return True
         return False
 
     def arm(self, timeout: float = 10.0, attempts: int = 5) -> bool:
@@ -447,8 +524,9 @@ class Drone:
         Fly to (lat, lon, alt) in GUIDED. Only sends the target; arrival is
         checked separately via wait_arrival().
 
-        Note: uses global coordinates (GPS). For indoor use without GPS see the
-        README -> there SET_POSITION_TARGET_LOCAL_NED + optical flow take over.
+        Note: uses global coordinates (GPS). For indoor use without GPS see
+        goto_local() below and the frames table in docs/ARCHITECTURE.md -> there
+        SET_POSITION_TARGET_LOCAL_NED + optical flow take over.
         """
         # type_mask: use position only, ignore velocity/acceleration/yaw
         type_mask = 0b0000111111111000
@@ -474,8 +552,9 @@ class Drone:
         via SET_POSITION_TARGET_LOCAL_NED with MAV_FRAME_BODY_OFFSET_NED.
 
         This is the building block for visual servoing over the target in GUIDED:
-        the mission converts the camera's image offset into a step and lets the FC
-        fly it. Only the position fields are used; velocity/accel/yaw are ignored.
+        the mission converts the camera's ground offset (dx/dy, in METRES - every
+        Camera implementation reports metres, not image fractions) into a step and lets
+        the FC fly it. Only the position fields are used; velocity/accel/yaw are ignored.
         """
         type_mask = 0b0000111111111000  # position only
         self.master.mav.set_position_target_local_ned_send(
@@ -493,17 +572,46 @@ class Drone:
 
     def link_alive(self, timeout: float = 3.0) -> bool:
         """
-        True if a HEARTBEAT from the FC arrives within 'timeout'. Returns quickly
-        when the link is healthy (heartbeats stream at a few Hz); it only blocks up
-        to 'timeout' when the link is actually down. Used by the failsafe to detect
-        a lost companion<->FC link.
+        True if a HEARTBEAT *from the flight controller* arrives within 'timeout'.
+        Returns quickly when the link is healthy (heartbeats stream at a few Hz); it
+        only blocks up to 'timeout' when the link is actually down. Used by the
+        failsafe to detect a lost companion<->FC link.
+
+        The source check is the whole point and used to be missing. On the aircraft the
+        script does not talk to the FC directly: mavlink-router owns /dev/serial0 and
+        fans the stream out to us, to a ground station and to a log. Accepting ANY
+        heartbeat on that endpoint means a QGroundControl instance sitting on the same
+        router keeps this returning True while the FC UART is dead - which is exactly
+        the failure LINK_LOSS exists to catch. wait_heartbeat() above already documents
+        the same trap for the same reason.
+
+        Note we cannot use pymavlink's `condition=` argument for this: it is evaluated
+        against pymavlink's last-message-per-type cache, which can still hold an old FC
+        heartbeat and would let a fresh GCS packet through.
         """
-        return self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=timeout) is not None
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            msg = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=remaining)
+            if msg is None:
+                return False
+            # target_system is latched onto the vehicle by wait_heartbeat().
+            if msg.get_srcSystem() == self.master.target_system:
+                return True
 
     def wait_arrival(self, lat: float, lon: float, radius_m: float, timeout: float = 60.0) -> bool:
-        """Wait until the drone is within 'radius_m' of the target."""
+        """Wait until the drone is within 'radius_m' of the target.
+
+        tick() belongs in here, not just in the local-NED twin below: this loop can run
+        for the whole phase timeout, and without it our GCS heartbeat would fall silent
+        for longer than FS_GCS_TIMEOUT (5 s). The autopilot would then fire its own GCS
+        failsafe on a companion that is merely busy flying the leg it was told to fly.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self.tick()
             pos = self.get_position()
             if pos:
                 dist = self._haversine(pos["lat"], pos["lon"], lat, lon)
@@ -564,10 +672,16 @@ class Drone:
     def wait_disarmed(self, timeout: float = 60.0) -> bool:
         """
         Block until the motors report disarmed, pumping HEARTBEATs so the armed
-        state stays current. Returns True if disarmed within 'timeout', else
-        False (the caller then forces a disarm). Kept on Drone - rather than
-        reading master directly in the mission - so the mission logic can be
-        tested against a fake drone without a real MAVLink link.
+        state stays current. Returns True if disarmed within 'timeout', else False.
+
+        On False the caller deliberately does NOT force a disarm (see
+        mission._recover): cutting the motors of a vehicle that may still be airborne
+        is worse than leaving the LAND command standing. The kill switch lives on the
+        transmitter, not in this script. Drone.disarm() therefore has no caller in the
+        mission path and exists for bench use.
+
+        Kept on Drone - rather than reading master directly in the mission - so the
+        mission logic can be tested against a fake drone without a real MAVLink link.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:

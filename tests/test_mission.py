@@ -10,7 +10,7 @@ tests can assert on them. Because the mission was written against the Drone
 interface (not against the MAVLink connection directly), swapping in FakeDrone is
 all it takes.
 
-These tests protect the upcoming refactors (search/approach states, GPS-denied
+These tests cover the GPS path (ENROUTE/OVER_TARGET), the default GPS-denied
 navigation) from silently breaking the mission flow.
 """
 
@@ -49,6 +49,9 @@ class FakeDrone:
         self._armed = False
         self._servo = config.neutral_pwm
         self.ready_ok = ready_ok
+        self.ekf_flag_ok = True    # takeover: does the EKF bit appear once airborne?
+        # Global position as read by get_position(); takeover watches rel_alt on it.
+        self.position = {"lat": 0.0, "lon": 0.0, "alt": 0.0, "rel_alt": 0.0}
         self.arm_ok = arm_ok
         self.takeoff_ok = takeoff_ok
         self.arrival_ok = arrival_ok
@@ -57,6 +60,15 @@ class FakeDrone:
         self._link_checks = 0
         self._north = 0.0  # local NED position, updated by goto_local / move_body_offset
         self._east = 0.0
+        # Position sensors as read by failsafe.verify_position_sensors(). Healthy by
+        # default; a test that wants the flyaway precondition overrides this.
+        # What the FC carried before this run, as read back by read_param().
+        self.params_before = {"FENCE_ENABLE": 0.0, "FENCE_TYPE": 7.0,
+                              "FENCE_ALT_MAX": 120.0}
+        self.position_sensors = {
+            "rangefinder_samples": 25, "rangefinder_min": 0.30, "rangefinder_max": 1.20,
+            "flow_samples": 25, "flow_quality_max": 180,
+        }
         # Flight mode the FC reports. Tests flip this to simulate the pilot taking over.
         self.mode = "GUIDED"
         self.origin_ok = origin_ok
@@ -76,6 +88,21 @@ class FakeDrone:
             raise TimeoutError(f"No confirmation for parameter {name}")
         self.calls.append(("set_param", name, value))
         return float(value)
+
+    def get_position(self, timeout=2.0):
+        return self.position
+
+    def wait_ekf_flag(self, flag, timeout=10.0):
+        self.calls.append(("wait_ekf_flag", flag))
+        return self.ekf_flag_ok
+
+    def read_param(self, name, tries=3, timeout=2.0):
+        self.calls.append(("read_param", name))
+        return self.params_before.get(name)
+
+    def read_position_sensors(self, duration=5.0):
+        self.calls.append(("read_position_sensors", duration))
+        return self.position_sensors
 
     def get_battery(self, timeout=2.0):
         if isinstance(self._battery, list):
@@ -197,7 +224,7 @@ def _build_mission(drone: FakeDrone, config: Config, camera=None) -> DeliveryMis
 
 def test_happy_path_runs_to_done_and_delivers():
     config = Config.sitl()
-    config.gps_denied = False  # GPS path: IDLE->TAKEOFF->ENROUTE->OVER_TARGET->DROP->RTL
+    config.gps_denied = False  # GPS path: IDLE->TAKEOFF->ENROUTE->OVER_TARGET->DROP->RECOVER
     drone = FakeDrone(config)
     mission = _build_mission(drone, config)
 
@@ -207,14 +234,16 @@ def test_happy_path_runs_to_done_and_delivers():
     assert mission.abort_reason is None
 
     actions = drone.actions()
-    # The delivery happened in the right order and ended with a return to launch.
+    # The delivery happened in the right order and the aircraft came down (LAND:
+    # recovery_action defaults to "land", RECOVER only flies RTL when asked to).
     assert "drop" in actions
     assert actions.index("takeoff") < actions.index("drop") < actions.index("land")
 
 
 def test_low_battery_aborts_before_drop_but_still_returns():
     config = Config.sitl()
-    # Voltage below battery_min_voltage (10.8 V) -> failsafe fires on the first check.
+    # Voltage below battery_min_voltage (10.8 V) on every read -> the failsafe fires
+    # after battery_low_samples (3) consecutive checks, i.e. just after takeoff.
     drone = FakeDrone(config, battery={"voltage": 10.0, "current": 1.0, "remaining": 15})
     mission = _build_mission(drone, config)
 
@@ -658,3 +687,431 @@ def test_pi_flag_still_accepted_as_a_redundant_alias():
     from main import make_config
 
     assert make_config(["main.py", "--pi"]).release_mechanism == "pi"
+
+
+# ======================================================================
+# Staged hardware bring-up: hover test and skip_drop
+# ======================================================================
+# These exist so a first flight on a new aircraft adds ONE unknown at a time.
+# A failure then names its own cause instead of leaving four candidates open.
+
+def test_hover_test_skips_search_and_drop_and_lands():
+    """Milestone 1: climb, hold, land. Nothing else may be commanded."""
+    config = Config.sitl()
+    config.hover_test_s = 0.2          # keep the test fast; the path is what matters
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    actions = drone.actions()
+    assert "takeoff" in actions
+    assert "land" in actions
+    # The whole point: no search pattern, no payload release.
+    assert "goto_local" not in actions
+    assert "goto" not in actions
+    assert "drop" not in actions
+
+
+def test_hover_test_alt_overrides_the_takeoff_altitude():
+    """A bring-up hover must be flyable lower than the search altitude without
+    touching the rest of the configuration."""
+    config = Config.sitl()
+    config.hover_test_s = 0.1
+    config.hover_test_alt = 1.0
+    config.search_altitude = 2.0
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    assert mission.takeoff_altitude() == 1.0
+
+    mission.run()
+    commanded = [c for c in drone.calls if c[0] == "takeoff"]
+    assert commanded == [("takeoff", 1.0)]
+
+
+def test_hover_test_alt_is_ignored_without_hover_mode():
+    """hover_test_alt must not silently lower a real mission's takeoff."""
+    config = Config.sitl()
+    config.hover_test_alt = 1.0        # set, but hover_test_s stays 0
+    config.search_altitude = 2.0
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    assert mission.takeoff_altitude() == 2.0
+
+
+def test_hover_aborts_on_failsafe_instead_of_holding():
+    """A failsafe during the hold must end the hover, not sit it out."""
+    config = Config.sitl()
+    config.hover_test_s = 30.0         # long enough that only the abort can end it
+    drone = FakeDrone(config, battery={"voltage": 10.0, "current": 1.0, "remaining": 50})
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason == "LOW_BATTERY"
+    assert "land" in drone.actions()   # airborne abort -> RECOVER -> LAND
+
+
+def test_skip_drop_centres_but_releases_nothing():
+    """Milestone 4: prove search + detect + centring with nothing falling out."""
+    config = Config.sitl()
+    config.skip_drop = True
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    actions = drone.actions()
+    assert "goto_local" in actions     # it really flew the search pattern
+    assert "drop" not in actions       # and released nothing
+    assert "land" in actions
+
+
+def test_bringup_flags_are_parsed_from_the_command_line():
+    """The flags exist so no source edit is needed on the drone between stages."""
+    from main import make_config
+
+    c = make_config(["main.py", "--hover", "30", "--alt", "1.5"])
+    assert c.hover_test_s == 30.0
+    assert c.hover_test_alt == 1.5
+    assert c.release_mechanism == "pi"          # still the real-aircraft profile
+
+    c = make_config(["main.py", "--hover"])     # bare flag -> default duration
+    assert c.hover_test_s == 20.0
+
+    c = make_config(["main.py", "--no-drop"])
+    assert c.skip_drop is True
+    assert c.hover_test_s == 0.0
+
+    c = make_config(["main.py", "--sim"])       # nothing set unless asked for
+    assert c.hover_test_s == 0.0
+    assert c.skip_drop is False
+
+
+# ======================================================================
+# Flyaway protection
+# ======================================================================
+# A GPS-denied position estimate that loses its height reference does not fail
+# loudly - it drifts, and the position controller then chases an error that only
+# exists in the filter. params/README.md records 366 m of drift measured while the
+# vehicle stood still, from a rangefinder stuck at 0.00 m. These tests pin the two
+# guards against that: refuse to arm on dead sensors, and land if the reported
+# position leaves a plausible envelope.
+
+def test_rangefinder_stuck_at_zero_lands_right_after_takeoff():
+    """The exact precondition of the documented 366 m drift.
+
+    It cannot be caught on the ground - there a healthy sensor reads 0.00 m too - so
+    the abort must happen just after the climb, at takeoff height, before the estimate
+    has a search pattern in which to run away."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 40,     # messages ARE arriving ...
+        "rangefinder_min": 0.0,        # ... but the distance never leaves zero
+        "rangefinder_max": 0.0,
+        "flow_samples": 40, "flow_quality_max": 150,
+    }
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "RANGEFINDER_NOT_TRACKING"
+    assert "takeoff" in drone.actions()          # it did leave the ground ...
+    assert "land" in drone.actions()             # ... and came straight back down
+    assert "goto_local" not in drone.actions()   # no search pattern was ever flown
+    assert "drop" not in drone.actions()
+
+
+def test_zero_rangefinder_on_the_ground_does_not_block_arming():
+    """A healthy sensor reads ~0 m sitting on the floor. Blocking on that would refuse
+    every takeoff - SITL caught exactly this when the check was written wrong."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 40, "rangefinder_min": 0.0, "rangefinder_max": 0.0,
+        "flow_samples": 40, "flow_quality_max": 150,
+    }
+    mission = _build_mission(drone, config)
+
+    assert mission.failsafe.verify_position_sensors() is None
+
+
+def test_missing_optical_flow_refuses_to_arm():
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 40, "rangefinder_min": 0.3, "rangefinder_max": 1.1,
+        "flow_samples": 0, "flow_quality_max": None,     # no flow at all
+    }
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "NO_OPTICAL_FLOW_DATA"
+    assert "arm" not in drone.actions()
+
+
+def test_silent_rangefinder_refuses_to_arm():
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 0, "rangefinder_min": None, "rangefinder_max": None,
+        "flow_samples": 40, "flow_quality_max": 150,
+    }
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "NO_RANGEFINDER_DATA"
+
+
+def test_sensor_gate_is_skipped_outdoors():
+    """The gate is about optical flow. With GPS there is nothing for it to check."""
+    config = Config.sitl()
+    config.gps_denied = False
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 0, "rangefinder_min": None, "rangefinder_max": None,
+        "flow_samples": 0, "flow_quality_max": None,
+    }
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason is None
+    assert "read_position_sensors" not in drone.actions()
+    assert "drop" in drone.actions()             # the GPS mission still completes
+
+
+def test_runaway_position_estimate_lands_the_aircraft():
+    """The software counterpart to a horizontal fence: if the reported position leaves
+    the envelope, land - whether it is the aircraft running away or the filter."""
+    config = Config.sitl()
+    config.max_position_radius_m = 15.0
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    # Airborne, then the estimate jumps far outside anything the search pattern reaches.
+    original_takeoff = drone.takeoff
+
+    def takeoff_then_diverge(altitude, timeout=30.0):
+        result = original_takeoff(altitude, timeout)
+        drone._north, drone._east = 300.0, 200.0
+        return result
+
+    drone.takeoff = takeoff_then_diverge
+    mission.run()
+
+    assert mission.abort_reason == "POSITION_IMPLAUSIBLE"
+    assert "land" in drone.actions()             # airborne abort -> RECOVER -> LAND
+    assert "drop" not in drone.actions()
+
+
+def test_position_guard_can_be_disabled():
+    config = Config.sitl()
+    config.max_position_radius_m = 0.0           # off
+    drone = FakeDrone(config)
+    drone._north, drone._east = 300.0, 200.0
+    mission = _build_mission(drone, config)
+
+    assert mission.failsafe.position_implausible() is None
+
+
+def test_safety_envelope_limits_horizontal_speed_too():
+    """WPNAV_SPEED caps how fast a diverging estimate can be chased. The firmware
+    default is 1000 cm/s - a hall crossed in under a second."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    params = {c[1]: c[2] for c in drone.calls if c[0] == "set_param"}
+    assert params["WPNAV_SPEED"] == config.cruise_speed_cms
+    assert params["WPNAV_SPEED_UP"] == config.climb_rate_cms
+
+
+def test_every_milestone_is_a_coherent_stage():
+    """Each milestone must add exactly one unknown to the previous one."""
+    from main import make_config, MILESTONES
+
+    stages = {n: make_config(["main.py", "--milestone", str(n)]) for n in MILESTONES}
+
+    assert stages[1].hover_test_s > 0 and stages[1].camera_source == "none"
+    assert stages[2].hover_test_s > 0 and stages[2].camera_source == "real"
+    assert stages[3].hover_test_s == 0 and stages[3].camera_source == "none"
+    assert stages[4].camera_source == "real" and stages[4].skip_drop is True
+    assert stages[5].camera_source == "real" and stages[5].skip_drop is False
+    # All of them stay on the real-aircraft profile.
+    assert all(c.release_mechanism == "pi" for c in stages.values())
+    assert all(c.milestone == n for n, c in stages.items())
+
+
+def test_unknown_milestone_is_rejected_not_ignored():
+    """A typo must stop the run, not silently fly a different stage."""
+    from main import make_config
+
+    with pytest.raises(SystemExit):
+        make_config(["main.py", "--milestone", "9"])
+
+
+def test_milestone_substitutes_the_camera_in_simulation_and_says_so():
+    """A milestone must be rehearsable in SITL - but never silently with a different
+    detector than the one it names."""
+    from main import make_config
+
+    sim = make_config(["main.py", "--sim", "--milestone", "5"])
+    assert sim.camera_source == "auto"            # SimCamera, not RealCamera
+    assert sim.milestone_camera_substituted is True
+
+    real = make_config(["main.py", "--milestone", "5"])
+    assert real.camera_source == "real"
+    assert real.milestone_camera_substituted is False
+
+
+def test_pilot_takeover_during_approach_stops_the_companion():
+    """Flipping out of GUIDED must stop the servo loop immediately, not after the phase
+    timeout. Our setpoints are discarded from that moment anyway - what matters is that
+    the companion stops talking and the log records when the human took over."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    camera = ScriptedCamera([{"detected": True, "dx": 3.0, "dy": 3.0, "distance": 2.0}])
+    mission = _build_mission(drone, config, camera=camera)
+
+    original_nudge = drone.move_body_offset
+
+    def nudge_then_pilot_takes_over(forward, right, down=0.0):
+        original_nudge(forward, right, down)
+        drone.mode = "LOITER"          # pilot flips the mode switch mid-approach
+
+    drone.move_body_offset = nudge_then_pilot_takes_over
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason == "MODE_CHANGED_LOITER"
+    assert "drop" not in drone.actions()     # never released after the takeover
+    assert "land" not in drone.actions()     # and never fought the pilot with a mode
+
+
+def test_geofence_is_restored_on_every_exit_path():
+    """Fence parameters live in the FC and outlive the script. A 4 m 'Always Land'
+    fence left behind lands the next MANUAL flight, minutes later, with no visible
+    connection to the companion run that set it."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    sets = [c for c in drone.calls if c[0] == "set_param"]
+    # It was enabled for the mission ...
+    assert ("set_param", "FENCE_ENABLE", 1) in [(c[0], c[1], int(c[2])) for c in sets]
+    # ... and the FC's own values were put back afterwards.
+    final = {}
+    for c in sets:
+        final[c[1]] = c[2]
+    assert final["FENCE_ENABLE"] == 0.0
+    assert final["FENCE_TYPE"] == 7.0
+    assert final["FENCE_ALT_MAX"] == 120.0
+
+
+def test_geofence_is_restored_even_when_the_mission_crashes():
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("something went wrong mid-flight")
+
+    drone.takeoff = explode
+    with pytest.raises(RuntimeError):
+        mission.run()
+
+    final = {c[1]: c[2] for c in drone.calls if c[0] == "set_param"}
+    assert final["FENCE_ENABLE"] == 0.0     # restored despite the crash
+
+
+# ======================================================================
+# Pilot-assisted start (takeover)
+# ======================================================================
+# The companion must never arm or take off in this mode. It inherits an aircraft the
+# pilot has already flown up - which both puts the human in charge of the riskiest
+# moment and breaks the flow-only deadlock (no position estimate on the ground, no
+# takeoff without one).
+
+def _airborne_after(drone, alt_m=1.2):
+    """Make FakeDrone report a pilot who has armed and climbed."""
+    drone._armed = True
+    drone.position = {"lat": 0.0, "lon": 0.0, "alt": alt_m, "rel_alt": alt_m}
+
+
+def test_takeover_never_arms_and_never_takes_off():
+    config = Config.sitl()
+    config.takeover_mode = True
+    config.hover_test_s = 0.2
+    drone = FakeDrone(config)
+    _airborne_after(drone)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    actions = drone.actions()
+    assert "arm" not in actions          # the pilot armed it, not us
+    assert "takeoff" not in actions      # and the pilot flew it up
+    assert "set_mode" in actions         # we only asked for GUIDED
+    assert mission.state is State.DONE
+
+
+def test_takeover_waits_until_the_pilot_is_high_enough():
+    """Handing over at 10 cm would defeat the purpose - flow needs height."""
+    config = Config.sitl()
+    config.takeover_mode = True
+    config.takeover_min_alt_m = 0.8
+    config.takeover_timeout_s = 0.5      # pilot never climbs; give up quickly
+    drone = FakeDrone(config)
+    drone._armed = True
+    drone.position = {"lat": 0.0, "lon": 0.0, "alt": 0.1, "rel_alt": 0.1}
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "PILOT_NEVER_TOOK_OFF"
+    assert "set_mode" not in drone.actions()   # never grabbed control
+
+
+def test_takeover_refuses_without_a_position_estimate_in_the_air():
+    """Taking over a flying aircraft with no position estimate is the flyaway setup."""
+    config = Config.sitl()
+    config.takeover_mode = True
+    drone = FakeDrone(config)
+    _airborne_after(drone)
+    drone.ekf_flag_ok = False            # airborne, but the EKF still has nothing
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "NO_POSITION_ESTIMATE_IN_AIR"
+    assert "set_mode" not in drone.actions()
+    # It must not command a landing either - the pilot is flying and in control.
+    assert "land" not in drone.actions()
+
+
+def test_takeover_goes_straight_to_the_stage_under_test():
+    """The pilot already did the climb, so TAKEOFF must be skipped entirely."""
+    config = Config.sitl()
+    config.takeover_mode = True
+    drone = FakeDrone(config)
+    _airborne_after(drone)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert "goto_local" in drone.actions()     # went straight into SEARCH
+    assert "takeoff" not in drone.actions()
