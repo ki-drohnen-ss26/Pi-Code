@@ -423,6 +423,7 @@ def test_no_origin_when_disabled():
 
 def test_geofence_sets_altitude_fence():
     config = Config.sitl()
+    config.geofence_enable = True      # off by default indoors, see config.py
     drone = FakeDrone(config)
     mission = _build_mission(drone, config)
 
@@ -501,15 +502,19 @@ def test_pilot_override_stops_without_commanding_anything():
 
 
 def test_safety_envelope_is_enforced_before_flight():
-    """The FC defaults are built for open sky: FENCE_ACTION=1 climbs to RTL_ALT (15 m)
-    on a breach. Indoors that is the ceiling, so the companion sets its own limits."""
+    """The FC defaults are built for open sky: WPNAV_SPEED_UP 250 cm/s overshoots a
+    2 m takeoff, WPNAV_SPEED 1000 cm/s crosses a hall in a second, and RTL climbs to
+    15 m. Indoors all three are wrong, so the companion sets its own limits."""
     config = Config.sitl()
     drone = FakeDrone(config)
     _build_mission(drone, config).run()
 
     assert ("set_param", "WPNAV_SPEED_UP", config.climb_rate_cms) in drone.calls
-    assert ("set_param", "FENCE_ACTION", config.fence_action) in drone.calls
+    assert ("set_param", "WPNAV_SPEED", config.cruise_speed_cms) in drone.calls
     assert ("set_param", "RTL_ALT", config.rtl_alt_m * 100.0) in drone.calls  # cm on 4.6
+    # FENCE_ACTION is NOT part of the envelope any more: meaningless with the fence off,
+    # and writing it left an unrestored change on the FC. It moved to setup_geofence().
+    assert not any(c[0] == "set_param" and c[1].startswith("FENCE_") for c in drone.calls)
 
 
 def test_rtl_altitude_falls_back_to_the_newer_parameter_name():
@@ -1005,6 +1010,7 @@ def test_geofence_is_restored_on_every_exit_path():
     fence left behind lands the next MANUAL flight, minutes later, with no visible
     connection to the companion run that set it."""
     config = Config.sitl()
+    config.geofence_enable = True      # off by default indoors, see config.py
     drone = FakeDrone(config)
     mission = _build_mission(drone, config)
 
@@ -1024,6 +1030,7 @@ def test_geofence_is_restored_on_every_exit_path():
 
 def test_geofence_is_restored_even_when_the_mission_crashes():
     config = Config.sitl()
+    config.geofence_enable = True
     drone = FakeDrone(config)
     mission = _build_mission(drone, config)
 
@@ -1115,3 +1122,26 @@ def test_takeover_goes_straight_to_the_stage_under_test():
 
     assert "goto_local" in drone.actions()     # went straight into SEARCH
     assert "takeoff" not in drone.actions()
+
+
+def test_geofence_is_off_by_default_indoors():
+    """Not a preference - a result. A barometric altitude fence sized for an indoor
+    hover sits inside its own sensor's noise band: propeller downwash spiked BAlt to
+    4-5 m in all five of our flight logs while the aircraft was centimetres off the
+    floor. With FENCE_ACTION=2 that forced the vehicle out of the pilot's mode into
+    LAND on every single takeoff."""
+    for config in (Config(), Config.pi(), Config.sitl(), Config.pi_serial()):
+        assert config.geofence_enable is False
+
+
+def test_geofence_untouched_when_disabled():
+    """If we do not enable it, we must also not write - and not 'restore' - anything."""
+    config = Config.sitl()
+    assert config.geofence_enable is False
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    written = {c[1] for c in drone.calls if c[0] == "set_param"}
+    assert not any(name.startswith("FENCE_") for name in written)

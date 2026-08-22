@@ -237,6 +237,69 @@ Calibration (either path), on the **bench, no props**:
     in a hall, or leave it `0` and rely on the pilot — but then write down that a dead
     Pi has no automatic rescue.
 
+## 5c. Incident 2026-08-21 — full-power climb into the ceiling
+
+**What happened.** During a MANUAL flight in Stabilize, with no companion script running,
+the aircraft came off the ground and then went to full throttle and hit the hall ceiling.
+
+**An earlier version of this section blamed a cable under the rangefinder. That was
+wrong**, and the dataflash logs disprove it. The correct chain has three links, and all
+three are visible in all five logs from those two days.
+
+**Link 1 — the EKF's altitude was already meaningless, and had been for every flight.**
+`EK3_SRC1_POSZ = 2` makes the rangefinder the vertical position source. At rest that
+rangefinder reports a constant 0.02 m, and a constant reading carries no absolute height
+information: vehicle height and terrain offset become jointly unobservable and drift
+together while the filter integrates uncorrected vertical acceleration. `CTUN.Alt`
+diverged in **every** log — 14 m, 44 m, 37 m, 20 m, and finally **1147 m** — while
+`CTUN.BAlt`, the barometric altitude sitting right beside it, stayed within ±0.4 m the
+whole time. The truth was in the log; it was simply not a configured source.
+
+**Link 2 — the barometer spikes on takeoff, and the fence was set below the spike.**
+Propeller downwash raises the local pressure, so barometric altitude jumps the moment the
+aircraft comes light on its skids. At ~15 % throttle, centimetres off the floor:
+
+| log 1 | log 2 | log 3 | log 4 | log 5 |
+|---|---|---|---|---|
+| `BAlt` 4.05 m | 4.65 m | 5.26 m | 4.73 m | 4.17 m (with `RFND` reading 0.16 m) |
+
+`FENCE_ALT_MAX = 4.0` — written by our own `setup_geofence()` — sits **inside that noise
+band**. It breached on every single takeoff.
+
+**Link 3 — the fence action is a mode change.** `FENCE_ACTION = 2` forced the vehicle out
+of the pilot's Stabilize into **LAND**, an altitude-controlled mode. LAND read the EKF
+altitude from link 1, concluded it was 1147 m below target and descending at 12.9 m/s,
+and saturated `CTUN.ThO` at **1.000** trying to arrest a descent that was not happening.
+Impact at 4.8 g.
+
+On the earlier flights the same three links produced the *opposite-looking* symptom: LAND
+happened to command a descent, the aircraft auto-disarmed, and re-arming was then refused
+with **"Arm: LAND mode not armable"** until the battery was pulled. That was never a
+battery failsafe and never a latched EKF error — it was simply a vehicle still sitting in
+LAND mode.
+
+**The rangefinder was not at fault.** During the fatal climb it tracked correctly:
+0.02 → 0.16 → 0.28 → 0.96 → 3.89 → **4.94 m** and back down, 48 consecutive plausible
+samples. The barometer was healthy in all five logs (`Health = 1` throughout). Both
+sensors did their job.
+
+**What changed as a result**
+- `geofence_enable` now defaults to **False**. A barometric altitude fence sized for an
+  indoor hover sits inside its own sensor's noise band, and a fence whose action is a
+  *mode change* converts a bad measurement into a manoeuvre nobody commanded. If you
+  enable it, put `fence_alt_max_m` well above the downwash spike (> 8 m from our data).
+- `FENCE_ACTION` moved out of `setup_safety_envelope()` into `setup_geofence()`, so the
+  companion writes fence parameters only when it actually enables the fence — and
+  restores every one of them on exit.
+- `preflight.py` reports the EKF altitude drift while the aircraft is disarmed and
+  standing still. In these logs it drifted at metres per minute; twenty seconds on the
+  ground would have shown it before any of these flights.
+
+**What is still open.** `EK3_SRC1_POSZ = 2` remains the root cause and is unchanged. The
+barometer — the reference that was correct throughout — failed *after* the crash
+("Baro: unable to initialise driver"), which removes `EK3_SRC1_POSZ = 1` as the obvious
+fix. See `docs/ROADMAP.md` for the current state of that decision.
+
 ## 5b. Flyaway: why it happens indoors, and what stops it
 
 Another team reported their aircraft going to full power and flying away. That is not a

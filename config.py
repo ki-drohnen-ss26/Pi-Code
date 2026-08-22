@@ -82,7 +82,30 @@ class Config:
     # Only this many consecutive readings below the threshold abort the mission.
     battery_low_samples: int = 3
     phase_timeout_s: float = 60.0       # max duration per mission phase
-    geofence_enable: bool = True        # set FENCE_ENABLE?
+
+    # Geofence: DEFAULT OFF INDOORS, and that is the result of an accident, not caution.
+    #
+    # An altitude fence is only as good as the altitude it is fed, and near the ground
+    # the barometer is not usable: propeller downwash raises the local pressure, so the
+    # barometric altitude SPIKES the moment the aircraft comes light on its skids. Every
+    # one of our five flight logs shows it, at ~15 % throttle with the aircraft still
+    # centimetres off the floor:
+    #
+    #     log 1: BAlt 4.05 m     log 3: BAlt 5.26 m
+    #     log 2: BAlt 4.65 m     log 4: BAlt 4.73 m     log 5: BAlt 4.17 m at RFND 0.16 m
+    #
+    # With fence_alt_max_m = 4.0 that breached on EVERY takeoff, and FENCE_ACTION = 2
+    # forced the vehicle out of the pilot's mode into LAND. Twice that ended in an
+    # auto-disarm the pilot had not asked for (and then "Arm: LAND mode not armable"
+    # until the battery was pulled); once, with a diverged EKF altitude, LAND commanded
+    # full throttle and the aircraft hit the ceiling.
+    #
+    # The lesson is not "use a bigger number". It is that a barometric altitude fence
+    # sized for an indoor hover sits inside the noise band of its own sensor, and that a
+    # fence whose action is a MODE CHANGE converts a bad measurement into a manoeuvre
+    # nobody commanded. Enable it only with fence_alt_max_m well above the downwash
+    # spike (> 8 m from our data) and only where that still leaves ceiling clearance.
+    geofence_enable: bool = False
     # FENCE_TYPE bitmask. 1 = max altitude only — works WITHOUT a horizontal position,
     # so it is indoor-safe (a circle/polygon fence would need GPS/position). Outdoor you
     # can add the circle bit (2) / polygon bit (4).

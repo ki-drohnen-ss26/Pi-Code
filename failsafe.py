@@ -65,12 +65,14 @@ class FailsafeMonitor:
         # second and is what turns a diverging position estimate into a flyaway rather
         # than a slow drift you can watch and take over from.
         self._try_param("WPNAV_SPEED", self.config.cruise_speed_cms)
-        self._try_param("FENCE_ACTION", self.config.fence_action)
         self._set_rtl_altitude(self.config.rtl_alt_m)
+        # FENCE_ACTION deliberately NOT set here. It is meaningless with the fence off,
+        # and writing it anyway left an unrestored change on the flight controller.
+        # Everything fence-related lives in setup_geofence()/restore_geofence(), so that
+        # what we change is exactly what we put back.
         log.info(
             f"[FAILSAFE] Safety envelope: climb<={self.config.climb_rate_cms} cm/s, "
             f"cruise<={self.config.cruise_speed_cms} cm/s, "
-            f"FENCE_ACTION={self.config.fence_action} (2=Always Land), "
             f"RTL_ALT={self.config.rtl_alt_m} m"
         )
 
@@ -211,7 +213,7 @@ class FailsafeMonitor:
         # from the pilot's seat that looks like a random failsafe, with no connection to
         # a companion run that ended minutes ago.
         self._fence_before = {}
-        for name in ("FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX"):
+        for name in ("FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_ACTION"):
             value = self.drone.read_param(name)
             if value is not None:
                 self._fence_before[name] = value
@@ -220,10 +222,13 @@ class FailsafeMonitor:
         # horizontal position estimate - indoor-safe), then the altitude, then enable.
         self.drone.set_param("FENCE_TYPE", self.config.fence_type)
         self.drone.set_param("FENCE_ALT_MAX", self.config.fence_alt_max_m)
+        self.drone.set_param("FENCE_ACTION", self.config.fence_action)
         self.drone.set_param("FENCE_ENABLE", 1)
-        log.info(
-            f"[FAILSAFE] Geofence enabled (type={self.config.fence_type}, "
-            f"alt_max={self.config.fence_alt_max_m} m)"
+        log.warning(
+            f"[FAILSAFE] Geofence ENABLED (type={self.config.fence_type}, "
+            f"alt_max={self.config.fence_alt_max_m} m, action={self.config.fence_action}). "
+            f"Note: propeller downwash spikes the BAROMETRIC altitude by 4-5 m near the "
+            f"ground - a low altitude fence will breach on takeoff."
         )
         if self._fence_before:
             log.info(f"[FAILSAFE] Previous fence saved for restore: {self._fence_before}")

@@ -60,6 +60,29 @@ EKF_FLAGS = [
 ]
 
 
+
+def wait_for_vehicle(master, timeout=30):
+    """Wait for a heartbeat FROM THE AUTOPILOT, not from whatever speaks first.
+
+    pymavlink's wait_heartbeat() returns on the first heartbeat of any kind. Over
+    mavlink-router that can be a ground station or another tool, and then
+    target_system stays 0 - every later parameter request goes to nobody and the
+    script simply hangs. drone.py has guarded against this for a while; these
+    diagnostic tools had not.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        master.wait_heartbeat(timeout=2)
+        if master.target_system != 0:
+            return True
+    print("\nNo autopilot heartbeat - target_system stayed 0.")
+    print("Something is on the link, but nothing that identifies itself as a vehicle.")
+    print("Check that:")
+    print("  * the flight controller is powered (USB or battery),")
+    print("  * mavlink-router is running:  systemctl status mavlink-router")
+    print("  * it actually sees the FC:    journalctl -u mavlink-router -n 20")
+    return False
+
 def describe_ekf(flags: int) -> str:
     return " ".join(name for bit, name in EKF_FLAGS if flags & bit) or "(none)"
 
@@ -95,7 +118,7 @@ def main() -> None:
     rec.write("START", f"listening on udpin:127.0.0.1:{port}")
 
     master = mavutil.mavlink_connection(f"udpin:127.0.0.1:{port}", source_system=253)
-    master.wait_heartbeat(timeout=60)
+    wait_for_vehicle(master) or sys.exit(1)
     rec.write("LINK", f"autopilot system {master.target_system} is alive")
     master.mav.request_data_stream_send(
         master.target_system, master.target_component,
@@ -169,8 +192,14 @@ def main() -> None:
         now = time.time()
         if now - last_sample >= 1.0:
             last_sample = now
+            # POS_HORIZ_REL and POS_VERT_AGL on every sample, not just on change: the
+            # hand-lift test is exactly "at what height do these appear", and reading
+            # that off a separate EKF line further up the scrollback does not work.
+            rel = "-" if ekf is None else ("YES" if ekf & 0x08 else "no ")
+            agl = "-" if ekf is None else ("YES" if ekf & 0x40 else "no ")
             rec.write("SAMPLE", f"mode={mode} armed={armed} alt={alt} m  "
-                                f"rng={rng} m  flow_q={flow_q}  batt={volt} V")
+                                f"rng={rng} m  flow_q={flow_q}  batt={volt} V  "
+                                f"POS_HORIZ_REL={rel} POS_VERT_AGL={agl}")
         recent = [(w, m) for w, m in recent if w >= now - 60]
 
 

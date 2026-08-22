@@ -35,6 +35,29 @@ NEEDS_REBOOT = (
 )
 
 
+
+def wait_for_vehicle(master, timeout=30):
+    """Wait for a heartbeat FROM THE AUTOPILOT, not from whatever speaks first.
+
+    pymavlink's wait_heartbeat() returns on the first heartbeat of any kind. Over
+    mavlink-router that can be a ground station or another tool, and then
+    target_system stays 0 - every later parameter request goes to nobody and the
+    script simply hangs. drone.py has guarded against this for a while; these
+    diagnostic tools had not.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        master.wait_heartbeat(timeout=2)
+        if master.target_system != 0:
+            return True
+    print("\nNo autopilot heartbeat - target_system stayed 0.")
+    print("Something is on the link, but nothing that identifies itself as a vehicle.")
+    print("Check that:")
+    print("  * the flight controller is powered (USB or battery),")
+    print("  * mavlink-router is running:  systemctl status mavlink-router")
+    print("  * it actually sees the FC:    journalctl -u mavlink-router -n 20")
+    return False
+
 def read_param(master, name, tries=4, timeout=2.0):
     for _ in range(tries):
         master.mav.param_request_read_send(
@@ -73,7 +96,7 @@ def main() -> None:
     config = Config.sitl() if simulate else Config.pi()
     print(f"Connecting to {config.connection_string} ...")
     master = mavutil.mavlink_connection(config.connection_string, source_system=251)
-    master.wait_heartbeat(timeout=20)
+    wait_for_vehicle(master) or sys.exit(1)
     print(f"Connected to system {master.target_system}")
 
     if master.motors_armed():

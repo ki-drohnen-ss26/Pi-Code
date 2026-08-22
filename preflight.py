@@ -26,7 +26,7 @@ from config import Config
 
 # Grouped so the output reads like a checklist rather than a parameter dump.
 GROUPS = {
-    "Arming": ["ARMING_CHECK"],
+    "Pre-arm checks (reading only - this tool never arms anything)": ["ARMING_CHECK"],
     "Geofence (the companion sets these - are they still ours?)": [
         "FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_ACTION",
     ],
@@ -56,6 +56,29 @@ EKF_FLAGS = [
 ]
 
 
+
+def wait_for_vehicle(master, timeout=30):
+    """Wait for a heartbeat FROM THE AUTOPILOT, not from whatever speaks first.
+
+    pymavlink's wait_heartbeat() returns on the first heartbeat of any kind. Over
+    mavlink-router that can be a ground station or another tool, and then
+    target_system stays 0 - every later parameter request goes to nobody and the
+    script simply hangs. drone.py has guarded against this for a while; these
+    diagnostic tools had not.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        master.wait_heartbeat(timeout=2)
+        if master.target_system != 0:
+            return True
+    print("\nNo autopilot heartbeat - target_system stayed 0.")
+    print("Something is on the link, but nothing that identifies itself as a vehicle.")
+    print("Check that:")
+    print("  * the flight controller is powered (USB or battery),")
+    print("  * mavlink-router is running:  systemctl status mavlink-router")
+    print("  * it actually sees the FC:    journalctl -u mavlink-router -n 20")
+    return False
+
 def read_param(master, name, tries=3, timeout=1.5):
     for _ in range(tries):
         master.mav.param_request_read_send(
@@ -72,7 +95,7 @@ def main():
     config = Config.sitl() if ("--sim" in sys.argv or "--sitl" in sys.argv) else Config.pi()
     print(f"Connecting to {config.connection_string} ...")
     master = mavutil.mavlink_connection(config.connection_string, source_system=252)
-    master.wait_heartbeat(timeout=20)
+    wait_for_vehicle(master) or sys.exit(1)
     print(f"Connected to system {master.target_system}\n")
 
     # Throttle telemetry so PARAM_VALUE replies are not lost in the stream. Learned the
@@ -106,6 +129,9 @@ def main():
     battery = None
     rng = []
     flow_q = []
+    altitudes = []          # EKF altitude - must NOT drift while the vehicle sits still
+    sensors = None          # SYS_STATUS health bitmask
+    armed_seen = False
     end = time.time() + 20
     while time.time() < end:
         msg = master.recv_match(blocking=True, timeout=1)
@@ -119,6 +145,13 @@ def main():
             ekf_flags = msg.flags
         elif kind == "SYS_STATUS":
             battery = (msg.voltage_battery / 1000.0, msg.battery_remaining)
+            sensors = (msg.onboard_control_sensors_present,
+                       msg.onboard_control_sensors_enabled,
+                       msg.onboard_control_sensors_health)
+        elif kind == "HEARTBEAT":
+            armed_seen = armed_seen or master.motors_armed()
+        elif kind == "GLOBAL_POSITION_INT":
+            altitudes.append((time.time(), msg.relative_alt / 1000.0))
         elif kind == "RANGEFINDER":
             rng.append(msg.distance)
         elif kind in ("OPTICAL_FLOW", "OPTICAL_FLOW_RAD"):
@@ -127,8 +160,77 @@ def main():
     print("\n--- Result ---")
     if battery:
         print(f"  Battery: {battery[0]:.2f} V, {battery[1]} % remaining")
+
+    # --- sensor health, straight from the autopilot -------------------------
+    # SYS_STATUS carries a present/enabled/health bit per sensor. This answers
+    # "is the barometer alive" without touching the flight controller - which matters,
+    # because a dead barometer removes the only height source that cannot be blocked
+    # by something lying under the airframe.
+    if sensors:
+        present, enabled, health = sensors
+        print("\n  Sensor health (from SYS_STATUS):")
+        for bit, label in ((0x08, "barometer"), (0x100, "rangefinder"),
+                           (0x40, "optical flow"), (0x04, "compass"),
+                           (0x01, "gyro"), (0x02, "accelerometer")):
+            if not present & bit:
+                state = "not present"
+            elif not enabled & bit:
+                state = "present, DISABLED"
+            elif not health & bit:
+                state = "*** UNHEALTHY ***"
+            else:
+                state = "ok"
+            print(f"    {label:14s} {state}")
+        if (present & 0x08) and not (health & 0x08):
+            print("\n  !! THE BAROMETER IS UNHEALTHY. ArduPilot needs it for altitude in")
+            print("  !! every mode. Do not fly. And note that EK3_SRC1_POSZ = 1 (baro) is")
+            print("  !! then NOT an available fallback for the rangefinder either.")
+
+    # --- is the height estimate stable while standing still? ----------------
+    # In the 2026-08-21 crash log the EKF altitude drifted linearly to -10.8 m over
+    # three minutes while the aircraft sat motionless on the floor, because
+    # EK3_SRC1_POSZ pointed at a frozen rangefinder and the barometer was not a
+    # configured source - so the filter had no height measurement at all and
+    # integrated accelerometer bias. That is visible on the ground in seconds.
+    if len(altitudes) >= 5 and not armed_seen:
+        span = max(a for _, a in altitudes) - min(a for _, a in altitudes)
+        seconds = altitudes[-1][0] - altitudes[0][0]
+        drift = (altitudes[-1][1] - altitudes[0][1]) / seconds if seconds > 0 else 0.0
+        print(f"\n  Reported altitude while disarmed: span {span:.2f} m over "
+              f"{seconds:.0f} s, trend {drift * 100:+.1f} cm/s")
+        if abs(drift) > 0.02 or span > 0.5:
+            print("  !! THE HEIGHT ESTIMATE IS RUNNING AWAY while the aircraft is not")
+            print("  !! moving. Every altitude-controlled mode (AltHold, Loiter, Land,")
+            print("  !! Guided) will chase this. Do not fly. Check which source")
+            print("  !! EK3_SRC1_POSZ selects and whether that sensor is usable.")
+        else:
+            print("  -> stable, as it should be when the aircraft is standing still")
     if rng:
         print(f"  Rangefinder: {len(rng)} samples, min={min(rng):.2f} max={max(rng):.2f} m")
+
+        # THE dangerous combination, and it is silent: the EKF takes its HEIGHT from the
+        # rangefinder while the rangefinder is frozen. The altitude controller then sees
+        # a height that never rises, adds throttle, sees the same height, adds more - and
+        # flies into the ceiling at full power. This happened to us on 2026-08-21 with a
+        # cable resting under the sensor. Nothing about it looks like a fault: the sensor
+        # reports a plausible number, just always the same one.
+        posz = read_param(master, "EK3_SRC1_POSZ")
+        frozen = (max(rng) - min(rng)) < 0.01
+        if posz is not None and abs(posz - 2.0) < 0.1:
+            print("\n  !! EK3_SRC1_POSZ = 2: the EKF takes its HEIGHT from the rangefinder.")
+            if frozen:
+                print("  !! AND the rangefinder did not move during this run "
+                      f"(min={min(rng):.2f} max={max(rng):.2f}).")
+                print("  !! DO NOT FLY. If it stays frozen while the aircraft climbs, the")
+                print("  !! altitude controller keeps adding throttle to reach a height it")
+                print("  !! never sees - a full-power climb into the ceiling, in ANY mode")
+                print("  !! that holds altitude, with or without the companion running.")
+                print("  !! Check for anything under the sensor, then set EK3_SRC1_POSZ = 1")
+                print("  !! (barometer) until the rangefinder is proven in flight:")
+                print("  !!     python setparam.py EK3_SRC1_POSZ 1 --reboot")
+            else:
+                print("  -> It did vary here, so it is alive. Consider EK3_SRC1_POSZ = 1")
+                print("     (barometer) anyway: a barometer cannot be blocked by a cable.")
     if flow_q:
         print(f"  Optical flow: {len(flow_q)} messages, quality min={min(flow_q)} max={max(flow_q)}")
     else:
