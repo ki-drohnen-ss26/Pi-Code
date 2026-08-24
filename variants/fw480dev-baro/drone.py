@@ -147,6 +147,18 @@ class Drone:
         raw = msg.flight_sw_version
         version = f"{(raw >> 24) & 0xFF}.{(raw >> 16) & 0xFF}.{(raw >> 8) & 0xFF}"
         log.info(f"[FC] ArduPilot flight software {version}")
+        # This code variant carries 4.8.0-dev parameter names; the FC silently ignores
+        # names it does not know, so a mismatch means our safety params never take effect
+        # while the log still looks fine. getattr guards the case where an older Config
+        # (without expected_fw_prefix) is used - then we simply skip the check.
+        expected = getattr(self.config, "expected_fw_prefix", None)
+        if expected and not version.startswith(expected):
+            log.warning(
+                f"[FC] Firmware {version} does NOT match this code variant "
+                f"(fw480dev-baro, expects {expected}.x). Parameter names differ between "
+                f"releases and wrong names are silently ignored - use the folder that "
+                f"matches this FC instead (the main Pi-Code repo is for 4.6.3)."
+            )
         return version
 
     def request_data_streams(self, rate_hz: int = 4) -> None:

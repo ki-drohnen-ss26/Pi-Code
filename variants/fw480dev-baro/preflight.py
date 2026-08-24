@@ -36,11 +36,18 @@ GROUPS = {
     ],
     "Other failsafes": ["FS_GCS_ENABLE", "FS_GCS_TIMEOUT", "FS_THR_ENABLE", "FS_EKF_ACTION"],
     "Navigation limits (the companion sets these too)": [
-        "WPNAV_SPEED", "WPNAV_SPEED_UP", "RTL_ALT",
+        # RTL_ALT (cm) is the 4.6 name, RTL_ALT_M (m) the 4.7+/4.8-dev name. Only one is
+        # real on any given FC; the other prints "not present", which tells you at a
+        # glance whether this FC is on the firmware this variant expects.
+        "WPNAV_SPEED", "WPNAV_SPEED_UP", "RTL_ALT", "RTL_ALT_M",
     ],
     "Position sensors": [
+        # RNGFND1_MIN_CM/MAX_CM (cm) are the 4.6 names, RNGFND1_MIN/MAX (m) the 4.7+/
+        # 4.8-dev names. One pair shows "not present" - that IS the check: on this
+        # variant's 4.8-dev FC the _CM pair should be absent and the metre pair real.
         "SERIAL5_PROTOCOL", "SERIAL5_BAUD", "FLOW_TYPE", "FLOW_ORIENT_YAW",
-        "RNGFND1_TYPE", "RNGFND1_MIN_CM", "RNGFND1_MAX_CM", "RNGFND1_ORIENT",
+        "RNGFND1_TYPE", "RNGFND1_MIN_CM", "RNGFND1_MAX_CM",
+        "RNGFND1_MIN", "RNGFND1_MAX", "RNGFND1_ORIENT",
     ],
     "EKF sources": [
         "AHRS_EKF_TYPE", "EK3_SRC1_POSXY", "EK3_SRC1_VELXY", "EK3_SRC1_POSZ",

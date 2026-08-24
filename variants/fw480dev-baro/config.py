@@ -1,6 +1,11 @@
 """
 config.py
 =========
+VARIANT fw480dev-baro - firmware target ArduCopter 4.8.0-dev (WORKING barometer).
+This is the 4.8.0-dev copy of the code: identical safety logic to the main Pi-Code
+(4.6.3), only the FC parameter NAMES differ (see README_VARIANT.md). Do not fly it
+against a 4.6.3 flight controller - use the main repo for that.
+
 Central configuration. Everything that differs between "test against SITL" and
 "real flight on the Pi" lives HERE and nowhere else - drone.py, mission.py,
 failsafe.py and the state machine are identical either way.
@@ -43,6 +48,11 @@ class Config:
     connection_string: str = "udpin:127.0.0.1:14550"
     baud: int = 115200            # only used for a serial connection
     gcs_system_id: int = 255      # the ID we announce as the ground station
+    # This variant is for ArduCopter 4.8.0-dev; drone.log_autopilot_version() warns when
+    # the FC reports a different major.minor, because parameter names differ between
+    # releases and are silently ignored when wrong (RTL_ALT_M vs RTL_ALT, RNGFND1_MIN vs
+    # RNGFND1_MIN_CM, MAV_GCS_SYSID vs SYSID_MYGCS).
+    expected_fw_prefix: str = "4.8"
 
     # ------------------------------------------------------------------
     # Mission / target

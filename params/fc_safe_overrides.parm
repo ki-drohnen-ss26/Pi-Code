@@ -1,0 +1,41 @@
+# Safety overrides for the REAL FC - load AFTER fc_baseline_463_20260821.parm.
+#
+# The baseline is a faithful copy of the aircraft as it crashed on 2026-08-21.
+# These lines override exactly the values the crash analysis (docs/SIM_TO_REAL.md
+# section 5c) identified as causal or unsafe. Load baseline -> load this -> reboot ->
+# run `python preflight.py` and read its verdict before anything arms.
+
+# --- The crash quartet -------------------------------------------------------
+# A 4 m barometric fence breached on the downwash spike of every takeoff, and
+# FENCE_ACTION=2 forced the pilot's Stabilize into LAND. Fence stays OFF indoors;
+# the companion (failsafe.setup_geofence) manages it explicitly when wanted.
+FENCE_ENABLE,0
+
+# Root cause: rangefinder as the EKF's ONLY height source. EKF3 never fused a
+# height from it and the vertical estimate diverged quadratically on the ground
+# (-1070 m at arming). Barometer primary is the ArduPilot-recommended setup; the
+# rangefinder stays available to the EKF for terrain/low-altitude use.
+# !! Requires a WORKING barometer - stock 4.6.3 will not even boot without one.
+EK3_SRC1_POSZ,1
+
+# The crash flight armed with a 1000 m vertical EKF error that an enabled pre-arm
+# check would have refused. 786390 = every check except GPS lock (indoor, no GPS).
+# Outdoors, prefer ARMING_CHECK,1 (everything).
+ARMING_CHECK,786390
+
+# 4S Li-Ion: 16.4 V full, 11.2 V empty. The baseline's 12.4 V fires late.
+BATT_LOW_VOLT,12.8
+
+# --- Recommended, decide per session (uncomment deliberately) ----------------
+# FC-side reaction when the companion falls silent. 5=Land is right for the hall,
+# but only fires after the FC has seen our GCS heartbeat (Drone.tick sends it).
+#FS_GCS_ENABLE,5
+#
+# Dataflash logging while disarmed - invaluable for pre-arm diagnosis, but fills
+# the log storage; switch it off again after a debugging session.
+#LOG_DISARMED,1
+#
+# Flight-mode plan: the crash-day transmitter had ALL SIX switch positions on
+# Stabilize. Once (and only once) the height source is proven healthy again, give
+# the pilot an altitude-assisted escape on the last switch position:
+#FLTMODE6,2

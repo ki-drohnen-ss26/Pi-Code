@@ -129,7 +129,10 @@ GPS, so the companion must establish the reference itself:
 - **`Drone.set_origin()`** — send `SET_GPS_GLOBAL_ORIGIN` (a chosen reference lat/lon) so
   the EKF origin/home, `LOCAL_POSITION_NED` and `goto_local()` work without GPS.
 - **Geofence indoors** — the GPS-style fence needs a position; use an altitude-only fence
-  or disable it indoors (`config.geofence_enable`). Decide and wire it.
+  or disable it indoors (`config.geofence_enable`). *Decided after the 2026-08-21
+  incident: **disabled by default*** — the barometric altitude spikes 4–6.7 m under
+  propeller downwash, so an indoor-sized altitude fence breaches on every takeoff and
+  `FENCE_ACTION` converts that into an uncommanded mode change (see `SIM_TO_REAL.md` §5c).
 - **`TimedCamera`** (config-selectable camera source) — "finds" the target after a set
   time (centred), so a real flight can exercise the search-pattern flight + the drop
   mechanism with **no AI camera**. Same `Camera` interface, so the mission is untouched.
@@ -228,8 +231,11 @@ Driven entirely by things that actually went wrong in SITL:
   over a human who has just taken control.
 - **LAND instead of RTL, and `ABORT` split three ways** (never armed / mode changed /
   airborne). RTL climbs to `RTL_ALT` first, which indoors is the ceiling.
-- **FC safety envelope** set + verified before every flight (`FENCE_ACTION`, `RTL_ALT`
-  with the 4.6/4.7 name fallback, `WPNAV_SPEED_UP`).
+- **FC safety envelope** set + verified before every flight (`WPNAV_SPEED_UP`,
+  `WPNAV_SPEED`, `RTL_ALT` with the 4.6/4.7 name fallback). Every changed parameter is
+  saved first and restored on exit, mirrored to disk so even a killed run is cleaned up
+  by the next one; fence parameters live exclusively in `setup_geofence()` since the
+  2026-08-21 incident (a leftover `FENCE_ACTION=2` fence was its trigger).
 - **Presets over source edits:** `python main.py` runs the **real aircraft**, `--sim`
   the simulator; the dataclass defaults carry the aircraft's drop-servo path and
   battery threshold, and `Config.sitl()` overrides both for the simulator
@@ -256,19 +262,59 @@ firmware version, the autopilot's own messages and a named abort reason. ☑
 | 3     | GPS-denied real HW: origin, fence, TimedCamera | ☑ done (SITL on ArduCopter **4.6.3**: origin set + verified by the companion, GPS off, full indoor mission green) |
 | 3b    | Diagnostics & safety hardening | ☑ done (STATUSTEXT logging, companion heartbeat, verified origin/takeoff, mode monitoring, LAND instead of RTL, FC safety envelope) |
 | 4     | Real AI camera                 | ◑ `RealCamera` implemented + wired; IMX500 detected on the Pi. Blocked on an `.rpk` model (only `.tflite` exists) and `imx500-all` |
-| 5     | Pi provisioning & HIL prep     | ◑ Pi image, `mavlink-router` (systemd, `/dev/serial0` @ 921600 → `127.0.0.1:14550`), pymavlink, gpiozero/lgpio all **verified on hardware**. **MTF-01P delivers no data** — see below |
+| 5     | Pi provisioning & HIL prep     | ☑ Pi image, `mavlink-router` (systemd, `/dev/serial0` @ 921600 → `127.0.0.1:14550`), pymavlink, gpiozero/lgpio all **verified on hardware**. MTF-01P configured and streaming (see note below) |
 | 6     | Bench integration (no props)   | ◑ Companion↔FC link verified against the real FC (heartbeat, `--tele`, ArduPilot 4.6.3). Servo drop + arm/disarm still open |
-| 7     | Flight tests                   | ☐ **blocked:** `ARMING_CHECK = 0` on the FC (all pre-arm checks disabled) must be restored before any flight |
-| 8     | Documentation & deliverables   | ☐     |
+| 7     | Flight tests                   | ☐ **blocked on hardware** since the 2026-08-21 crash — see "Current blockers" below |
+| 8     | Documentation & deliverables   | ◑ Pi-Code docs current; project-docs (mkdocs site) being filled |
 
-> **Correction (bench session, real hardware).** Phase 5 previously claimed "MTF-01P
-> configured + serial verified". Measured against the actual flight controller, that is
-> **not** the case: `RANGEFINDER` streams a constant `0.00 m` and no `OPTICAL_FLOW`
-> messages arrive at all, so the EKF sits in `CONST_POS_MODE` without `POS_HORIZ_REL` —
-> the indoor mission would abort at `NO_POSITION_ESTIMATE` before ever leaving the
-> ground. The **flight-controller side is provably correct** (`SERIAL5` = MAVLink1 @
-> 115200, `FLOW_TYPE` 5, `RNGFND1_TYPE` 10, `RNGFND1_MIN_CM` 1, `RNGFND1_ORIENT` 25 —
-> every value matches `project-docs/hardware/drone/InitialSetup.md`), so the fault is on
-> the sensor side: the MTF-01P supports both MSP and MAVLink and was, per the team's own
-> week-3 journal, never configured. Next steps: check the sensor's power LED, then an
-> MSP counter-test on the FC, then the CP2102 adapter.
+> **MTF-01P history.** An earlier bench session found `RANGEFINDER` at a constant
+> `0.00 m` and no `OPTICAL_FLOW` at all (sensor still on MSP, never configured for
+> MAVLink). That was subsequently fixed: in all five dataflash logs from the 2026-08-20/21
+> flight days both streams are healthy — rangefinder status "good" in 3441/3441 samples
+> (and truthfully tracking the crash climb 0.02 → 4.94 m), flow quality 45–113. The
+> sensor side of Task 4 works.
+
+## Incident 2026-08-21 and the EK3_SRC1_POSZ decision
+
+The full analysis lives in [`SIM_TO_REAL.md` §5c](SIM_TO_REAL.md); this section tracks
+the *decisions and blockers* that came out of it.
+
+**Decisions taken:**
+- `geofence_enable = False` by default indoors (fence breached on downwash spike on
+  every takeoff; `FENCE_ACTION=2` then forced LAND over the pilot).
+- Fence parameters are written only by `setup_geofence()`, saved before every change,
+  restored on every exit, and mirrored to disk so a killed run is cleaned up by the
+  next one (`failsafe.recover_stale_params()`). A stale fence found enabled at startup
+  is disarmed.
+- The takeover gate (`--takeover`) now trusts the **rangefinder**, not the EKF
+  altitude, and refuses the handover when the two disagree (`EKF_ALT_DIVERGED`).
+
+**Decision still open — the EKF height source.** `EK3_SRC1_POSZ = 2` (rangefinder) is
+the verified root cause: EKF3 never fused a height from it and the vertical estimate
+diverged quadratically on the ground (−1070 m at arming, "climb rate" −12.6 m/s while
+stationary). The standard fix is `EK3_SRC1_POSZ = 1` (barometer as primary, rangefinder
+via `EK3_RNG_USE_HGT` for low-altitude override) — **but the barometer stopped being
+detected after the crash**, so that option is blocked on the hardware repair below.
+Until it is resolved, the aircraft must not fly any altitude-controlled mode.
+
+**Current blockers (in repair order):**
+1. **Baro/I2C damage.** After the crash the stock 4.6.3 firmware halts with
+   `Config Error: Baro: unable to initialise driver` (FC_Check.pdf), and a colleague's
+   custom 4.8.0-dev build (baro requirement bypassed) shows `Baro: no sensors found`
+   **and** `Bad Compass Health`. The FlywooF745 has exactly **one I2C bus** shared by
+   the onboard baro and the external GPS-module compass — and the crash **tore off the
+   GPS connector** (FC_Check.pdf §1.4). A damaged compass/GPS wiring holding SDA/SCL
+   down would explain both symptoms with an intact baro chip. **Zero-cost test:**
+   unplug the GPS module's I2C wires, boot stock 4.6.3 — if the baro reappears, repair
+   the GPS connector/wiring (or fly indoor without compass) instead of replacing the FC.
+   *Update 2026-08-23:* a **bent pin** in the GPS connector was found and straightened;
+   "Bad Compass Health" disappeared on the 4.8.0-dev build. Baro re-test on stock
+   4.6.3 is next — if it passes, no new FC is needed.
+2. **Parameter wipe.** Flashing the custom 4.8.0-dev build reset ALL parameters to
+   defaults (Mission Planner shows `New mission / New rally / New fence`, battery
+   monitor unconfigured). After returning to stock 4.6.3, reload the captured baseline
+   `mav.parm` — but **override the crash quartet** first: `FENCE_ENABLE=0` and
+   `EK3_SRC1_POSZ=1` (see `params/README.md`).
+3. **`ARMING_CHECK = 0`** must be restored (1, or 786390 = everything except GPS lock)
+   before any flight — the crash flight armed with an EKF vertical error of 1000 m that
+   an enabled EKF pre-arm check would have refused.

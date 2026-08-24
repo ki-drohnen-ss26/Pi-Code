@@ -22,10 +22,12 @@ confined to `Config.sitl()`.
 | `search.py`      | Search patterns (expanding spiral / lawnmower) in local NED |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |
-| `preflight.py`   | Read-only FC inspection: parameters, EKF flags, live `STATUSTEXT`. Run it, then try to arm — the autopilot's own objection appears verbatim |
+| `preflight.py`   | Read-only FC inspection: parameters, EKF flags, sensor health, EKF-altitude drift check, live `STATUSTEXT`. Run it, then try to arm — the autopilot's own objection appears verbatim |
+| `setparam.py`    | Set FC parameters with read-back verification (`python setparam.py NAME VALUE [--reboot]`). Refuses to run while armed |
 | `fclog.py`       | Continuous FC recorder (own router endpoint). Logs every `STATUSTEXT`, mode change, arm/disarm and EKF-flag transition, plus a "why did it land" dump before each disarm |
 | `tests/`         | `pytest` unit tests for the mission logic (no SITL needed)  |
 | `params/`        | FC parameter baseline (capture/restore) — see `params/README.md` |
+| `variants/`      | Ready-to-run code+param sets for the ArduCopter **4.8.0-dev** contingencies (with / without barometer) — decision tree in `variants/README.md`. The repo root is the main flavour: stock 4.6.3 with a working baro |
 | `requirements.txt` | Pinned dependencies (pymavlink, pytest)                   |
 | `docs/ARCHITECTURE.md` | Components, relationships & mission flow (Mermaid diagrams) |
 | `docs/SIM_TO_REAL.md`  | Concrete SITL→hardware transition guide + safety checklist |
@@ -115,8 +117,7 @@ Indoor run (default `gps_denied=True`):
 ```
 [FC] ArduPilot flight software 4.6.3
 [ORIGIN] EKF origin confirmed: lat=50.131196 lon=8.692972
-[FAILSAFE] Safety envelope: climb<=50.0 cm/s, FENCE_ACTION=2 (2=Always Land), RTL_ALT=2.0 m
-[FAILSAFE] Geofence enabled (type=1, alt_max=4.0 m)
+[FAILSAFE] Safety envelope: climb<=50.0 cm/s, cruise<=100.0 cm/s, RTL_ALT=2.0 m
 [PREARM] Waiting for relative (optical flow) EKF position estimate ...
 [PREARM] EKF position estimate ready
 [MODE] Mode is now GUIDED
@@ -220,8 +221,11 @@ worse than no rehearsal.
 | 5 | `[DROP] Release confirmed`. |
 
 Milestone 3 flies the spiral, which reaches `search_max_radius_m` **plus one**
-`search_step_m` — 7 m with the defaults. The geofence is altitude-only and will not stop
-a horizontal excursion, so size the hall (or the radius) for that.
+`search_step_m` — 7 m with the defaults. The geofence is **off by default** (a
+barometric altitude fence indoors caused the 2026-08-21 crash — see
+`docs/SIM_TO_REAL.md` §5c), and even enabled it is altitude-only; the only horizontal
+guard is the software check `max_position_radius_m` (15 m), so size the hall (or the
+radius) for that.
 
 ## When something goes wrong: recording the flight controller
 

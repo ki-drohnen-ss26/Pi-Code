@@ -898,6 +898,44 @@ def test_silent_rangefinder_refuses_to_arm():
     assert mission.abort_reason == "NO_RANGEFINDER_DATA"
 
 
+def test_ekf_altitude_drift_on_the_ground_refuses_to_arm():
+    """The no-baro crash signature, caught before arming.
+
+    With the rangefinder as the EKF's only height source the vertical estimate can
+    diverge on the ground (2026-08-21: past -1000 m before arming), and with no baro
+    nothing else catches it. A reported altitude that MOVES while the aircraft stands
+    still must refuse the arm - the sensors themselves stream fine, so the older gates
+    would wave this through."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 40, "rangefinder_min": 0.3, "rangefinder_max": 1.1,
+        "flow_samples": 40, "flow_quality_max": 150,
+        "alt_trend": 0.3,      # 30 cm/s - the height estimate is running away ...
+        "alt_span": 2.0,       # ... 2 m of spread while sitting on the floor
+    }
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "EKF_ALT_DRIFTING"
+    assert "arm" not in drone.actions()          # it must never leave the ground
+
+
+def test_old_position_sensor_dict_without_alt_keys_still_verifies():
+    """The drift gate reads alt_trend/alt_span via .get(), so a read_position_sensors()
+    that predates those keys skips the check silently instead of blowing up."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.position_sensors = {
+        "rangefinder_samples": 40, "rangefinder_min": 0.3, "rangefinder_max": 1.1,
+        "flow_samples": 40, "flow_quality_max": 150,     # no alt_trend / alt_span at all
+    }
+    mission = _build_mission(drone, config)
+
+    assert mission.failsafe.verify_position_sensors() is None
+
+
 def test_sensor_gate_is_skipped_outdoors():
     """The gate is about optical flow. With GPS there is nothing for it to check."""
     config = Config.sitl()
@@ -986,6 +1024,25 @@ def test_every_milestone_is_a_coherent_stage():
     # All of them stay on the real-aircraft profile.
     assert all(c.release_mechanism == "pi" for c in stages.values())
     assert all(c.milestone == n for n, c in stages.items())
+
+
+def test_real_profile_milestones_force_takeover_on_the_no_baro_build():
+    """On this no-baro build a ground start would deadlock: a flow-only EKF may never
+    report a position estimate on the floor. So every REAL-aircraft run - including a
+    milestone - starts in takeover, and the pilot flies the first metre. SITL keeps a
+    settling EKF, so simulation must still arm itself."""
+    from main import make_config, MILESTONES
+
+    # Bare real profile and both real-profile aliases.
+    assert make_config(["main.py"]).takeover_mode is True
+    assert make_config(["main.py", "--pi"]).takeover_mode is True
+    assert make_config(["main.py", "--pi-serial"]).takeover_mode is True
+    # Every milestone on the real profile inherits it.
+    for n in MILESTONES:
+        assert make_config(["main.py", "--milestone", str(n)]).takeover_mode is True, n
+    # ... but simulation is left free to arm and take off itself.
+    assert make_config(["main.py", "--sim"]).takeover_mode is False
+    assert make_config(["main.py", "--sim", "--milestone", "1"]).takeover_mode is False
 
 
 def test_unknown_milestone_is_rejected_not_ignored():

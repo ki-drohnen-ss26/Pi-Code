@@ -1,11 +1,14 @@
 # Flight-controller parameters
 
-A reproducible flight needs a known flight-controller (FC) parameter set. This
-folder holds the SITL baseline so a simulated run can always be restored to a defined
-state. Every `.parm` file here is a SITL artefact and belongs in SITL — the full dumps
-were captured from a simulator run, the three overlays were hand-written for one. The
-equivalent baseline for the real FC still has to be captured (see the warning under
-*Files*).
+A reproducible flight needs a known flight-controller (FC) parameter set. This folder
+holds the SITL baseline so a simulated run can always be restored to a defined state,
+**plus** — since 2026-08-22 — the recovered baseline of the **real** flight controller:
+`fc_baseline_463_20260821.parm` was reconstructed from the crash day's dataflash log
+(the FC writes every parameter into its own log at boot) after a custom-firmware flash
+wiped the live values. It is the only surviving full dump of the real aircraft's
+configuration, including the accel calibration, ESC/servo setup, the MTF-01P serial
+config and the Pi companion link. **Never load it without `fc_safe_overrides.parm` on
+top** — see *Restoring the real FC after the wipe* below.
 
 > ## ⚠️ Parameter names are firmware-specific
 >
@@ -32,6 +35,8 @@ equivalent baseline for the real FC still has to be captured (see the warning un
 
 | File           | Firmware | What it is                                              |
 |----------------|----------|---------------------------------------------------------|
+| `fc_baseline_463_20260821.parm` | 4.6.3 | **REAL FC.** Full baseline of the actual aircraft, recovered from the 2026-08-21 dataflash log (1154 parameters). Contains the CRASH configuration — load only together with the overrides below. |
+| `fc_safe_overrides.parm` | 4.6.3 | **REAL FC.** The corrections from the crash analysis: fence off, `EK3_SRC1_POSZ 1`, arming checks on, 4S-Li-Ion battery failsafe. Load after the baseline, then reboot. |
 | `sitl_flow_phaseA.parm` | 4.6.x | SITL: enable simulated optical flow + rangefinder (load, then reboot). |
 | `sitl_flow_phaseB.parm` | 4.6.x | SITL: configure flow/rangefinder + point the EKF at flow (load after phase A reboot, then reboot again). |
 | `sitl_gps_off.parm`     | 4.6.x | SITL: GPS truly off (`GPS1_TYPE 0`) + an `ARMING_CHECK` mask without the GPS bit (Phase 3). |
@@ -44,10 +49,12 @@ The three overlays are the ones to use in SITL; they are small, commented and
 version-checked. The full dumps document the old 4.8-dev runs and are kept for the
 record only.
 
-> ## ⚠️ Every file in this folder is a SITL artefact
+> ## ⚠️ Every `sitl_*` / historical file in this folder is a SITL artefact
 >
 > Not just the historical 4.8-dev dumps — `sitl_indoor_463.parm` and the three overlays
-> too. **None of them may be loaded onto the real flight controller.** They carry:
+> too. **None of them may be loaded onto the real flight controller.** (The two
+> `fc_*.parm` files above are the exception: they are FOR the real FC and carry the
+> same danger in reverse — they would misconfigure SITL.) The SITL files carry:
 >
 > - the SITL airframe's PID tuning (`ATC_RAT_RLL_P`/`ATC_RAT_PIT_P 0.135`) and 364
 >   `SIM_*` parameters, plus simulated compass IDs;
@@ -66,8 +73,30 @@ record only.
 > its tuning, sensor backends and serial wiring. The version check at the top of this
 > file protects against the 4.8-dev dumps only; nothing protects against this.
 >
-> A fresh baseline captured from the real FC is still missing and is the most valuable
-> file this folder could have.
+> The same warning applies to `mav.parm` in the repo root: despite living outside this
+> folder it is a **SITL capture** (`FLOW_TYPE 10`, `RNGFND1_TYPE 100`, `SERIAL5`
+> disabled) and must never go onto the aircraft.
+
+## Restoring the real FC after the wipe (2026-08-22)
+
+Flashing the colleague's custom 4.8.0-dev build **reset every parameter to firmware
+defaults** (Mission Planner showed `New mission / New rally / New fence`; the battery
+monitor read 0 V). After flashing back to **stock ArduCopter 4.6.3** — which requires
+the barometer problem to be fixed first, see `../docs/SIM_TO_REAL.md` §5c — restore
+the aircraft like this, in Mission Planner (CONFIG → Full Parameter List → Load from
+file → Write params), or MAVProxy `param load`:
+
+```
+1. load  fc_baseline_463_20260821.parm      # the aircraft as it was (incl. calibration)
+2. load  fc_safe_overrides.parm             # fence off, EK3_SRC1_POSZ 1, checks on
+3. reboot
+4. python preflight.py                      # sensor health + EKF-drift verdict
+```
+
+The baseline deliberately stays byte-faithful to the crash-day state (it is also the
+forensic record); every safety-relevant deviation lives visibly in the small,
+commented overrides file. Do a compass calibration afterwards if the GPS/compass
+module was replaced.
 
 > Full dumps are captured from a working run, not hand-written. The list below
 > documents the parameters our companion code relies on, so you know what must be
@@ -75,17 +104,20 @@ record only.
 
 ## Parameters the companion code touches or assumes
 
-Set at runtime by the code (you do **not** need to pre-set these):
+Set at runtime by the code (you do **not** need to pre-set these). Everything the
+failsafe writes is **saved first and restored on exit** (`restore_params()`, mirrored
+to `logs/fc_params_backup.json` so even a killed run is cleaned up by the next one):
 
 | Parameter         | Value | Set by                          | Why                                                              |
 |-------------------|-------|---------------------------------|------------------------------------------------------------------|
-| `FENCE_TYPE`      | `1`   | `failsafe.setup_geofence()`     | Altitude-only fence (`config.fence_type`) — works without a horizontal position (indoor-safe). |
-| `FENCE_ALT_MAX`   | `4.0` | `failsafe.setup_geofence()`     | Max fence altitude in m (`config.fence_alt_max_m`).              |
-| `FENCE_ENABLE`    | `1`   | `failsafe.setup_geofence()`     | Geofence on before the mission (`config.geofence_enable`).       |
-| `FENCE_ACTION`    | `2`   | `failsafe.setup_safety_envelope()` | "Always Land". The firmware default `1` ("RTL or Land") **climbs** to `RTL_ALT` on a breach — into the ceiling. |
+| `WPNAV_SPEED_UP`  | `50` cm/s | `failsafe.setup_safety_envelope()` | The default 250 cm/s overshot a 2 m takeoff by more than 2 m in SITL. |
+| `WPNAV_SPEED`     | `100` cm/s | `failsafe.setup_safety_envelope()` | The default 1000 cm/s crosses a hall in under a second; also the brake on a flyaway. |
 | `RTL_ALT`         | `200` cm | `failsafe.setup_safety_envelope()` | In case RTL is triggered from elsewhere. **Centimetres on 4.5/4.6**; renamed to `RTL_ALT_M` (metres) in 4.7, so the code tries both. Firmware default is 1500 cm = 15 m. |
-| `WPNAV_SPEED_UP`  | `50` cm/s | `failsafe.setup_safety_envelope()` | The default 250 cm/s overshot a 2 m takeoff by more than 2 m in SITL and breached a 4 m fence. |
-| `SERVO9_FUNCTION` | `0`   | `drone.configure_drop_servo()`  | "Disabled" = MAVLink/mission-controlled, so `DO_SET_SERVO` works for the drop (`config.drop_servo`). **Only for `release_mechanism="fc"` (SITL);** the real build uses `"pi"` (servo on a Pi GPIO), where the FC has no drop servo. |
+| `FENCE_TYPE`      | `1`   | `failsafe.setup_geofence()` — **only when `config.geofence_enable=True` (default False, see SIM_TO_REAL §5c)** | Altitude-only fence — works without a horizontal position. |
+| `FENCE_ALT_MAX`   | `4.0` | `failsafe.setup_geofence()` (same gate) | Max fence altitude in m (`config.fence_alt_max_m`). |
+| `FENCE_ACTION`    | `2`   | `failsafe.setup_geofence()` (same gate; moved out of the envelope after the crash) | "Always Land". The firmware default `1` ("RTL or Land") **climbs** to `RTL_ALT` on a breach — into the ceiling. |
+| `FENCE_ENABLE`    | `1`   | `failsafe.setup_geofence()` (same gate) | Geofence on before the mission. With the fence *disabled*, the companion instead checks for — and disarms — a stale `FENCE_ENABLE=1` left by an earlier run. |
+| `SERVO9_FUNCTION` | `0`   | `drone.configure_drop_servo()`  | "Disabled" = MAVLink/mission-controlled, so `DO_SET_SERVO` works for the drop (`config.drop_servo`). **Only for `release_mechanism="fc"` (SITL);** the real build uses `"pi"` (servo on a Pi GPIO), where the FC has no drop servo. Deliberately not restored. |
 
 Indoors the companion also sends `SET_GPS_GLOBAL_ORIGIN` (a message, not a parameter)
 when `config.set_origin_on_start` is set — see Phase 3 in the roadmap.

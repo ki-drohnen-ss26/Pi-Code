@@ -1,6 +1,14 @@
 """
 config.py
 =========
+VARIANT fw480dev-nobaro - firmware target ArduCopter 4.8.0-dev (NO-BARO build).
+This is the 4.8.0-dev copy of the code for an airframe with NO usable barometer: the
+rangefinder is the EKF's only height source (EK3_SRC1_POSZ=2), so the height-estimate
+drift that killed the aircraft on 2026-08-21 has no baro backstop and must be caught on
+the ground before arming (see README_VARIANT.md). Only the FC parameter NAMES differ
+from the main Pi-Code (4.6.3); the safety logic is the same. Do not fly it against a
+4.6.3 flight controller - use the main repo for that.
+
 Central configuration. Everything that differs between "test against SITL" and
 "real flight on the Pi" lives HERE and nowhere else - drone.py, mission.py,
 failsafe.py and the state machine are identical either way.
@@ -43,6 +51,13 @@ class Config:
     connection_string: str = "udpin:127.0.0.1:14550"
     baud: int = 115200            # only used for a serial connection
     gcs_system_id: int = 255      # the ID we announce as the ground station
+
+    # This variant is for ArduCopter 4.8.0-dev; drone.log_autopilot_version() warns when
+    # the FC reports a different major.minor, because parameter names differ between
+    # releases and are silently ignored when wrong (RTL_ALT vs RTL_ALT_M, RNGFND1_MIN_CM
+    # vs RNGFND1_MIN, SYSID_MYGCS vs MAV_GCS_SYSID). A wrong-firmware run would load none
+    # of the safety envelope and give no error - hence the guard.
+    expected_fw_prefix: str = "4.8"
 
     # ------------------------------------------------------------------
     # Mission / target
@@ -186,7 +201,27 @@ class Config:
     # can disagree legitimately - hence a loose threshold plus several consecutive
     # samples before aborting. 0 disables the check.
     alt_disagree_max_m: float = 2.0
-    alt_disagree_samples: int = 3
+    # No barometer backstop on this build: the rangefinder is the ONLY height source, so
+    # when the vertical estimate starts to diverge there is no second sensor to hold it.
+    # React one sample earlier than the main repo (3) - a false abort on the ground is
+    # free, a missed divergence is the 2026-08-21 crash.
+    alt_disagree_samples: int = 2
+
+    # ------------------------------------------------------------------
+    # Ground height-estimate drift (NO-BARO build) - the pre-arm gate
+    # ------------------------------------------------------------------
+    # The 2026-08-21 crash: with EK3_SRC1_POSZ=2 (rangefinder as the EKF's only height
+    # source) EKF3 never fused a height while the aircraft sat on the floor, so the
+    # vertical estimate integrated accelerometer bias unchecked and diverged QUADRATICALLY
+    # - past -1000 m by the time it armed - while the rangefinder itself stayed healthy at
+    # 0.02 m the whole time. On a build WITH a baro this cannot happen (baro holds the
+    # height); on THIS build there is no such backstop, so the divergence has to be caught
+    # by watching the reported altitude stand still on the ground. Even the first seconds
+    # of that quadratic runaway are visible before arming, which is where these thresholds
+    # bite: verify_position_sensors() refuses the arm if the disarmed altitude moves at
+    # all. Deliberately tight - a stationary aircraft's height estimate should not move.
+    max_ground_alt_drift: float = 0.05   # abort if |trend| exceeds this [m/s] on the ground
+    max_ground_alt_span: float = 0.5     # abort if max-min altitude exceeds this [m] on the ground
 
     # ------------------------------------------------------------------
     # Target alignment (visual servoing over the target before the drop)

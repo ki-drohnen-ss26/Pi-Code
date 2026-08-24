@@ -77,6 +77,15 @@ adapter to the FC.
   optical flow), and navigation uses `goto_local()` (local NED) instead of `goto()`
   (lat/lon). On the real drone this runs on the MTF-01P.
 
+  **Know the on-ground deadlock:** a flow-only vehicle may never set
+  `EKF_POS_HORIZ_REL` while it sits on the floor — optical flow needs a height above
+  ground before the filter trusts it, and there is no height without a takeoff. On
+  the real aircraft `wait_ready_to_arm(require_abs=False)` can therefore wait forever
+  (exactly what happened on the 2026-08-20 test day). The designed escape is
+  `--takeover` (`mission._wait_for_pilot()`): the pilot flies the first metre by
+  hand and the companion takes over in the air — gated on the **rangefinder** height
+  and on EKF/rangefinder agreement, not on the EKF altitude alone (§5c explains why).
+
   **To validate the indoor path in SITL** load the three ready-made overlays, each
   followed by a reboot — see `../params/README.md` for what each one does and why:
 
@@ -115,9 +124,13 @@ adapter to the FC.
     976 mGauss is exactly the difference between the northern and southern hemisphere
     (Frankfurt vs the default home at CMAC, Canberra). Also set `SIM_TERRAIN 0` when you
     use `--custom-location` — see `../params/README.md`.
-  - **Geofence** — `setup_geofence()` sets an **altitude-only** fence by default
-    (`fence_type = 1`, `fence_alt_max_m`), which needs no horizontal position. Size
-    `fence_alt_max_m` to the flight, or set `config.geofence_enable = False` indoors.
+  - **Geofence** — **off by default** (`config.geofence_enable = False`) since the
+    2026-08-21 incident: an indoor-sized barometric altitude fence breaches on the
+    downwash spike of every takeoff, and `FENCE_ACTION` turns that into an uncommanded
+    mode change (§5c). If you enable it, `setup_geofence()` sets an **altitude-only**
+    fence (`fence_type = 1`, needs no horizontal position) — put `fence_alt_max_m`
+    well above the spike (> 8 m from our logs). With the fence off, the companion
+    still checks for (and disarms) a stale fence left enabled by an earlier run.
   - **Camera-less flight test** — set `config.camera_source = "timed"` to fly the search
     pattern and drop after `timed_camera_after_s`, with no AI camera (Phase 3).
 
@@ -166,6 +179,15 @@ yolo export model=<trained>.pt format=imx data=<dataset>.yaml   # Linux / Docker
 imx500-package -i packerOut.zip -o ~/models/pad                 # on the Pi
 ```
 `imx500-package` ships with `imx500-all`, so install that on the Pi first.
+
+**The box format of the `.rpk` is a config value, not a constant.** Two conventions
+exist: the IMX500/picamera2 samples emit `(y0, x0, y1, x1)` normalised to 0..1, while
+Ultralytics `format=imx` exports have been seen emitting `(x0, y0, x1, y1)` in
+input-tensor **pixels**. `config.cam_box_order` selects the order (`"yxyx"` default /
+`"xyxy"`); pixel-valued boxes are normalised automatically. `RealCamera` logs the
+first raw box next to its decoded form — check that line on the bench (milestone 2)
+before trusting any dx/dy: a wrong order shows up as swapped axes, a wrong scale as
+corrections that are far too large.
 
 **`RealCamera` returns ground METRES, not image fractions.** `SimCamera` — against which
 the whole mission was validated in SITL — reports metres, and `centre_tolerance`,
@@ -259,9 +281,9 @@ whole time. The truth was in the log; it was simply not a configured source.
 Propeller downwash raises the local pressure, so barometric altitude jumps the moment the
 aircraft comes light on its skids. At ~15 % throttle, centimetres off the floor:
 
-| log 1 | log 2 | log 3 | log 4 | log 5 |
+| log 1 | log 2 | log 3 | log 4 | log 5 (crash takeoff) |
 |---|---|---|---|---|
-| `BAlt` 4.05 m | 4.65 m | 5.26 m | 4.73 m | 4.17 m (with `RFND` reading 0.16 m) |
+| `BAlt` 4.05 m | 4.65 m | 5.26 m | 4.73 m | 6.73 m (with `RFND` reading 0.24 m; 14.1 m at the ceiling impact) |
 
 `FENCE_ALT_MAX = 4.0` — written by our own `setup_geofence()` — sits **inside that noise
 band**. It breached on every single takeoff.
@@ -290,15 +312,53 @@ sensors did their job.
   enable it, put `fence_alt_max_m` well above the downwash spike (> 8 m from our data).
 - `FENCE_ACTION` moved out of `setup_safety_envelope()` into `setup_geofence()`, so the
   companion writes fence parameters only when it actually enables the fence — and
-  restores every one of them on exit.
+  restores every one of them on exit. The saved baseline is additionally mirrored to
+  disk (`logs/fc_params_backup.json`): the crash fence was a leftover from a run that
+  died before restoring, and `failsafe.recover_stale_params()` now cleans exactly that
+  up at the start of the next run. With the fence off, a stale `FENCE_ENABLE=1` found
+  on the FC at startup is disarmed and loudly logged.
 - `preflight.py` reports the EKF altitude drift while the aircraft is disarmed and
-  standing still. In these logs it drifted at metres per minute; twenty seconds on the
-  ground would have shown it before any of these flights.
+  standing still. The divergence is **quadratic** — pure inertial integration of
+  accelerometer bias, with no height measurement fused at all: −268 m ninety seconds
+  after boot, −1070 m three minutes in, the EKF "climb rate" at −12.6 m/s while the
+  aircraft stood motionless. Even its first seconds are visible from the ground;
+  twenty seconds of `preflight.py` would have shown it before any of these flights.
+- The `--takeover` gate no longer trusts the EKF altitude (which read +1070 m *on the
+  floor* at the moment of arming — it would have handed over instantly). It now gates
+  on the **rangefinder** and refuses the handover when EKF and rangefinder disagree
+  (`EKF_ALT_DIVERGED`).
 
-**What is still open.** `EK3_SRC1_POSZ = 2` remains the root cause and is unchanged. The
-barometer — the reference that was correct throughout — failed *after* the crash
-("Baro: unable to initialise driver"), which removes `EK3_SRC1_POSZ = 1` as the obvious
-fix. See `docs/ROADMAP.md` for the current state of that decision.
+**What is still open.** `EK3_SRC1_POSZ = 2` remains the root cause and is unchanged on
+the FC. The barometer — the reference that was correct throughout — stopped being
+*detected* after the crash: stock 4.6.3 halts with **"Config Error: Baro: unable to
+initialise driver"** (in that state the FC streams no sensor data at all, so the zeros
+in FC_Check.pdf prove nothing about the rangefinder or flow — both were demonstrably
+healthy in the same day's logs). That removes `EK3_SRC1_POSZ = 1` as the *immediate*
+fix. Two findings point at repairable wiring rather than a dead baro chip:
+
+1. The crash **tore off the GPS connector** (FC_Check.pdf §1.4: "in der Nähe des
+   abgerissenen GPS-Anschlusses").
+2. The FlywooF745 has exactly **one I2C bus** (hwdef: "only one I2C bus", PB6/PB7),
+   shared by the onboard barometer (BMP280/SPL06/DPS310 at 0x76) and the external
+   GPS-module compass. A torn-off connector whose SDA/SCL lines short or hang the bus
+   makes the baro probe fail at boot — and on the colleague's custom 4.8.0-dev build
+   (baro requirement bypassed) it *also* explains the **"Bad Compass Health"** shown in
+   Mission Planner: two symptoms, one bus.
+
+**Zero-cost test:** disconnect the GPS module's I2C wires (or the whole GPS plug),
+boot **stock 4.6.3**, and watch the messages. Baro back → the chip is fine, repair the
+GPS wiring (or fly indoor without compass) instead of replacing the FC. Baro still
+missing → the chip itself died and a new FC/external baro is needed. Note the custom
+4.8.0-dev flash also **wiped all parameters to defaults** — after returning to stock,
+reload the recovered baseline with the safe overrides (see `../params/README.md`).
+See [`ROADMAP.md`](ROADMAP.md) ("Incident 2026-08-21") for the decision tracking.
+
+> **Update 2026-08-23 — the hypothesis held.** A **bent pin** was found in the GPS
+> connector and straightened; "Bad Compass Health" on the custom 4.8.0-dev build
+> disappeared afterwards. That is exactly the shared-bus picture: a bent pin holding
+> SDA/SCL is enough to make every device on the FC's single I2C bus unreachable.
+> Currently being tested: whether the barometer also comes back on **stock 4.6.3**
+> (i.e. was never dead, only unreachable behind the hung bus).
 
 ## 5b. Flyaway: why it happens indoors, and what stops it
 
@@ -327,6 +387,7 @@ indoors is **altitude-only** (`FENCE_TYPE = 1`) — it guards the ceiling, not t
 | `verify_position_sensors()` | before arming | The rangefinder or the flow produce **no messages at all**. Note it does **not** abort on a reading of `0.00 m`: on the floor a healthy sensor reads zero too, so the value proves nothing there. |
 | `verify_rangefinder_tracks_altitude()` | right after the climb | The rangefinder does not follow the height — at 1 m it still reads `0.00`. **This is the check that catches the flyaway precondition**, and it runs at takeoff altitude where an abort is a short descent instead of after a whole search pattern's worth of drift. |
 | `position_implausible()` | every failsafe check in flight | The reported position leaves `max_position_radius_m` (15 m). This is the software stand-in for the horizontal fence we cannot set. Whether the aircraft is running away or the estimate is, the answer is the same: land. |
+| `altitude_implausible()` | every failsafe check in flight | The EKF altitude and the raw rangefinder disagree by more than `alt_disagree_max_m` (2 m) for `alt_disagree_samples` (3) consecutive checks — the exact signature of the 2026-08-21 crash (EKF −1070 m, rangefinder 0.02 m). The sensor check above proves the SENSOR responds; this one watches the ESTIMATE for the rest of the flight. |
 | `WPNAV_SPEED` | safety envelope | Caps horizontal speed at `cruise_speed_cms` (100 cm/s). The firmware default is **1000 cm/s** — a hall crossed in under a second, and the difference between a drift you can take over from and one you cannot. |
 
 **What they do not replace.** A pilot with a kill switch, and `ARMING_CHECK` restored.
@@ -340,9 +401,20 @@ board silently reverts to them:
 
 | Parameter | We set | Default | Why the default is dangerous indoors |
 |---|---|---|---|
-| `FENCE_ACTION` | `2` (Always Land) | `1` (RTL or Land) | RTL **climbs** to `RTL_ALT` before returning — into the ceiling |
-| `RTL_ALT` | `200` cm | `1500` cm (15 m) | see above; set in case RTL is triggered from elsewhere |
-| `WPNAV_SPEED_UP` | `50` cm/s | `250` cm/s | overshot a 2 m takeoff by >2 m in SITL and breached a 4 m fence |
+| `WPNAV_SPEED_UP` | `50` cm/s | `250` cm/s | overshot a 2 m takeoff by >2 m in SITL |
+| `WPNAV_SPEED` | `100` cm/s | `1000` cm/s | a hall crossed in under a second; also the single most effective brake on a flyaway |
+| `RTL_ALT` | `200` cm | `1500` cm (15 m) | RTL **climbs** to `RTL_ALT` before returning — into the ceiling |
+
+`FENCE_ACTION` is **not** part of the envelope any more. It is meaningless with the
+fence off, and writing it unconditionally left an unrestored change on the FC — the
+exact leave-behind pattern behind the 2026-08-21 crash (§5c). Everything fence-related
+lives in `setup_geofence()`.
+
+Every parameter the companion changes is **saved first and restored on every exit
+path** (`restore_params()`), and the saved values are mirrored to
+`logs/fc_params_backup.json` on disk: a run that dies without restoring (battery pull,
+`kill -9`, Pi brownout) is cleaned up by the *next* run's
+`failsafe.recover_stale_params()` before anything else happens.
 
 > `RTL_ALT` is **centimetres** on ArduPilot 4.5/4.6 and was renamed to `RTL_ALT_M`
 > (metres) in 4.7. Setting the wrong one is not an error — the autopilot ignores unknown

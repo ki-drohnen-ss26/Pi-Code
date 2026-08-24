@@ -64,7 +64,7 @@ flowchart TB
 | `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. The link is UDP in **both** worlds: against SITL directly, on the Pi through mavlink-router, which owns the UART to the FC and fans the stream out to us and to a ground station. A direct UART link is only the `--pi-serial` fallback for setups without the router. |
 | `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera` for simulation, `TimedCamera` for camera-less **real** flight tests — it is the current default on the aircraft (`camera_source="timed"`) and does no detection at all, it just reports "centred" after a fixed time so the search and drop can be flown without the AI camera — and `RealCamera` for the IMX500 AI camera (network runs on the sensor's NPU, so the Pi's CPU stays free for MAVLink). Same contract throughout, so the mission never changes. Chosen by `config.camera_source`. `RealCamera` returns **ground metres**, not image fractions — see [SIM_TO_REAL.md §3a](SIM_TO_REAL.md) for why, and for the `cam_*` mounting calibration. |
 | `ReleaseMechanism` | A `Protocol` (`setup/reset/drop/confirm`) for the payload drop. `FcServo` drives a servo on an FC output over MAVLink (SITL); `PiServo` drives a servo on a Pi GPIO pin directly. Chosen by `config.release_mechanism` — the mission never changes. |
-| `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout. Returns a reason string; the mission decides to ABORT. |
+| `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout, position envelope, and the continuous EKF-vs-rangefinder altitude cross-check (`EKF_ALT_DIVERGED`). Returns a reason string; the mission decides to ABORT. Also owns the crash-proof FC-parameter save/restore. |
 | `DeliveryMission` | The state machine that sequences the delivery and runs the failsafe check before each state. |
 | `logbook` | Configures logging to console + a timestamped file under `logs/`. |
 
@@ -121,6 +121,12 @@ stateDiagram-v2
   | never armed | `DONE` | the aircraft is on the ground |
   | `MODE_CHANGED_*` | `DONE` | the pilot or an FC failsafe has control — commanding anything would override the human |
   | airborne, in control | `RECOVER` | land (or RTL outdoors), then disarm |
+
+  The mode check is done twice: once against the *recorded* abort reason, and once
+  **live** against the FC — because a failure whose cause was a mode change can arrive
+  under another name (a takeoff that timed out because the pilot flipped to STABILIZE
+  mid-climb reads `TAKEOFF_FAILED`). Only if the FC is still in our mode does `ABORT`
+  hand off to `RECOVER`.
 
 - **`RECOVER` lands by default.** `config.recovery_action` selects `"land"` (indoor,
   default) or `"rtl"`. RTL first *climbs* to `RTL_ALT` before returning, which in a hall
@@ -243,18 +249,24 @@ sequenceDiagram
     FS-->>Mis: None or "LINK_LOSS"/"NO_TELEMETRY"/"LOW_BATTERY"/"TIMEOUT_x"
 
     note over Mis: IDLE
+    Mis->>FS: recover_stale_params()
+    FS->>Dr: (only if a previous run died before restoring: put its saved values back)
     Mis->>FS: setup_safety_envelope()
+    note over FS: every write below saves the FC's previous value first (restore_params)
     FS->>Dr: set_param("WPNAV_SPEED_UP", climb_rate_cms=50)
     Dr->>FC: PARAM_SET WPNAV_SPEED_UP=50
-    FS->>Dr: set_param("FENCE_ACTION", fence_action=2)
-    Dr->>FC: PARAM_SET FENCE_ACTION=2 (Always Land)
+    FS->>Dr: set_param("WPNAV_SPEED", cruise_speed_cms=100)
+    Dr->>FC: PARAM_SET WPNAV_SPEED=100
     FS->>Dr: set_param("RTL_ALT", rtl_alt_m * 100)
     Dr->>FC: PARAM_SET RTL_ALT=200 (centimetres)
     Mis->>FS: setup_geofence()
+    note over FS: geofence_enable defaults to FALSE (see SIM_TO_REAL §5c) - then this only checks for (and disarms) a stale fence. When enabled:
     FS->>Dr: set_param("FENCE_TYPE", 1)
     Dr->>FC: PARAM_SET FENCE_TYPE=1
     FS->>Dr: set_param("FENCE_ALT_MAX", fence_alt_max_m)
     Dr->>FC: PARAM_SET FENCE_ALT_MAX
+    FS->>Dr: set_param("FENCE_ACTION", fence_action=2)
+    Dr->>FC: PARAM_SET FENCE_ACTION=2 (Always Land)
     FS->>Dr: set_param("FENCE_ENABLE", 1)
     Dr->>FC: PARAM_SET FENCE_ENABLE=1
     Mis->>Rel: setup()  (FcServo)
@@ -306,13 +318,21 @@ sequenceDiagram
 > the FC left our mode) or goes to `RECOVER` — see the state diagram above.
 >
 > The safety-envelope and the geofence block are both config-gated
-> (`enforce_safety_envelope` / `geofence_enable`, both default true). `RTL_ALT` is in
-> **centimetres** on our ArduCopter 4.6.3; 4.7 renamed it to `RTL_ALT_M` in metres, so
+> (`enforce_safety_envelope` defaults true; `geofence_enable` defaults **false** since
+> the 2026-08-21 incident — see SIM_TO_REAL.md §5c). `RTL_ALT` is in **centimetres** on
+> our ArduCopter 4.6.3; 4.7 renamed it to `RTL_ALT_M` in metres, so
 > `_set_rtl_altitude()` tries `RTL_ALT` first and only then the new name. In the
 > safety-envelope block a parameter the firmware does not know is logged as a warning
-> instead of aborting (`_try_param`) — but it then keeps the autopilot's outdoor default.
-> The geofence block sets its three parameters unguarded, so an unconfirmed `FENCE_*`
-> ends the mission — on the ground, before arming, which is where that failure belongs.
+> instead of aborting — but it then keeps the autopilot's outdoor default. The geofence
+> block is strict: it refuses to write any `FENCE_*` whose previous value it could not
+> read, and an unconfirmed write ends the mission — on the ground, before arming, which
+> is where that failure belongs.
+>
+> **Restore on every exit:** each parameter the failsafe changes is saved first and put
+> back in `run()`'s `finally` (`restore_params()`), and the saved baseline is mirrored
+> to `logs/fc_params_backup.json` — so even a run that dies without a `finally`
+> (battery pull, `kill -9`) is cleaned up by the next run's `recover_stale_params()`.
+> The crash fence of 2026-08-21 was exactly such an unrestored leftover.
 >
 > Not drawn: `Drone.tick()`. It runs at the start of every `FailsafeMonitor.check()` and
 > inside every loop that waits on the aircraft — the `Drone` waiters
@@ -339,11 +359,16 @@ machine, same components, same `Camera` interface as sequence 1 — only the nav
 differs.
 
 **Unchanged from sequence 1:** `connect()` / heartbeat, the failsafe `check()` before
-every state, the rest of IDLE (safety envelope, geofence, release `setup()`/`reset()`,
-GUIDED, arm), and the final DROP → RECOVER (LAND) block — the mission calls are identical,
-so they are not redrawn below. (IDLE also gains the optional `set_origin()` — see the
-Changed table.) `TAKEOFF` is **not** in this list: the state is the same call, but it
-climbs to a different altitude — see the Changed table.
+every state, the rest of IDLE (stale-param recovery, safety envelope, geofence,
+release `setup()`/`reset()`, GUIDED, arm), and the final DROP → RECOVER (LAND) block —
+the mission calls are identical, so they are not redrawn below. (IDLE also gains the
+optional `set_origin()` **and** the pre-arm sensor gate
+`failsafe.verify_position_sensors()` — indoor only, it proves the rangefinder and the
+optical flow actually stream data before anything arms; see the Changed table.)
+`TAKEOFF` is **not** in this list: the state is the same call, but it climbs to a
+different altitude, and right after the climb
+`failsafe.verify_rangefinder_tracks_altitude()` proves the rangefinder follows the
+height — the in-air half of the same flyaway guard.
 
 > The drop still goes through the `ReleaseMechanism` protocol, but on the **real indoor
 > build** `config.release_mechanism = "pi"`, so `PiServo` drives the servo on a Pi GPIO

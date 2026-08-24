@@ -225,6 +225,29 @@ class FailsafeMonitor:
         if r["flow_samples"] == 0:
             return "NO_OPTICAL_FLOW_DATA"
 
+        # NO-BARO build: the rangefinder is the EKF's ONLY height source, so if EKF3
+        # never fuses a height on the ground the vertical estimate diverges QUADRATICALLY
+        # and there is no barometer to hold it - the 2026-08-21 crash reached -1070 m
+        # before it even armed. Unlike the rangefinder-reads-zero case, this IS visible
+        # on the ground: a stationary aircraft's reported altitude must not move. read
+        # via .get() so an older read_position_sensors() (no alt keys) skips silently.
+        alt_trend = r.get("alt_trend")
+        alt_span = r.get("alt_span")
+        if alt_trend is not None and alt_span is not None:
+            if (abs(alt_trend) > self.config.max_ground_alt_drift
+                    or alt_span > self.config.max_ground_alt_span):
+                log.warning(
+                    f"[PREARM] The reported altitude is MOVING while the aircraft stands "
+                    f"still: trend {alt_trend * 100:+.1f} cm/s, span {alt_span:.2f} m "
+                    f"(limits {self.config.max_ground_alt_drift * 100:.0f} cm/s / "
+                    f"{self.config.max_ground_alt_span:.2f} m). This is the 2026-08-21 "
+                    f"signature: with the rangefinder as the only height source the EKF "
+                    f"fused no height and the vertical estimate diverged quadratically - "
+                    f"visible within seconds on the ground, and with no barometer nothing "
+                    f"else catches it. Refusing to arm."
+                )
+                return "EKF_ALT_DRIFTING"
+
         # Deliberately NOT an abort: sitting on the floor, a perfectly healthy sensor
         # reads ~0 m, so a zero here proves nothing either way. The distinction between
         # "broken" and "on the ground" can only be made in the air, which is what

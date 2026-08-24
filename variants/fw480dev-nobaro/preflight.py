@@ -36,11 +36,19 @@ GROUPS = {
     ],
     "Other failsafes": ["FS_GCS_ENABLE", "FS_GCS_TIMEOUT", "FS_THR_ENABLE", "FS_EKF_ACTION"],
     "Navigation limits (the companion sets these too)": [
-        "WPNAV_SPEED", "WPNAV_SPEED_UP", "RTL_ALT",
+        # RTL_ALT (cm) is the 4.5/4.6 name, RTL_ALT_M (m) the 4.7+ name. This variant is
+        # 4.8.0-dev so RTL_ALT_M is the live one and RTL_ALT will read "not present" - we
+        # list both so the output proves which firmware the FC is actually running.
+        "WPNAV_SPEED", "WPNAV_SPEED_UP", "RTL_ALT", "RTL_ALT_M",
     ],
     "Position sensors": [
         "SERIAL5_PROTOCOL", "SERIAL5_BAUD", "FLOW_TYPE", "FLOW_ORIENT_YAW",
-        "RNGFND1_TYPE", "RNGFND1_MIN_CM", "RNGFND1_MAX_CM", "RNGFND1_ORIENT",
+        "RNGFND1_TYPE", "RNGFND1_ORIENT",
+        # RNGFND1_MIN_CM/_MAX_CM (cm) are the 4.6 names, RNGFND1_MIN/_MAX (m) the 4.7+
+        # names. On this 4.8.0-dev FC the _CM pair reads "not present" and the metre pair
+        # is live; on the main-repo 4.6.3 FC it is the other way round. One set showing
+        # "not present" is the expected, informative result, not a fault.
+        "RNGFND1_MIN_CM", "RNGFND1_MAX_CM", "RNGFND1_MIN", "RNGFND1_MAX",
     ],
     "EKF sources": [
         "AHRS_EKF_TYPE", "EK3_SRC1_POSXY", "EK3_SRC1_VELXY", "EK3_SRC1_POSZ",
@@ -173,7 +181,10 @@ def main():
                            (0x40, "optical flow"), (0x04, "compass"),
                            (0x01, "gyro"), (0x02, "accelerometer")):
             if not present & bit:
-                state = "not present"
+                # On THIS no-baro build a missing barometer is the point of the build,
+                # not a fault - say so, so nobody chases a "problem" that is by design.
+                state = ("not present - EXPECTED on this no-baro build"
+                         if bit == 0x08 else "not present")
             elif not enabled & bit:
                 state = "present, DISABLED"
             elif not health & bit:
@@ -181,6 +192,8 @@ def main():
             else:
                 state = "ok"
             print(f"    {label:14s} {state}")
+        # Only alarm if a barometer IS present but unhealthy. A no-baro build reports it
+        # "not present", handled above - that must not trip the do-not-fly warning.
         if (present & 0x08) and not (health & 0x08):
             print("\n  !! THE BAROMETER IS UNHEALTHY. ArduPilot needs it for altitude in")
             print("  !! every mode. Do not fly. And note that EK3_SRC1_POSZ = 1 (baro) is")
@@ -195,8 +208,8 @@ def main():
     # fused a single height measurement from it, and the barometer was not a
     # configured source - so the filter integrated accelerometer bias unchecked.
     # Even the first seconds of that are visible from the ground, which is what
-    # this check is for.
-    baro_ok = bool(sensors) and bool(sensors[0] & 0x08) and bool(sensors[2] & 0x08)
+    # this check is for - and on this no-baro build it is the ONLY thing that catches
+    # the divergence, since there is no barometer to hold the height.
     if len(altitudes) >= 5 and not armed_seen:
         span = max(a for _, a in altitudes) - min(a for _, a in altitudes)
         seconds = altitudes[-1][0] - altitudes[0][0]
@@ -224,19 +237,24 @@ def main():
         # the aircraft into the ceiling at full throttle on 2026-08-21.
         posz = read_param(master, "EK3_SRC1_POSZ")
         if posz is not None and abs(posz - 2.0) < 0.1:
-            print("\n  !! EK3_SRC1_POSZ = 2: the rangefinder is the EKF's ONLY height source.")
-            print("  !! This is the configuration of the 2026-08-21 crash: the EKF never")
-            print("  !! fused a height, the vertical estimate diverged on the ground, and")
-            print("  !! the first altitude-controlled mode (a fence-forced LAND) went to")
-            print("  !! full throttle. Watch the altitude-drift line above - if it is")
-            print("  !! running away while the aircraft stands still, DO NOT FLY.")
-            if baro_ok:
-                print("  !! Use the healthy barometer as the height source instead:")
-                print("  !!     python setparam.py EK3_SRC1_POSZ 1 --reboot")
-            else:
-                print("  !! The usual fix is EK3_SRC1_POSZ = 1 (barometer) - but THIS FC's")
-                print("  !! barometer is not healthy (see sensor health above), so that")
-                print("  !! fallback does not exist until the baro/I2C problem is repaired.")
+            # On the main aircraft POSZ=2 is the mistake and "switch to baro" is the fix.
+            # HERE there is no baro to switch to - POSZ=2 (rangefinder) is the ONLY height
+            # source this airframe has, so it is the INTENDED configuration. The danger is
+            # unchanged (this is still exactly the 2026-08-21 setup), so instead of a fix
+            # that does not exist we print the strict protocol that keeps it flyable.
+            print("\n  ** EK3_SRC1_POSZ = 2: the rangefinder is the EKF's ONLY height source.")
+            print("  ** On this no-baro airframe that is the INTENDED configuration - there")
+            print("  ** is no barometer to fall back to. But it is also the exact setup of")
+            print("  ** the 2026-08-21 crash (EKF fused no height, the vertical estimate")
+            print("  ** diverged on the ground, a fence-forced LAND then went to full")
+            print("  ** throttle), so the strict no-baro protocol is mandatory here:")
+            print("  **   1. The altitude-drift line above IS the gate: if the reported")
+            print("  **      height is running away while the aircraft stands still, DO NOT")
+            print("  **      FLY - there is no second sensor to catch it.")
+            print("  **   2. Bench hand-lift test first: lift the airframe by hand and")
+            print("  **      confirm the EKF altitude FOLLOWS the real lift before any flight.")
+            print("  **   3. Start flights only via --takeover: the pilot flies the first")
+            print("  **      metre, the companion inherits an aircraft already stable in air.")
     if flow_q:
         print(f"  Optical flow: {len(flow_q)} messages, quality min={min(flow_q)} max={max(flow_q)}")
     else:

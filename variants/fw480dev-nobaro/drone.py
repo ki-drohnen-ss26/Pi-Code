@@ -147,6 +147,21 @@ class Drone:
         raw = msg.flight_sw_version
         version = f"{(raw >> 24) & 0xFF}.{(raw >> 16) & 0xFF}.{(raw >> 8) & 0xFF}"
         log.info(f"[FC] ArduPilot flight software {version}")
+
+        # This code variant targets one firmware family, and a mismatch is silent damage:
+        # 4.8.0-dev uses 4.7+ parameter NAMES (RTL_ALT_M, RNGFND1_MIN/MAX, MAV_GCS_SYSID),
+        # and ArduPilot ignores an unknown parameter without complaint - so against the
+        # wrong firmware the whole safety envelope would load as no-ops and nothing would
+        # say so. getattr keeps this safe if an older Config has no expected prefix.
+        expected = getattr(self.config, "expected_fw_prefix", None)
+        if expected and not version.startswith(expected):
+            log.warning(
+                f"[FC] FIRMWARE MISMATCH: this is the fw480dev-nobaro variant (expects "
+                f"ArduCopter {expected}.x) but the FC reports {version}. Parameter names "
+                f"differ between releases and wrong ones are silently ignored, so the "
+                f"safety envelope may not take effect. Use the code variant that matches "
+                f"this firmware (main Pi-Code = 4.6.3)."
+            )
         return version
 
     def request_data_streams(self, rate_hz: int = 4) -> None:
@@ -311,7 +326,7 @@ class Drone:
         """Listen for the sensors the GPS-denied position estimate is built on.
 
         Returns {"rangefinder_samples", "rangefinder_min", "rangefinder_max",
-                 "flow_samples", "flow_quality_max"}.
+                 "flow_samples", "flow_quality_max", "alt_span", "alt_trend"}.
 
         Why this exists: a broken optical-flow setup does not announce itself. The
         autopilot keeps streaming RANGEFINDER messages whose distance is simply always
@@ -321,12 +336,23 @@ class Drone:
         the position controller flies full-throttle after an imaginary error. Reading the
         raw sensor values before arming is the cheapest way to catch that on the ground.
 
+        On a NO-BARO build there is a second, deadlier failure this catches: with the
+        rangefinder as the EKF's ONLY height source (EK3_SRC1_POSZ=2), EKF3 can sit on
+        the ground never fusing a height and let the vertical estimate diverge - the
+        2026-08-21 crash reached -1070 m before arming. So we also watch the reported
+        EKF altitude (GLOBAL_POSITION_INT.relative_alt) while the aircraft stands still:
+        a height estimate that MOVES on the ground is that divergence starting, and with
+        no barometer to hold it there is nothing else to catch it before takeoff.
+        "alt_span" is max-min of the samples, "alt_trend" is the signed rate (last minus
+        first over the elapsed seconds); both 0.0 until at least two samples arrive.
+
         Note ArduPilot emits RANGEFINDER (its own message, with distance in metres) as
         well as DISTANCE_SENSOR (centimetres); we count both so a differently configured
         backend still registers.
         """
         rng: list = []
         flow_q: list = []
+        alts: list = []       # (timestamp, EKF relative altitude [m]) - must not drift on the ground
         deadline = time.time() + duration
         while time.time() < deadline:
             # Keep the GCS heartbeat alive: this runs for sensor_check_s (5 s) and is
@@ -337,7 +363,8 @@ class Drone:
             if time.time() - self._last_heartbeat_sent >= 1.0:
                 self.send_heartbeat()
             msg = self.master.recv_match(
-                type=["RANGEFINDER", "DISTANCE_SENSOR", "OPTICAL_FLOW", "OPTICAL_FLOW_RAD"],
+                type=["RANGEFINDER", "DISTANCE_SENSOR", "OPTICAL_FLOW",
+                      "OPTICAL_FLOW_RAD", "GLOBAL_POSITION_INT"],
                 blocking=True, timeout=1.0)
             if msg is None:
                 continue
@@ -346,14 +373,27 @@ class Drone:
                 rng.append(msg.distance)                  # metres
             elif kind == "DISTANCE_SENSOR":
                 rng.append(msg.current_distance / 100.0)  # centimetres -> metres
+            elif kind == "GLOBAL_POSITION_INT":
+                alts.append((time.time(), msg.relative_alt / 1000.0))  # mm -> metres
             else:
                 flow_q.append(getattr(msg, "quality", 0))
+
+        # A stationary aircraft's height estimate should not move; on this no-baro build
+        # a moving one is the diverging vertical filter and there is no baro to catch it.
+        # span = spread over the window, trend = signed rate between first and last sample.
+        alt_span = (max(a for _, a in alts) - min(a for _, a in alts)) if len(alts) >= 2 else 0.0
+        if len(alts) >= 2 and alts[-1][0] > alts[0][0]:
+            alt_trend = (alts[-1][1] - alts[0][1]) / (alts[-1][0] - alts[0][0])
+        else:
+            alt_trend = 0.0
         return {
             "rangefinder_samples": len(rng),
             "rangefinder_min": min(rng) if rng else None,
             "rangefinder_max": max(rng) if rng else None,
             "flow_samples": len(flow_q),
             "flow_quality_max": max(flow_q) if flow_q else None,
+            "alt_span": alt_span,
+            "alt_trend": alt_trend,
         }
 
     def get_rangefinder(self, timeout: float = 1.5) -> Optional[float]:
