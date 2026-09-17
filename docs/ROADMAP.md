@@ -98,9 +98,10 @@ IDLE → TAKEOFF → SEARCH → APPROACH → DROP → RECOVER
 *Target search & approach:*
 - **`SearchPattern`** (`search.py`): generates local-NED waypoints relative to launch.
   - `ExpandingSquare` (**default**): spirals outward; needs only a step size + max
-    radius, not the hall dimensions — but size that radius for the hall by hand. The
-    configured geofence is altitude-only (`FENCE_TYPE=1`) and will not stop a
-    horizontal excursion, and the pattern reaches one `step` beyond `max_radius`.
+    radius, not the hall dimensions — but size that radius for the hall by hand. No
+    geofence guards the walls (the fence is off in the flight set; even an altitude fence
+    would only guard the ceiling), so nothing stops a horizontal excursion, and the
+    pattern reaches one `step` beyond `max_radius`.
   - `Lawnmower`: back-and-forth over a configured rectangle (even full coverage).
   - Selected via `config.py` (`search_pattern`).
 - **Detection cadence** (config-selected): `stop_and_look` (**default** — fly to a
@@ -128,11 +129,13 @@ In SITL we leave GPS on as a shortcut to seed the EKF origin/home. Indoors there
 GPS, so the companion must establish the reference itself:
 - **`Drone.set_origin()`** — send `SET_GPS_GLOBAL_ORIGIN` (a chosen reference lat/lon) so
   the EKF origin/home, `LOCAL_POSITION_NED` and `goto_local()` work without GPS.
-- **Geofence indoors** — the GPS-style fence needs a position; use an altitude-only fence
-  or disable it indoors (`config.geofence_enable`). *Decided after the 2026-08-21
-  incident: **disabled by default*** — the barometric altitude spikes 4–6.7 m under
-  propeller downwash, so an indoor-sized altitude fence breaches on every takeoff and
-  `FENCE_ACTION` converts that into an uncommanded mode change (see `SIM_TO_REAL.md` §5c).
+- **Geofence indoors** — the GPS-style fence needs a position, so at most an altitude-only
+  fence is possible indoors. *Decided after the 2026-08-21 incident: **off by default***
+  (`FENCE_ENABLE 0` in the flight set, owned by Mission Planner) — the barometric altitude
+  spikes 4–6.7 m under propeller downwash, so an indoor-sized altitude fence breaches on
+  every takeoff and `FENCE_ACTION` converts that into an uncommanded mode change (see
+  `SIM_TO_REAL.md` §5c). The companion only verifies read-only that no stale fence is armed
+  (`verify_fence_disabled()`); it never writes fence parameters.
 - **`TimedCamera`** (config-selectable camera source) — "finds" the target after a set
   time (centred), so a real flight can exercise the search-pattern flight + the drop
   mechanism with **no AI camera**. Same `Camera` interface, so the mission is untouched.
@@ -185,9 +188,12 @@ LiDAR + companion link.
 **Goal:** earn trust step by step. Each stage adds exactly ONE unknown, selected from
 the command line with `--milestone N` so no source is edited between flights.
 
-1. Manual `AltHold` → confirms LiDAR altitude hold.
-2. Manual `PosHold` → confirms optical-flow position hold.
-3. `--milestone 1` — companion hover at 1 m. The logged **drift** is the result, not the
+1. Manual `AltHold` → confirms LiDAR altitude hold. **☑ flying (2026-08-24 evening)**
+   under the mandated `EK3_SRC1_POSZ=2`.
+2. Manual `PosHold`/`Loiter` → confirms optical-flow position hold. **☑ Loiter flying
+   (2026-08-24 evening)**; the earlier oscillation was cured by halving
+   `ATC_RAT_PIT`/`ATC_RAT_RLL` P/I (0.135→0.0675) and D (0.0036→0.0018) (v1→v2 tune).
+3. `--milestone 1` — companion hover at 0.8 m. The logged **drift** is the result, not the
    fact that it hovered: a broken flow setup still flies, it just walks away.
 4. `--milestone 2` — same flight with the detector running, logging only. Verify the
    **sign** of `dx`/`dy` here (pad to the right → positive `dx`), on the ground first.
@@ -196,6 +202,33 @@ the command line with `--milestone N` so no source is edited between flights.
    `search_step_m` and nothing bounds it horizontally.
 6. `--milestone 4` — search, detect and centre with nothing able to fall out.
 7. `--milestone 5` — the full indoor delivery.
+
+- **2026-08-25 (from the hall dataflash logs):** **AltHold verified clean in the hall**
+  (36 s stable, 0.12 m position excursion). **Loiter is blocked by the hall's magnetics** —
+  it drifted and was abandoned within seconds on all three attempts. The hall's field
+  magnitude swings 195–565 mGauss across the flight volume (rebar/steel; ~340 mGauss on the
+  floor vs ~480 Earth field), and the EKF never *rejected* the compass — it fused a wrong
+  heading (yaw snapped +83° in one second on landing against only +50° of gyro rotation, an
+  `ERR COMPASS` event; a full 360° yaw at up to 182°/s during Loiter). Optical-flow position
+  control needs a correct yaw to convert flow into NED, so a wrong heading becomes drift;
+  AltHold is yaw-independent, hence clean. *Next:* (1) bench yaw sanity check + confirm
+  `COMPASS_ORIENT = 2` is correct for the mast-mounted HGLRC M100; (2) in-hall compass
+  calibration / MAGFit from this log (vehicle-fixed offsets only — the spatial gradient
+  cannot be calibrated away); (3) pick a flight area away from floor rebar/walls, consider an
+  elevated takeoff spot. The team has removed the compass bit from `ARMING_CHECK`
+  (41350 → 41346) to clear compass prearm failures — a decision to record and revisit; all
+  parameter changes via Mission Planner. A follow-up measurement (recal in the *middle* of
+  the hall) found the field magnitude climbing from ~360 mGauss on the floor to ~850 mGauss
+  at ~2 m over one and the same spot — a vertical gradient larger than the ~480 mGauss Earth
+  field, which no calibration can remove. Flying compassless is not an escape either: on the
+  `flight_v2` SITL mirror (4.6.3) `COMPASS_USE=0` + `EK3_SRC1_YAW=0` flapped EKF aiding on/off
+  and refused arming with *"Need Position Estimate"* (5/5), while the same mirror with the
+  compass flew milestone 1 green — so the compass is mandatory and the fix must make *it*
+  usable in the hall. The ranked options (field-mapping a stable takeoff zone, the
+  colleague-team comparison, an `EK3_MAG_M_NSE` damping experiment, a hand-lift
+  building-vs-self test, or escalation) live in `project-docs` → Problems → "Loiter drifts in
+  the hall"; until one lands there are no milestone-1 flights in the hall (GUIDED drifts like
+  Loiter), and the compass bit returns to `ARMING_CHECK` (41346 → 41350) when solved.
 
 Flyaway guards run throughout (`SIM_TO_REAL.md` §5b): the rangefinder must track altitude
 after the climb, the reported position must stay inside `max_position_radius_m`, and
@@ -231,11 +264,14 @@ Driven entirely by things that actually went wrong in SITL:
   over a human who has just taken control.
 - **LAND instead of RTL, and `ABORT` split three ways** (never armed / mode changed /
   airborne). RTL climbs to `RTL_ALT` first, which indoors is the ceiling.
-- **FC safety envelope** set + verified before every flight (`WPNAV_SPEED_UP`,
-  `WPNAV_SPEED`, `RTL_ALT` with the 4.6/4.7 name fallback). Every changed parameter is
-  saved first and restored on exit, mirrored to disk so even a killed run is cleaned up
-  by the next one; fence parameters live exclusively in `setup_geofence()` since the
-  2026-08-21 incident (a leftover `FENCE_ACTION=2` fence was its trigger).
+- **FC safety envelope** (`WPNAV_SPEED_UP`, `WPNAV_SPEED`, `RTL_ALT` with the 4.6/4.7 name
+  fallback) was originally *set + restored* by the companion before/after every flight,
+  mirrored to disk so even a killed run was cleaned up by the next one. **Superseded on
+  2026-08-25** by the parameter-ownership decision: those limits now live in
+  `params/flight_v2.param` (owned by Mission Planner) and the companion only verifies them
+  read-only. The stale-fence trigger of the 2026-08-21 incident (a leftover `FENCE_ACTION=2`)
+  is now caught read-only by `verify_fence_disabled()`, which refuses to fly rather than
+  writing anything.
 - **Presets over source edits:** `python main.py` runs the **real aircraft**, `--sim`
   the simulator; the dataclass defaults carry the aircraft's drop-servo path and
   battery threshold, and `Config.sitl()` overrides both for the simulator
@@ -264,7 +300,7 @@ firmware version, the autopilot's own messages and a named abort reason. ☑
 | 4     | Real AI camera                 | ◑ `RealCamera` implemented + wired; IMX500 detected on the Pi. Blocked on an `.rpk` model (only `.tflite` exists) and `imx500-all` |
 | 5     | Pi provisioning & HIL prep     | ☑ Pi image, `mavlink-router` (systemd, `/dev/serial0` @ 921600 → `127.0.0.1:14550`), pymavlink, gpiozero/lgpio all **verified on hardware**. MTF-01P configured and streaming (see note below) |
 | 6     | Bench integration (no props)   | ◑ Companion↔FC link verified against the real FC (heartbeat, `--tele`, ArduPilot 4.6.3). Servo drop + arm/disarm still open |
-| 7     | Flight tests                   | ☐ **blocked on hardware** since the 2026-08-21 crash — see "Current blockers" below |
+| 7     | Flight tests                   | ◑ **manual modes flying again on the real aircraft (2026-08-24 evening):** both **AltHold and Loiter** work with the mandated `EK3_SRC1_POSZ=2`; the v1→v2 oscillation was fixed by **halving `ATC_RAT_PIT`/`ATC_RAT_RLL` P/I (0.135→0.0675) and D (0.0036→0.0018)**. Companion `--milestone` flights still to come |
 | 8     | Documentation & deliverables   | ◑ Pi-Code docs current; project-docs (mkdocs site) being filled |
 
 > **MTF-01P history.** An earlier bench session found `RANGEFINDER` at a constant
@@ -274,28 +310,105 @@ firmware version, the autopilot's own messages and a named abort reason. ☑
 > (and truthfully tracking the crash climb 0.02 → 4.94 m), flow quality 45–113. The
 > sensor side of Task 4 works.
 
-## Incident 2026-08-21 and the EK3_SRC1_POSZ decision
+## Incident 2026-08-21 and the EKF height source
 
 The full analysis lives in [`SIM_TO_REAL.md` §5c](SIM_TO_REAL.md); this section tracks
 the *decisions and blockers* that came out of it.
 
 **Decisions taken:**
-- `geofence_enable = False` by default indoors (fence breached on downwash spike on
-  every takeoff; `FENCE_ACTION=2` then forced LAND over the pilot).
-- Fence parameters are written only by `setup_geofence()`, saved before every change,
-  restored on every exit, and mirrored to disk so a killed run is cleaned up by the
-  next one (`failsafe.recover_stale_params()`). A stale fence found enabled at startup
-  is disarmed.
+- Fence **off** indoors (`FENCE_ENABLE 0` in the flight set; fence breached on the
+  downwash spike on every takeoff, and `FENCE_ACTION=2` then forced LAND over the pilot).
+- **Parameter ownership (2026-08-24): the companion no longer writes any FC parameter.**
+  FC parameters now have one owner — Mission Planner plus the published, versioned flight
+  parameter set (`params/flight_v2.param`); the companion verifies them read-only
+  (`preflight.py`). Two reasons: (1) a **single source of truth** for the flight
+  configuration, and (2) **no surprise overwrites** — the 2026-08-21 crash fence was
+  precisely a companion-written parameter that outlived its run. A
+  stale fence found enabled at startup is no longer cleared by the companion: it now
+  **refuses to fly** (`UNEXPECTED_FENCE_ENABLED`) and asks the operator to disable it in
+  Mission Planner. Deliberate values kept on the real aircraft: `BATT_LOW_VOLT=12.4`
+  (recommendation was 12.8) and `ARMING_CHECK=41350` (the fuller 786390 mask declined for
+  now); the `FLTMODE` switch mapping is done transmitter-side and lands in flight-set v3.
+- **Legacy write/restore machinery deleted (2026-08-25).** The old opt-in
+  (`enforce_safety_envelope`, `setup_safety_envelope()`, `restore_params()`,
+  `recover_stale_params()`, the `logs/fc_params_backup.json` mirror) is gone; the flight
+  companion now writes no FC flight parameter (its only PARAM_SET is `FcServo`'s SITL-only
+  `SERVO9_FUNCTION=0`).
 - The takeover gate (`--takeover`) now trusts the **rangefinder**, not the EKF
   altitude, and refuses the handover when the two disagree (`EKF_ALT_DIVERGED`).
 
-**Decision still open — the EKF height source.** `EK3_SRC1_POSZ = 2` (rangefinder) is
-the verified root cause: EKF3 never fused a height from it and the vertical estimate
-diverged quadratically on the ground (−1070 m at arming, "climb rate" −12.6 m/s while
-stationary). The standard fix is `EK3_SRC1_POSZ = 1` (barometer as primary, rangefinder
-via `EK3_RNG_USE_HGT` for low-altitude override) — **but the barometer stopped being
-detected after the crash**, so that option is blocked on the hardware repair below.
-Until it is resolved, the aircraft must not fly any altitude-controlled mode.
+**The EKF height source — mandated, not chosen (2026-08-24).** The assignment
+**mandates the rangefinder as the EKF height source** (`EK3_SRC1_POSZ = 2`); using the
+barometer as the EKF source (`POSZ = 1`) is **not permitted** by the task. This is also
+the verified 2026-08-21 configuration in which the vertical estimate diverged: EKF3 never
+fused a height from the rangefinder, so it ran away quadratically on the ground (−1070 m
+at arming, "climb rate" −12.6 m/s while stationary). So `POSZ = 2` is not a decision to
+revisit — it is a constraint we operate under a **safety protocol**.
+`params/fc_safe_overrides.parm` now sets `EK3_SRC1_POSZ = 2` and `RNGFND1_GNDCLEAR = 2`
+(the EKF's expected on-ground reading in cm — the default 10 did not match our ~2 cm
+mounting), loaded on top of the recovered baseline before the next flight.
+
+*The protective net that makes `POSZ = 2` operable:*
+- `preflight.py` ground-drift verdict before **every** arming — drift on the ground is
+  the crash failure mode, so it is the GO/NO-GO gate.
+- `ARMING_CHECK = 786390`, geofence off.
+- continuous in-flight EKF-vs-rangefinder cross-check (`EKF_ALT_DIVERGED` /
+  `altitude_implausible()`).
+- rangefinder-gated `--takeover` starts — the EKF altitude is never trusted for the
+  handover.
+- a bench hand-lift test proving the EKF altitude follows a real lift, before the first
+  flight of a session.
+
+The barometer stays a logged **witness** (BAlt, sanity reference) even though the mandate
+forbids it as the EKF source.
+
+*Open clarification (2026-08-24):* the professor's course document (`AI_Drones.pdf`,
+§11.2 Step C) sets `POSZ = 2` only in its **SRC2**/aux-switch recipe; its
+exclusively-indoor **SRC1** recipe has no POSZ line (height stays at the baro default).
+Which variant the assignment intends needs to be clarified with the professor, and
+`EK3_SRC1_POSZ` is the **first** value to check in the colleague-team parameter diff —
+if they followed the SRC1 recipe verbatim, they fly baro height without knowing it,
+which would fully explain their stable ground behaviour.
+
+*Open investigation:* a colleague team flies the **same** sensor with `POSZ = 2`
+successfully. The next step is a full parameter diff against their aircraft (hot suspects:
+`RNGFND1_GNDCLEAR`, `RNGFND1_MIN_CM`, `EK3_ALT_M_NSE`) plus a 3-minute ground-drift test
+on *their* aircraft — the alternative explanation being that their EKF drifts on the
+ground too and nobody ever left it standing for minutes.
+
+*Documented lead (2026-08-25):* a **working** reference script from the drone lab
+(`fly_800CM_and_land.py`, flown on another aircraft in the same lab) states its EKF
+source set as `EK3_SRC1_POSXY = 3` (**GPS**), `VELXY = 5`, `POSZ = 2` — i.e. that
+aircraft flies rangefinder height with the *horizontal* source left on GPS despite
+having no indoor GPS fix, where ours runs `EK3_SRC1_POSXY = 0`. This is the first
+documented evidence of a concrete working parameter set in this lab, so
+`EK3_SRC1_POSXY` (ours: 0) now joins `EK3_SRC1_POSZ` and `RNGFND1_GNDCLEAR` as concrete
+values to compare in that diff. The same script also warns that optical flow is
+typically poor below ~0.5 m ("keep above ~0.5 m") — which bears on our minimum test
+altitudes, including the 0.8 m first-flight choice for milestone 1.
+
+*Breakthrough (2026-08-25) — the on-ground blocker in SITL is the `RNGFND1_MIN_CM`
+validity floor, not `POSZ`.* A clean 2×2 matrix on a wiped, mirror-loaded SITL (each cell
+after reboot, 60 s of `EKF_STATUS_REPORT` on the ground) isolated it:
+
+| | `RNGFND1_MIN_CM = 0` | `RNGFND1_MIN_CM = 1` |
+|---|---|---|
+| `EK3_SRC1_POSZ = 1` (baro) | `POS_HORIZ_REL` immediately | — |
+| `EK3_SRC1_POSZ = 2` (rangefinder) | `POS_HORIZ_REL` immediately | **never** (`0x0027`, no `PRED_REL`/`VERT_AGL`) |
+
+`POSZ = 2` is **exonerated for the on-ground phase in SITL**: with `MIN_CM 0` fusion comes
+up immediately under either height source. What blocks it is the `MIN_CM` floor — SITL's
+landed rangefinder reads exactly `0.00 m`, so `MIN_CM 1` flags it out-of-range-low, the EKF
+gets no range, optical flow cannot be scaled, and no relative position (nor, under `POSZ 2`,
+any height) initialises. The **real aircraft sits 1 cm above** the same floor (reads
+`0.02 m` with `MIN_CM 1`), so this gate is now the leading suspect for the crash-day
+divergence. With this deviation the mirror flew a **fully green milestone 1** in SITL under
+the mandated `POSZ 2`: EKF ready on the ground, climb to 0.8 m, rangefinder track confirmed,
+20 s hover at **0.03 m** worst horizontal drift, LAND — the milestone-1 logic is validated
+end-to-end. *Next real-aircraft steps:* the colleague parameter diff
+(`EK3_SRC1_POSZ` / `EK3_SRC1_POSXY` / `RNGFND1_MIN_CM` / `RNGFND1_GNDCLEAR`) and a team
+decision whether to set `RNGFND1_MIN_CM = 0` on the aircraft — applied via Mission Planner
+only, per the ownership rule.
 
 **Current blockers (in repair order):**
 1. **Baro/I2C damage.** After the crash the stock 4.6.3 firmware halts with
@@ -304,17 +417,18 @@ Until it is resolved, the aircraft must not fly any altitude-controlled mode.
    **and** `Bad Compass Health`. The FlywooF745 has exactly **one I2C bus** shared by
    the onboard baro and the external GPS-module compass — and the crash **tore off the
    GPS connector** (FC_Check.pdf §1.4). A damaged compass/GPS wiring holding SDA/SCL
-   down would explain both symptoms with an intact baro chip. **Zero-cost test:**
-   unplug the GPS module's I2C wires, boot stock 4.6.3 — if the baro reappears, repair
-   the GPS connector/wiring (or fly indoor without compass) instead of replacing the FC.
-   *Update 2026-08-23:* a **bent pin** in the GPS connector was found and straightened;
-   "Bad Compass Health" disappeared on the 4.8.0-dev build. Baro re-test on stock
-   4.6.3 is next — if it passes, no new FC is needed.
+   down would explain both symptoms with an intact baro chip.
+   **RESOLVED 2026-08-24 — the hypothesis held completely.** Bent pins in the GPS
+   connector were found and straightened (2026-08-23); "Bad Compass Health"
+   disappeared. Stock 4.6.3 was re-flashed and **detects the barometer again**: the
+   chip was never dead, only unreachable behind the hung single I2C bus. No new FC
+   needed. Full story: `project-docs` → Problems → "Crash & barometer recovery".
 2. **Parameter wipe.** Flashing the custom 4.8.0-dev build reset ALL parameters to
    defaults (Mission Planner shows `New mission / New rally / New fence`, battery
-   monitor unconfigured). After returning to stock 4.6.3, reload the captured baseline
-   `mav.parm` — but **override the crash quartet** first: `FENCE_ENABLE=0` and
-   `EK3_SRC1_POSZ=1` (see `params/README.md`).
+   monitor unconfigured). After returning to stock 4.6.3, reload the recovered baseline
+   and then `params/fc_safe_overrides.parm` on top: `FENCE_ENABLE=0`, `EK3_SRC1_POSZ=2`
+   (the mandated rangefinder height source) + `RNGFND1_GNDCLEAR=2`, arming checks on
+   (see `params/README.md`).
 3. **`ARMING_CHECK = 0`** must be restored (1, or 786390 = everything except GPS lock)
    before any flight — the crash flight armed with an EKF vertical error of 1000 m that
    an enabled EKF pre-arm check would have refused.

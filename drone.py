@@ -27,7 +27,6 @@ log = logging.getLogger(__name__)
 
 
 class Drone:
-    # MAV_SEVERITY -> label, for the STATUSTEXT messages we mirror into our log.
     _SEVERITY = {0: "EMERGENCY", 1: "ALERT", 2: "CRITICAL", 3: "ERROR",
                  4: "WARNING", 5: "NOTICE", 6: "INFO", 7: "DEBUG"}
 
@@ -48,7 +47,7 @@ class Drone:
             source_system=self.config.gcs_system_id,
         )
         self.wait_heartbeat()
-        self.send_heartbeat()          # announce ourselves before anything else
+        self.send_heartbeat()
         self.request_data_streams()
         self.log_autopilot_version()
 
@@ -168,7 +167,7 @@ class Drone:
         Tell the EKF where it is WITHOUT GPS, via SET_GPS_GLOBAL_ORIGIN. Indoors there is
         no GPS to seed the EKF origin/home, so the companion provides a reference. Any
         sensible lat/lon works - it only anchors the local NED frame and home. After this,
-        LOCAL_POSITION_NED, home and the geofence have a reference.
+        LOCAL_POSITION_NED and home have a reference.
 
         lat/lon in degrees, alt in metres (AMSL). Returns True only if the origin we
         asked for is the one the autopilot ended up using.
@@ -256,9 +255,11 @@ class Drone:
     def read_param(self, name: str, tries: int = 3, timeout: float = 2.0):
         """Read one parameter without writing it. Returns the value or None.
 
-        Needed so the companion can put back what it changed: parameters live in the
-        flight controller and outlive this process, so anything we set for a mission
-        has to be remembered before it is overwritten.
+        Read-only verification, nothing more: the companion inspects FC parameters -
+        the fence check before arming, and the preflight sweep - but never writes one.
+        Since the 2026-08-24 ownership decision Mission Planner and params/flight_v2.param
+        are the single source of truth, so there is nothing to remember and put back;
+        this reads and reports, it never restores a value because nothing here changes one.
         """
         for _ in range(tries):
             self.master.mav.param_request_read_send(
@@ -490,11 +491,6 @@ class Drone:
         log.warning("[ARM] Arming failed - see the [FC/...] messages above for the reason")
         return False
 
-    def disarm(self) -> None:
-        """Disarm the motors."""
-        self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0)
-        log.info("[ARM] Disarm sent")
-
     def takeoff(self, altitude: float, timeout: float = 30.0,
                 settle_s: float = 3.0, tolerance: float = 0.5) -> bool:
         """
@@ -509,6 +505,15 @@ class Drone:
         mission happily continued sending waypoints to a vehicle that was no longer
         listening. Overshoot is a hall-ceiling problem, so we watch for it here.
         """
+        # Scale the acceptance band to the target height. A fixed 0.5 m band
+        # contains the GROUND for low bring-up altitudes: for a 0.5 m takeoff the
+        # band |alt-0.5| <= 0.5 accepts 0.0 m, so a vehicle that never lifted would
+        # "reach" the target and could pass the settle window still sitting on the
+        # floor (found before the first 0.5 m milestone-1 flight on 2026-08-25).
+        # eff_tol shrinks with altitude but never below 0.15 m (sensor noise floor)
+        # and never above the passed tolerance: 0.5 m -> 0.2 m band, 1 m -> 0.4 m,
+        # >= 1.25 m -> capped at `tolerance`.
+        eff_tol = min(tolerance, max(0.15, 0.4 * altitude))
         self._command_long(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, altitude)
         log.info(f"[TAKEOFF] Climbing to {altitude} m ...")
 
@@ -532,12 +537,12 @@ class Drone:
             alt = pos["rel_alt"]
             peak = max(peak, alt)
 
-            if abs(alt - altitude) <= tolerance:
+            if abs(alt - altitude) <= eff_tol:
                 if stable_since is None:
                     stable_since = time.time()
                     log.info(f"[TAKEOFF] Altitude reached ({alt:.1f} m), settling ...")
                 elif time.time() - stable_since >= settle_s:
-                    if peak > altitude + tolerance:
+                    if peak > altitude + eff_tol:
                         log.warning(
                             f"[TAKEOFF] Overshot to {peak:.1f} m before settling at "
                             f"{alt:.1f} m - consider lowering WPNAV_SPEED_UP"
@@ -711,8 +716,8 @@ class Drone:
         On False the caller deliberately does NOT force a disarm (see
         mission._recover): cutting the motors of a vehicle that may still be airborne
         is worse than leaving the LAND command standing. The kill switch lives on the
-        transmitter, not in this script. Drone.disarm() therefore has no caller in the
-        mission path and exists for bench use.
+        transmitter, not in this script - which is why there is no companion-side disarm
+        command at all; the FC disarms itself once the LAND touches down.
 
         Kept on Drone - rather than reading master directly in the mission - so the
         mission logic can be tested against a fake drone without a real MAVLink link.

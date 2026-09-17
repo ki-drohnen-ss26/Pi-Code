@@ -10,13 +10,10 @@ tests can assert on them. Because the mission was written against the Drone
 interface (not against the MAVLink connection directly), swapping in FakeDrone is
 all it takes.
 
-These tests cover the GPS path (ENROUTE/OVER_TARGET), the default GPS-denied
-navigation) from silently breaking the mission flow.
+These tests cover both navigation paths - the GPS/outdoor one (ENROUTE/OVER_TARGET)
+and the default GPS-denied indoor one (SEARCH/APPROACH) - to keep a change in either
+from silently breaking the mission flow.
 """
-
-import json
-import os
-import tempfile
 
 import pytest
 
@@ -42,7 +39,6 @@ class FakeDrone:
         disarm_ok: bool = True,
         link_alive_ok: bool = True,
         origin_ok: bool = True,
-        unknown_params=None,
     ):
         self.config = config
         self.calls: list[tuple] = []
@@ -64,15 +60,12 @@ class FakeDrone:
         self._link_checks = 0
         self._north = 0.0  # local NED position, updated by goto_local / move_body_offset
         self._east = 0.0
-        # Position sensors as read by failsafe.verify_position_sensors(). Healthy by
-        # default; a test that wants the flyaway precondition overrides this.
-        # What the FC carried before this run, as read back by read_param(). Includes
-        # FENCE_ACTION - the parameter whose unrestored leftover caused the 2026-08-21
-        # crash - and the safety-envelope trio, so the restore paths are exercised.
+        # FC parameter values as read back by read_param(). The companion is read-only
+        # now (team decision 2026-08-24), so these only feed verify_fence_disabled():
+        # FENCE_ENABLE=0 means no stale fence is armed. A test that wants the
+        # refuse-to-fly path flips FENCE_ENABLE to 1.
         self.params_before = {"FENCE_ENABLE": 0.0, "FENCE_TYPE": 7.0,
-                              "FENCE_ALT_MAX": 120.0, "FENCE_ACTION": 1.0,
-                              "WPNAV_SPEED_UP": 250.0, "WPNAV_SPEED": 1000.0,
-                              "RTL_ALT": 1500.0}
+                              "FENCE_ALT_MAX": 120.0, "FENCE_ACTION": 1.0}
         # Raw rangefinder reading as read by get_rangefinder(); None = no message.
         self.rangefinder_m = None
         self.position_sensors = {
@@ -82,9 +75,6 @@ class FakeDrone:
         # Flight mode the FC reports. Tests flip this to simulate the pilot taking over.
         self.mode = "GUIDED"
         self.origin_ok = origin_ok
-        # Parameter names the fake FC does NOT know, so tests can exercise the
-        # RTL_ALT / RTL_ALT_M fallback across firmware versions.
-        self.unknown_params = set(unknown_params or ())
 
     # --- used by the failsafe ---
     def tick(self):
@@ -94,8 +84,6 @@ class FakeDrone:
         return self.mode
 
     def set_param(self, name, value, timeout=3.0):
-        if name in self.unknown_params:
-            raise TimeoutError(f"No confirmation for parameter {name}")
         self.calls.append(("set_param", name, value))
         return float(value)
 
@@ -232,10 +220,6 @@ def _no_sleep(monkeypatch):
 
 def _build_mission(drone: FakeDrone, config: Config, camera=None) -> DeliveryMission:
     camera = camera or MockCamera()  # target detected dead-centre by default
-    # Isolate the failsafe's on-disk param backup per test - a leftover from a real
-    # run (or another test) must not leak parameter restores into this one.
-    if not config.param_backup_file:
-        config.param_backup_file = os.path.join(tempfile.mkdtemp(), "fc_params_backup.json")
     failsafe = FailsafeMonitor(drone, config)  # the REAL failsafe, fed by FakeDrone
     release = FcServo(drone, config)  # FC servo path; FakeDrone provides the servo calls
     return DeliveryMission(drone, camera, failsafe, config, release)
@@ -440,19 +424,6 @@ def test_no_origin_when_disabled():
     assert "set_origin" not in drone.actions()
 
 
-def test_geofence_sets_altitude_fence():
-    config = Config.sitl()
-    config.geofence_enable = True      # off by default indoors, see config.py
-    drone = FakeDrone(config)
-    mission = _build_mission(drone, config)
-
-    mission.run()
-
-    assert ("set_param", "FENCE_TYPE", config.fence_type) in drone.calls
-    assert ("set_param", "FENCE_ALT_MAX", config.fence_alt_max_m) in drone.calls
-    assert ("set_param", "FENCE_ENABLE", 1) in drone.calls
-
-
 def test_timed_camera_finds_after_time():
     assert TimedCamera(detected_after_s=1000.0).get_target_offset()["detected"] is False
     offset = TimedCamera(detected_after_s=0.0).get_target_offset()
@@ -518,34 +489,6 @@ def test_pilot_override_stops_without_commanding_anything():
     # The decisive assertion: we did NOT override the human.
     assert "land" not in drone.actions()
     assert "return_to_launch" not in drone.actions()
-
-
-def test_safety_envelope_is_enforced_before_flight():
-    """The FC defaults are built for open sky: WPNAV_SPEED_UP 250 cm/s overshoots a
-    2 m takeoff, WPNAV_SPEED 1000 cm/s crosses a hall in a second, and RTL climbs to
-    15 m. Indoors all three are wrong, so the companion sets its own limits."""
-    config = Config.sitl()
-    drone = FakeDrone(config)
-    _build_mission(drone, config).run()
-
-    assert ("set_param", "WPNAV_SPEED_UP", config.climb_rate_cms) in drone.calls
-    assert ("set_param", "WPNAV_SPEED", config.cruise_speed_cms) in drone.calls
-    assert ("set_param", "RTL_ALT", config.rtl_alt_m * 100.0) in drone.calls  # cm on 4.6
-    # FENCE_ACTION is NOT part of the envelope any more: meaningless with the fence off,
-    # and writing it left an unrestored change on the FC. It moved to setup_geofence().
-    assert not any(c[0] == "set_param" and c[1].startswith("FENCE_") for c in drone.calls)
-
-
-def test_rtl_altitude_falls_back_to_the_newer_parameter_name():
-    """RTL_ALT (cm) was renamed to RTL_ALT_M (m) in ArduPilot 4.7. Setting the wrong
-    one is not an error - the autopilot ignores unknown parameters and silently keeps
-    its 15 m default - so we try both."""
-    config = Config.sitl()
-    drone = FakeDrone(config, unknown_params={"RTL_ALT"})   # pretend firmware >= 4.7
-    _build_mission(drone, config).run()
-
-    assert ("set_param", "RTL_ALT", config.rtl_alt_m * 100.0) not in drone.calls
-    assert ("set_param", "RTL_ALT_M", config.rtl_alt_m) in drone.calls
 
 
 def test_battery_sag_needs_several_samples_before_aborting():
@@ -951,27 +894,6 @@ def test_position_guard_can_be_disabled():
     assert mission.failsafe.position_implausible() is None
 
 
-def test_safety_envelope_limits_horizontal_speed_too():
-    """WPNAV_SPEED caps how fast a diverging estimate can be chased. The firmware
-    default is 1000 cm/s - a hall crossed in under a second."""
-    config = Config.sitl()
-    drone = FakeDrone(config)
-    mission = _build_mission(drone, config)
-
-    mission.run()
-
-    sets = [c for c in drone.calls if c[0] == "set_param"]
-    assert ("set_param", "WPNAV_SPEED", config.cruise_speed_cms) in sets
-    assert ("set_param", "WPNAV_SPEED_UP", config.climb_rate_cms) in sets
-    # And the FC's own values come back on exit - the envelope must not outlive the
-    # run any more than the fence may (the crash fence was exactly such a leftover).
-    final = {c[1]: c[2] for c in sets}
-    assert final["WPNAV_SPEED"] == 1000.0
-    assert final["WPNAV_SPEED_UP"] == 250.0
-    assert final["RTL_ALT"] == 1500.0
-    assert not os.path.exists(config.param_backup_file)
-
-
 def test_every_milestone_is_a_coherent_stage():
     """Each milestone must add exactly one unknown to the previous one."""
     from main import make_config, MILESTONES
@@ -1032,51 +954,6 @@ def test_pilot_takeover_during_approach_stops_the_companion():
     assert mission.abort_reason == "MODE_CHANGED_LOITER"
     assert "drop" not in drone.actions()     # never released after the takeover
     assert "land" not in drone.actions()     # and never fought the pilot with a mode
-
-
-def test_geofence_is_restored_on_every_exit_path():
-    """Fence parameters live in the FC and outlive the script. A 4 m 'Always Land'
-    fence left behind lands the next MANUAL flight, minutes later, with no visible
-    connection to the companion run that set it."""
-    config = Config.sitl()
-    config.geofence_enable = True      # off by default indoors, see config.py
-    drone = FakeDrone(config)
-    mission = _build_mission(drone, config)
-
-    mission.run()
-
-    sets = [c for c in drone.calls if c[0] == "set_param"]
-    # It was enabled for the mission - including FENCE_ACTION, the parameter whose
-    # unrestored leftover caused the 2026-08-21 crash ...
-    assert ("set_param", "FENCE_ENABLE", 1) in [(c[0], c[1], int(c[2])) for c in sets]
-    assert ("set_param", "FENCE_ACTION", config.fence_action) in sets
-    # ... and the FC's own values were put back afterwards.
-    final = {}
-    for c in sets:
-        final[c[1]] = c[2]
-    assert final["FENCE_ENABLE"] == 0.0
-    assert final["FENCE_TYPE"] == 7.0
-    assert final["FENCE_ALT_MAX"] == 120.0
-    assert final["FENCE_ACTION"] == 1.0
-    # Everything restored -> the on-disk backup must be gone.
-    assert not os.path.exists(config.param_backup_file)
-
-
-def test_geofence_is_restored_even_when_the_mission_crashes():
-    config = Config.sitl()
-    config.geofence_enable = True
-    drone = FakeDrone(config)
-    mission = _build_mission(drone, config)
-
-    def explode(*_args, **_kwargs):
-        raise RuntimeError("something went wrong mid-flight")
-
-    drone.takeoff = explode
-    with pytest.raises(RuntimeError):
-        mission.run()
-
-    final = {c[1]: c[2] for c in drone.calls if c[0] == "set_param"}
-    assert final["FENCE_ENABLE"] == 0.0     # restored despite the crash
 
 
 # ======================================================================
@@ -1161,23 +1038,37 @@ def test_takeover_goes_straight_to_the_stage_under_test():
     assert "takeoff" not in drone.actions()
 
 
-def test_geofence_is_off_by_default_indoors():
-    """Not a preference - a result. A barometric altitude fence sized for an indoor
-    hover sits inside its own sensor's noise band: propeller downwash spiked BAlt to
-    4-6.7 m in all five of our flight logs while the aircraft was centimetres off the
-    floor. With FENCE_ACTION=2 that forced the vehicle out of the pilot's mode into
-    LAND on every single takeoff - and once into the ceiling."""
-    for config in (Config(), Config.pi(), Config.sitl(), Config.pi_serial()):
-        assert config.geofence_enable is False
+def test_companion_writes_no_fc_parameters_by_default():
+    """THE DOCTRINE TEST (team decision 2026-08-24, parameter ownership). A default
+    mission must reach the FC without writing a single parameter: Mission Planner plus
+    params/flight_v2.param are the one source of truth, and the companion verifies
+    read-only. The 2026-08-21 crash fence was exactly a companion-written parameter that
+    outlived its run - this test pins that this cannot happen on the default path.
 
-
-def test_geofence_untouched_when_disabled():
-    """If we do not enable it, we must not write - and not 'restore' - anything.
-    (The one exception is a STALE fence from an earlier run, tested below; with a
-    clean FC like this one, no FENCE_* write may happen at all.)"""
-    config = Config.sitl()
-    assert config.geofence_enable is False
+    (FcServo.configure_drop_servo goes through drone.set_param on the REAL Drone but
+    through FakeDrone.configure_drop_servo here, so it shows up as a 'configure_drop_servo'
+    call, never a 'set_param' one - which is why we assert on set_param specifically.)"""
+    config = Config.sitl()   # all defaults: the companion writes no FC parameter
     drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason is None
+    assert not any(c[0] == "set_param" for c in drone.calls)   # ZERO FC parameter writes
+    assert "drop" in drone.actions()                           # and the mission still flew
+
+
+def test_fence_verify_leaves_a_disabled_fence_untouched():
+    """A clean FC with the fence disabled: verify_fence_disabled() reads FENCE_ENABLE,
+    finds it 0, and writes nothing at all. Since the 2026-08-24 ownership decision the
+    companion never writes FC parameters on the normal path - not the fence, not the
+    envelope. (A STALE fence found on the FC is a separate case, tested below: the
+    companion refuses to fly rather than writing to clear it.)"""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    assert drone.params_before["FENCE_ENABLE"] == 0.0   # fence off on the FC
     mission = _build_mission(drone, config)
 
     mission.run()
@@ -1186,44 +1077,24 @@ def test_geofence_untouched_when_disabled():
     assert not any(name.startswith("FENCE_") for name in written)
 
 
-def test_stale_fence_from_an_earlier_run_is_disarmed():
+def test_stale_fence_from_an_earlier_run_refuses_to_fly():
     """The 2026-08-21 crash fence was a LEFTOVER: written by an earlier companion run,
-    never restored (battery pulls), then armed during a manual flight. With the fence
-    now off by default, the companion must still notice such a leftover and disarm it -
-    touching only the ENABLE bit, nothing else."""
+    never restored (battery pulls), then armed during a manual flight. Detection still
+    earns its keep - but per the 2026-08-24 ownership decision the companion no longer
+    WRITES FENCE_ENABLE=0 to clear it. It REFUSES TO FLY instead and tells the operator
+    to disable the fence in Mission Planner. No parameter is written at all."""
     config = Config.sitl()
-    assert config.geofence_enable is False
     drone = FakeDrone(config)
     drone.params_before["FENCE_ENABLE"] = 1.0     # the leftover, as the FC reports it
     mission = _build_mission(drone, config)
 
     mission.run()
 
-    sets = [(c[1], c[2]) for c in drone.calls if c[0] == "set_param"]
-    assert ("FENCE_ENABLE", 0) in sets
-    # Only the enable bit - shape and action stay for the owner to inspect.
-    assert not any(name in ("FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_ACTION")
-                   for name, _ in sets)
-
-
-def test_leftover_backup_from_a_killed_run_is_restored_first():
-    """A battery pull ends the process without restore_params(). The on-disk backup
-    survives, and the NEXT run must put those values back BEFORE snapshotting its own
-    baseline - otherwise it would adopt the leftovers as 'before' values."""
-    config = Config.sitl()
-    config.param_backup_file = os.path.join(tempfile.mkdtemp(), "fc_params_backup.json")
-    with open(config.param_backup_file, "w") as fh:
-        json.dump({"WPNAV_SPEED": 1000.0}, fh)    # what the killed run had saved
-    drone = FakeDrone(config)
-    mission = _build_mission(drone, config)
-
-    mission.run()
-
-    sets = [(c[1], c[2]) for c in drone.calls if c[0] == "set_param"]
-    # Restored first, then this run's own envelope value was applied.
-    assert sets.index(("WPNAV_SPEED", 1000.0)) < sets.index(("WPNAV_SPEED", config.cruise_speed_cms))
-    # And this run cleaned up after itself again.
-    assert not os.path.exists(config.param_backup_file)
+    assert mission.state is State.DONE
+    assert mission.abort_reason == "UNEXPECTED_FENCE_ENABLED"
+    assert "arm" not in drone.actions()           # never armed on a stale fence
+    # The companion writes nothing - not to clear the fence, not anything else.
+    assert not any(c[0] == "set_param" for c in drone.calls)
 
 
 def test_continuous_cadence_counts_unreached_waypoints():

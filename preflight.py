@@ -17,17 +17,26 @@ Run it, then try to arm with the transmitter. Whatever the autopilot objects to 
 appear here, verbatim.
 """
 
+import os
 import sys
 import time
 
 from pymavlink import mavutil
 
 from config import Config
+from fctools import read_param, wait_for_vehicle
+
+# Where the documented, versioned flight parameter set lives by default. Per the
+# 2026-08-24 ownership decision the FC parameters have exactly one source of truth
+# (Mission Planner + this published file), and this tool VERIFIES the live FC against
+# it read-only. Kept relative to the script so it works from any working directory.
+DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "params", "flight_v2.param")
 
 # Grouped so the output reads like a checklist rather than a parameter dump.
 GROUPS = {
     "Pre-arm checks (reading only - this tool never arms anything)": ["ARMING_CHECK"],
-    "Geofence (the companion sets these - are they still ours?)": [
+    "Geofence (read-only - the companion never sets these; it refuses to fly if one is armed)": [
         "FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_ACTION",
     ],
     "Battery failsafe (latches until the FC is power-cycled)": [
@@ -35,16 +44,21 @@ GROUPS = {
         "BATT_FS_CRT_ACT", "BATT_CAPACITY",
     ],
     "Other failsafes": ["FS_GCS_ENABLE", "FS_GCS_TIMEOUT", "FS_THR_ENABLE", "FS_EKF_ACTION"],
-    "Navigation limits (the companion sets these too)": [
+    "Navigation limits (read-only - verified against the documented flight set)": [
         "WPNAV_SPEED", "WPNAV_SPEED_UP", "RTL_ALT",
     ],
     "Position sensors": [
         "SERIAL5_PROTOCOL", "SERIAL5_BAUD", "FLOW_TYPE", "FLOW_ORIENT_YAW",
         "RNGFND1_TYPE", "RNGFND1_MIN_CM", "RNGFND1_MAX_CM", "RNGFND1_ORIENT",
+        "RNGFND1_GNDCLEAR",
     ],
     "EKF sources": [
         "AHRS_EKF_TYPE", "EK3_SRC1_POSXY", "EK3_SRC1_VELXY", "EK3_SRC1_POSZ",
         "EK3_SRC1_VELZ", "EK3_SRC1_YAW",
+    ],
+    "Flight modes (switch mapping)": [
+        "FLTMODE_CH", "FLTMODE1", "FLTMODE2", "FLTMODE3", "FLTMODE4", "FLTMODE5",
+        "FLTMODE6",
     ],
 }
 
@@ -57,42 +71,59 @@ EKF_FLAGS = [
 
 
 
-def wait_for_vehicle(master, timeout=30):
-    """Wait for a heartbeat FROM THE AUTOPILOT, not from whatever speaks first.
+def load_expected(path):
+    """Parse a documented parameter file into {NAME: float}, tolerantly.
 
-    pymavlink's wait_heartbeat() returns on the first heartbeat of any kind. Over
-    mavlink-router that can be a ground station or another tool, and then
-    target_system stays 0 - every later parameter request goes to nobody and the
-    script simply hangs. drone.py has guarded against this for a while; these
-    diagnostic tools had not.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        master.wait_heartbeat(timeout=2)
-        if master.target_system != 0:
-            return True
-    print("\nNo autopilot heartbeat - target_system stayed 0.")
-    print("Something is on the link, but nothing that identifies itself as a vehicle.")
-    print("Check that:")
-    print("  * the flight controller is powered (USB or battery),")
-    print("  * mavlink-router is running:  systemctl status mavlink-router")
-    print("  * it actually sees the FC:    journalctl -u mavlink-router -n 20")
-    return False
+    Mission Planner and ArduPilot tooling emit several shapes of the same thing:
+    `NAME,VALUE` (our flight_v2.param), `NAME VALUE` or `NAME\tVALUE`, sometimes with a
+    trailing comment. Blank lines and `#`/`//` comments are skipped. A line whose value
+    is not a number is skipped rather than aborting the whole check - the goal is a
+    best-effort comparison, not a strict parser. Returns None if the file is absent."""
+    if not path or not os.path.exists(path):
+        return None
+    expected = {}
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith("//"):
+                continue
+            parts = line.replace(",", " ").replace("\t", " ").split()
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            try:
+                expected[name] = float(parts[1])
+            except ValueError:
+                continue
+    return expected
 
-def read_param(master, name, tries=3, timeout=1.5):
-    for _ in range(tries):
-        master.mav.param_request_read_send(
-            master.target_system, master.target_component, name.encode(), -1)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=timeout)
-            if msg and msg.param_id == name:
-                return msg.param_value
-    return None
+
+def _expected_path_from_argv(argv):
+    """--expected PATH, defaulting to params/flight_v2.param next to this script."""
+    if "--expected" in argv:
+        i = argv.index("--expected")
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return DEFAULT_EXPECTED
 
 
 def main():
-    config = Config.sitl() if ("--sim" in sys.argv or "--sitl" in sys.argv) else Config.pi()
+    sim = "--sim" in sys.argv or "--sitl" in sys.argv
+    config = Config.sitl() if sim else Config.pi()
+
+    # Read-only verification against the documented flight parameter set (team decision
+    # 2026-08-24: Mission Planner + params/flight_v2.param are the single source of
+    # truth). A missing file downgrades to "no verification", never a crash.
+    expected_path = _expected_path_from_argv(sys.argv)
+    expected = load_expected(expected_path)
+    if expected is None:
+        print(f"Note: no expected parameter file at {expected_path} - skipping the "
+              f"read-only comparison against the documented flight set.\n")
+    else:
+        print(f"Verifying against {expected_path} ({len(expected)} documented "
+              f"parameters).\n")
+    mismatches = []   # (name, live_value, expected_value)
+    checked = 0
     print(f"Connecting to {config.connection_string} ...")
     master = mavutil.mavlink_connection(config.connection_string, source_system=252)
     wait_for_vehicle(master) or sys.exit(1)
@@ -111,8 +142,38 @@ def main():
     for title, names in GROUPS.items():
         print(f"--- {title} ---")
         for name in names:
-            value = read_param(master, name)
-            print(f"  {name:20s} = {'--- not present ---' if value is None else round(value, 4)}")
+            # tries/timeout kept at preflight's historical 3/1.5 (fctools defaults to 4/2.0).
+            value = read_param(master, name, tries=3, timeout=1.5)
+            shown = "--- not present ---" if value is None else round(value, 4)
+            suffix = ""
+            # Compare against the documented set when we have both a live reading and an
+            # expected value. FLTMODE is deliberately NOT special-cased: v2 still carries
+            # 0 there, and a MISMATCH against a transmitter that has been remapped is
+            # exactly the point of the feature (v3 will carry the real mapping).
+            if expected is not None and name in expected and value is not None:
+                checked += 1
+                if abs(value - expected[name]) <= 1e-4:
+                    suffix = "   ok"
+                else:
+                    suffix = f"   EXPECTED {round(expected[name], 4)} <-- MISMATCH"
+                    mismatches.append((name, value, expected[name]))
+            print(f"  {name:20s} = {shown}{suffix}")
+        print()
+
+    # --- read-only verdict against the documented flight set --------------------
+    if expected is not None:
+        print("--- Parameter verification (read-only) ---")
+        print(f"  Checked {checked} documented parameter(s); {len(mismatches)} mismatch(es).")
+        if mismatches:
+            print("  !! The FC differs from the documented flight set "
+                  f"({os.path.basename(expected_path)}). Per the 2026-08-24 ownership")
+            print("  !! decision the companion does NOT write these. Either change the FC")
+            print("  !! back via Mission Planner, or capture the aircraft and publish a")
+            print("  !! new versioned param file. Differing parameters:")
+            for name, live, want in mismatches:
+                print(f"       {name:20s} FC={round(live, 4)}  documented={round(want, 4)}")
+        else:
+            print("  -> the FC matches the documented flight set.")
         print()
 
     # --- live state -----------------------------------------------------
@@ -182,21 +243,28 @@ def main():
                 state = "ok"
             print(f"    {label:14s} {state}")
         if (present & 0x08) and not (health & 0x08):
-            print("\n  !! THE BAROMETER IS UNHEALTHY. ArduPilot needs it for altitude in")
-            print("  !! every mode. Do not fly. And note that EK3_SRC1_POSZ = 1 (baro) is")
-            print("  !! then NOT an available fallback for the rangefinder either.")
+            print("\n  !! THE BAROMETER IS UNHEALTHY. It is not the EKF height source here")
+            print("  !! (the rangefinder is, by assignment), but it is our independent")
+            print("  !! altitude witness/reference - and stock 4.6.3 will not even boot")
+            print("  !! without it. Do not fly.")
 
     # --- is the height estimate stable while standing still? ----------------
-    # In the 2026-08-21 crash log the EKF altitude did not drift gently - it diverged
-    # QUADRATICALLY, exactly like an inertial system with no height measurement at
-    # all: -268 m ninety seconds after boot, -1070 m at the moment of arming three
+    # This drift line is the ground GO/NO-GO gate, and the crash chain behind it is
+    # unchanged: in the 2026-08-21 crash log the EKF altitude did not drift gently - it
+    # diverged QUADRATICALLY, exactly like an inertial system with no height measurement
+    # at all: -268 m ninety seconds after boot, -1070 m at the moment of arming three
     # minutes in, with the EKF "climb rate" at -12.6 m/s while the aircraft stood
-    # motionless on the floor. EK3_SRC1_POSZ pointed at the rangefinder, EKF3 never
-    # fused a single height measurement from it, and the barometer was not a
-    # configured source - so the filter integrated accelerometer bias unchecked.
-    # Even the first seconds of that are visible from the ground, which is what
-    # this check is for.
-    baro_ok = bool(sensors) and bool(sensors[0] & 0x08) and bool(sensors[2] & 0x08)
+    # motionless on the floor. EK3_SRC1_POSZ pointed at the rangefinder and EKF3 fused
+    # not a single height measurement from it, so the filter integrated accelerometer
+    # bias unchecked. What the 2026-08-25 SITL work refined is only WHY nothing was
+    # fused: the RNGFND1_MIN_CM validity floor. A landed reading below that floor is
+    # flagged out-of-range-low, the driver hands the EKF nothing, and with the
+    # rangefinder as the only height source there is nothing to correct the vertical
+    # estimate. In SITL that is provably the blocker (the landed reading is 0.00 m, below
+    # any non-zero MIN_CM); on the real aircraft the landed reading of 0.02 m sits one
+    # centimetre above a 0.01 m (MIN_CM 1) floor, so the same mechanism is the leading
+    # hypothesis pending the colleague diff. Even the first seconds of that divergence
+    # are visible from the ground, which is what this check is for.
     if len(altitudes) >= 5 and not armed_seen:
         span = max(a for _, a in altitudes) - min(a for _, a in altitudes)
         seconds = altitudes[-1][0] - altitudes[0][0]
@@ -217,30 +285,61 @@ def main():
         # MTF-01P sits a couple of centimetres above the floor and that IS the
         # distance. (We once mis-read this as a frozen/defective sensor - the crash
         # logs later showed it tracking the fatal climb 0.02 -> 4.94 m perfectly.)
-        # The dangerous thing is the PAIRING with EK3_SRC1_POSZ = 2: EKF3 then has the
-        # rangefinder as its ONLY height source, and in all five of our flight logs it
-        # never fused a single height measurement from it - the vertical estimate ran
-        # away quadratically (see the drift check above) until a fence-forced LAND flew
-        # the aircraft into the ceiling at full throttle on 2026-08-21.
-        posz = read_param(master, "EK3_SRC1_POSZ")
+        # With EK3_SRC1_POSZ = 2 the rangefinder is the EKF's ONLY height source, and in
+        # all five of our flight logs EKF3 never fused a single height measurement from
+        # it - the vertical estimate ran away quadratically (see the drift check above)
+        # until a fence-forced LAND flew the aircraft into the ceiling at full throttle on
+        # 2026-08-21. The 2026-08-25 SITL work showed the non-fusion is NOT the POSZ=2
+        # source choice itself but the RNGFND1_MIN_CM validity floor rejecting the landed
+        # reading: below the floor the driver reports out-of-range-low and the EKF gets
+        # nothing. Proven in SITL; the leading hypothesis on the real aircraft, whose
+        # 0.02 m landed reading clears a 0.01 m (MIN_CM 1) floor by a single centimetre.
+        posz = read_param(master, "EK3_SRC1_POSZ", tries=3, timeout=1.5)
         if posz is not None and abs(posz - 2.0) < 0.1:
             print("\n  !! EK3_SRC1_POSZ = 2: the rangefinder is the EKF's ONLY height source.")
-            print("  !! This is the configuration of the 2026-08-21 crash: the EKF never")
-            print("  !! fused a height, the vertical estimate diverged on the ground, and")
-            print("  !! the first altitude-controlled mode (a fence-forced LAND) went to")
-            print("  !! full throttle. Watch the altitude-drift line above - if it is")
-            print("  !! running away while the aircraft stands still, DO NOT FLY.")
-            if baro_ok:
-                print("  !! Use the healthy barometer as the height source instead:")
-                print("  !!     python setparam.py EK3_SRC1_POSZ 1 --reboot")
-            else:
-                print("  !! The usual fix is EK3_SRC1_POSZ = 1 (barometer) - but THIS FC's")
-                print("  !! barometer is not healthy (see sensor health above), so that")
-                print("  !! fallback does not exist until the baro/I2C problem is repaired.")
+            print("  !! This is REQUIRED - the assignment mandates the rangefinder as the")
+            print("  !! height source; the barometer is NOT a permitted EKF source. It is")
+            print("  !! MANDATED AND WORKING: milestone 1 flew fully green under POSZ=2 in")
+            print("  !! SITL (2026-08-25). It was ALSO the configuration of the 2026-08-21")
+            print("  !! crash (the EKF fused no height, the vertical estimate diverged on")
+            print("  !! the ground, a fence-forced LAND went to full throttle) - but the")
+            print("  !! 2026-08-25 SITL work showed the blocker was the RNGFND1_MIN_CM")
+            print("  !! validity floor rejecting the landed reading, NOT POSZ=2 itself. So")
+            print("  !! it flies under the safety protocol, and the altitude-drift line")
+            print("  !! above is the GO/NO-GO gate: drifting on the ground = the EKF is")
+            print("  !! fusing no height = DO NOT FLY. If it drifts, check RNGFND1_MIN_CM")
+            print("  !! (the validity floor - the landed reading must clear it; SITL proved")
+            print("  !! this, and ours clears a 0.01 m floor by only 1 cm) and")
+            print("  !! RNGFND1_GNDCLEAR (the expected on-ground reading in cm - ours is ~2),")
+            print("  !! and run the parameter diff against the colleague team's working")
+            print("  !! POSZ=2 aircraft. Before the first flight of a session, do the")
+            print("  !! hand-lift test: the EKF altitude must follow a real lift (fclog.py")
+            print("  !! shows it).")
     if flow_q:
         print(f"  Optical flow: {len(flow_q)} messages, quality min={min(flow_q)} max={max(flow_q)}")
     else:
         print("  Optical flow: no messages")
+
+    # No rangefinder AND no flow, on the simulator, is almost never a broken sensor: it
+    # is a fresh or wiped SITL still at firmware defaults (RNGFND1_TYPE=0, FLOW_TYPE=0)
+    # that never had the indoor profile loaded - the exact state that aborts a mission
+    # with NO_RANGEFINDER_DATA and gives no hint the fix is one line in this console.
+    # (Only for --sim/--sitl: on the real FC a dead stream is a hardware fault, not a
+    # forgotten param file.)
+    if sim and not rng and not flow_q:
+        print("\n  Neither the rangefinder nor optical flow produced a single message. On")
+        print("  SITL that is almost always a fresh or wiped simulator still at firmware")
+        print("  defaults (RNGFND1_TYPE=0, FLOW_TYPE=0), not a broken sensor. Load the")
+        print("  SITL mirror of the flight set in the MAVProxy console. Load it")
+        print("  TWICE: the RNGFND1_* sub-parameters only exist after the first pass sets")
+        print("  RNGFND1_TYPE and the FC reboots, so on pass one the alphabetically-earlier")
+        print("  RNGFND1_GNDCLEAR/MAX_CM/MIN_CM lines are discarded as unknown:")
+        print("      param load params/sitl_flight_v2.parm")
+        print("      reboot")
+        print("      param load params/sitl_flight_v2.parm")
+        print("      reboot")
+        print("  (see params/README.md, incl. the SIM_TERRAIN trap that pins the")
+        print("  rangefinder at a constant 0.00 m.)")
     if ekf_flags is not None:
         print(f"  EKF flags = 0x{ekf_flags:04x}")
         for bit, label in EKF_FLAGS:

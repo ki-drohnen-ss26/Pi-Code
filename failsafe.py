@@ -8,16 +8,22 @@ dangerous (never armed, or the FC has left our mode) and otherwise hands off to
 RECOVER - which LANDS by default. RTL only when config.recovery_action says so; it
 climbs to RTL_ALT first, which indoors is the ceiling.
 
-Note: this is it's own abort logic on the companion side. It is independent of
+Note: this is its own abort logic on the companion side. It is independent of
 ArduPilot's internal failsafes (BATT_LOW_VOLT, FS_*). Both can - and should -
 coexist.
+
+FC PARAMETER OWNERSHIP (team decision 2026-08-24): the companion no longer WRITES
+any FC parameter - Mission Planner plus the published params/flight_v2.param are the
+one source of truth, and this monitor VERIFIES them read-only. The fence, the
+envelope limits (WPNAV_*, RTL_ALT) and their values all live in
+params/flight_v2.param now. verify_fence_disabled() is what remains of the old
+set->restore fence machinery: a read-only check that refuses to fly when a fence
+this run did not ask for is armed.
 """
 
-import json
 import logging
 import math
 import time
-from pathlib import Path
 from typing import Optional
 
 from config import Config
@@ -37,156 +43,6 @@ class FailsafeMonitor:
         self._battery_lows: int = 0      # consecutive readings below the threshold
         self._alt_disagrees: int = 0     # consecutive EKF-vs-rangefinder mismatches
         self._mode_monitored: bool = False  # armed by watch_mode() once we set GUIDED
-        # FC values as they were BEFORE this run changed them, for restore_params().
-        # Mirrored to a file on disk: parameters live in the flight controller and
-        # outlive this process, so a kill/battery-pull must not lose the baseline.
-        self._params_before: dict = {}
-        self._backup_path = (Path(config.param_backup_file) if config.param_backup_file
-                             else Path(config.log_dir) / "fc_params_backup.json")
-
-    # ------------------------------------------------------------------
-    # FC parameter bookkeeping: remember -> set -> restore, crash-safe
-    # ------------------------------------------------------------------
-    def recover_stale_params(self) -> None:
-        """Restore FC parameters a PREVIOUS run changed but never put back.
-
-        restore_params() runs on every exit path of this process - but a battery
-        pull, a kill -9 or a Pi brownout ends the process without it, and the FC
-        then keeps the mission's fence/limits forever (parameters are persistent).
-        That is exactly how the fence that caused the 2026-08-21 crash came to be
-        armed during a MANUAL flight: a companion run wrote it and died before the
-        restore. So every run starts by checking the on-disk backup and putting
-        any leftover values back first - BEFORE snapshotting its own baseline.
-        """
-        if not self._backup_path.exists():
-            return
-        try:
-            stale = json.loads(self._backup_path.read_text())
-        except (OSError, ValueError) as exc:
-            log.warning(f"[FAILSAFE] Unreadable param backup {self._backup_path}: {exc}")
-            return
-        if not stale:
-            self._unlink_backup()
-            return
-        log.warning(f"[FAILSAFE] A previous run left changed FC parameters behind - "
-                    f"restoring: {stale}")
-        failed = self._write_params(stale)
-        if failed:
-            self._persist(failed)   # keep what we could not restore for the next try
-        else:
-            self._unlink_backup()
-
-    def _remember_and_set(self, name: str, value: float) -> bool:
-        """Read + record the FC's current value, then write the new one.
-
-        Returns True when the write was confirmed. A parameter the firmware does
-        not know (read and write both fail) is a warning, not an abort - the
-        firmware then simply keeps its default. The baseline is only recorded
-        after a successful write, so restore never touches a parameter this run
-        did not actually change."""
-        known = name in self._params_before
-        before = None if known else self.drone.read_param(name)
-        try:
-            self.drone.set_param(name, value)
-        except TimeoutError:
-            log.warning(f"[FAILSAFE] {name} not accepted - it keeps the firmware default")
-            return False
-        if not known:
-            if before is not None:
-                self._params_before[name] = before
-                self._persist(self._params_before)
-            else:
-                log.warning(f"[FAILSAFE] {name} was set, but its previous value could "
-                            f"not be read - it will NOT be restored on exit")
-        return True
-
-    def _remember_and_set_strict(self, name: str, value: float) -> None:
-        """Like _remember_and_set, but refuses to proceed without a restorable
-        baseline, and lets an unconfirmed write propagate. Used for the fence:
-        an altitude fence with a mode-change action is a behaviour change for the
-        NEXT (possibly manual) flight, so 'set but cannot restore' is exactly the
-        booby trap that caused the 2026-08-21 crash. Failing here happens on the
-        ground, before arming, which is where this failure belongs."""
-        if name not in self._params_before:
-            before = self.drone.read_param(name)
-            if before is None:
-                raise RuntimeError(
-                    f"Could not read {name} from the FC - refusing to change a fence "
-                    f"parameter whose previous value cannot be restored")
-            self._params_before[name] = before
-            self._persist(self._params_before)
-        self.drone.set_param(name, value)   # TimeoutError propagates on purpose
-
-    def _write_params(self, values: dict) -> dict:
-        """Write a set of parameters; returns the ones that failed.
-        FENCE_ENABLE=0 goes first so a fence is disarmed before its shape changes."""
-        failed = {}
-        names = sorted(values, key=lambda n: 0 if (n == "FENCE_ENABLE" and not values[n]) else 1)
-        for name in names:
-            try:
-                self.drone.set_param(name, values[name])
-            except TimeoutError:
-                failed[name] = values[name]
-                log.warning(f"[FAILSAFE] Could not restore {name} to {values[name]}. "
-                            f"The FC may still carry this run's value - check before "
-                            f"flying manually.")
-        return failed
-
-    def _persist(self, values: dict) -> None:
-        try:
-            self._backup_path.parent.mkdir(parents=True, exist_ok=True)
-            self._backup_path.write_text(json.dumps(values))
-        except OSError as exc:
-            log.warning(f"[FAILSAFE] Could not write the param backup "
-                        f"{self._backup_path}: {exc}")
-
-    def _unlink_backup(self) -> None:
-        try:
-            self._backup_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    # ------------------------------------------------------------------
-    # FC-side safety envelope (set once before the mission)
-    # ------------------------------------------------------------------
-    def setup_safety_envelope(self) -> None:
-        """Force the flight-controller limits that make an indoor abort survivable.
-
-        This is NOT our own failsafe logic - it is what the AUTOPILOT does on its own
-        when something goes wrong, and its defaults are built for open sky:
-
-          * FENCE_ACTION defaults to 1 ("RTL or Land"), and RTL first CLIMBS to
-            RTL_ALT (default 1500 cm = 15 m) before returning. In a hall that means
-            flying into the ceiling. We set 2 ("Always Land") plus a low RTL_ALT.
-          * WPNAV_SPEED_UP defaults to 250 cm/s, which overshoots a 2 m takeoff by
-            more than 2 m - enough to breach a low altitude fence on its own.
-
-        We set these before every flight rather than trusting whatever happens to be
-        stored in the FC, because a wiped or freshly flashed board silently reverts to
-        the outdoor defaults.
-        """
-        if not self.config.enforce_safety_envelope:
-            log.warning("[FAILSAFE] Safety envelope DISABLED by config")
-            return
-        # A parameter the firmware does not know must not throw us out of a mission on
-        # the ground, but it MUST be visible: whatever we failed to set is still at the
-        # autopilot's outdoor default. Each write records the FC's previous value first,
-        # so restore_params() can put the envelope back on exit.
-        self._remember_and_set("WPNAV_SPEED_UP", self.config.climb_rate_cms)
-        # Horizontal speed. The firmware default of 1000 cm/s crosses a hall in under a
-        # second and is what turns a diverging position estimate into a flyaway rather
-        # than a slow drift you can watch and take over from.
-        self._remember_and_set("WPNAV_SPEED", self.config.cruise_speed_cms)
-        self._set_rtl_altitude(self.config.rtl_alt_m)
-        # FENCE_ACTION deliberately NOT set here. It is meaningless with the fence off,
-        # and writing it anyway left an unrestored change on the flight controller.
-        # Everything fence-related lives in setup_geofence()/restore_geofence(), so that
-        # what we change is exactly what we put back.
-        log.info(
-            f"[FAILSAFE] Safety envelope: climb<={self.config.climb_rate_cms} cm/s, "
-            f"cruise<={self.config.cruise_speed_cms} cm/s, "
-            f"RTL_ALT={self.config.rtl_alt_m} m"
-        )
 
     # ------------------------------------------------------------------
     # Position-sensor gate (GPS-denied) - run once, before arming
@@ -221,8 +77,10 @@ class FailsafeMonitor:
         )
 
         if r["rangefinder_samples"] == 0:
+            self._hint_fresh_sitl()
             return "NO_RANGEFINDER_DATA"
         if r["flow_samples"] == 0:
+            self._hint_fresh_sitl()
             return "NO_OPTICAL_FLOW_DATA"
 
         # Deliberately NOT an abort: sitting on the floor, a perfectly healthy sensor
@@ -236,6 +94,38 @@ class FailsafeMonitor:
             )
         log.info("[PREARM] Position sensors are streaming")
         return None
+
+    def _hint_fresh_sitl(self) -> None:
+        """Explain the one abort the guard cannot tell apart from a broken sensor.
+
+        NO_RANGEFINDER_DATA / NO_OPTICAL_FLOW_DATA is CORRECT behaviour: without a
+        height and a flow signal a GPS-denied flight would drift away (params/README.md
+        records 366 m of it). But on the SIMULATOR "no samples at all" almost never
+        means a broken sensor - it means a fresh or wiped SITL still at firmware
+        defaults (RNGFND1_TYPE=0, FLOW_TYPE=0, EKF sources still on GPS) that never had
+        the indoor profile loaded. The fix is then a one-liner in the MAVProxy console,
+        not a change in this code - and that is exactly the hint the bare abort reason
+        does not give. Emitted only for the SITL profile (release_mechanism="fc", the
+        same test main.log_profile uses): on the real aircraft ("pi") a dead stream is a
+        genuine hardware fault, and pointing at a param file would be misleading.
+        """
+        if self.config.release_mechanism != "fc":
+            return
+        log.warning(
+            "[PREARM] SITL is streaming no rangefinder/optical-flow data at all - on the "
+            "simulator that is almost always a fresh or wiped SITL still at firmware "
+            "defaults (RNGFND1_TYPE=0, FLOW_TYPE=0), not a broken sensor. Load the SITL "
+            "mirror of the flight set in the MAVProxy console - load it TWICE (the "
+            "RNGFND1_* sub-parameters only exist after the first pass sets RNGFND1_TYPE "
+            "and the FC reboots, so the alphabetically-earlier "
+            "RNGFND1_GNDCLEAR/MAX_CM/MIN_CM are discarded on pass one):\n"
+            "    param load params/sitl_flight_v2.parm\n"
+            "    reboot\n"
+            "    param load params/sitl_flight_v2.parm\n"
+            "    reboot\n"
+            "(see params/README.md, which also documents the SIM_TERRAIN trap that makes "
+            "the rangefinder read a constant 0.00 m.)"
+        )
 
     def verify_rangefinder_tracks_altitude(self, expected_alt_m: float) -> Optional[str]:
         """After the climb, the rangefinder must report roughly the height we are at.
@@ -281,103 +171,43 @@ class FailsafeMonitor:
         log.info("[SENSORS] Rangefinder tracks altitude - position estimate has a height reference")
         return None
 
-    def _set_rtl_altitude(self, metres: float) -> None:
-        """Set the RTL altitude, coping with the 4.6 -> 4.7 parameter rename.
+    # ------------------------------------------------------------------
+    # Geofence (read-only verification before the mission)
+    # ------------------------------------------------------------------
+    def verify_fence_disabled(self) -> Optional[str]:
+        """Refuse to fly when a fence this run did not ask for is armed on the FC.
 
-        ArduPilot 4.5/4.6 has RTL_ALT in CENTIMETRES; 4.7 renamed it to RTL_ALT_M in
-        METRES. Setting the wrong one is not an error - the autopilot simply ignores an
-        unknown parameter, leaving the 15 m default in place. So try the name our
-        flight controller uses first and fall back to the newer one.
+        Read-only by design (team decision 2026-08-24, parameter ownership): the
+        companion no longer WRITES any fence parameter - configuring or clearing a
+        fence is the operator's job in Mission Planner. What remains is the DETECTION,
+        and it earns its keep twice over: the 2026-08-21 crash fence was a leftover
+        from an EARLIER companion run (not the flight it crashed), and on 2026-08-24
+        the FC arrived carrying a Mission-Planner-suggested fence too. Either way an
+        armed fence indoors is a refusal - a barometric altitude fence sits inside its
+        own sensor's noise band near the ground (propeller downwash spikes BAlt to
+        4-6.7 m in our flight logs, centimetres off the floor), and a fence whose
+        action is a mode change turns that bad measurement into a manoeuvre nobody
+        commanded. That is the mechanism of the 2026-08-21 ceiling crash.
+
+        Returns "UNEXPECTED_FENCE_ENABLED" when an unasked-for fence is armed, otherwise
+        None. An unreadable FENCE_ENABLE stays a warning (not an abort): we cannot prove
+        a fence is armed, so we do not block on the guess.
         """
-        if self._remember_and_set("RTL_ALT", metres * 100.0):   # 4.5 / 4.6: centimetres
-            return
-        if not self._remember_and_set("RTL_ALT_M", metres):     # 4.7+: metres
-            log.warning(
-                "[FAILSAFE] Could not set the RTL altitude (neither RTL_ALT nor "
-                "RTL_ALT_M exists) - an RTL may climb to the firmware default"
-            )
-
-    # ------------------------------------------------------------------
-    # Geofence (set once before the mission)
-    # ------------------------------------------------------------------
-    def setup_geofence(self) -> None:
-        if not self.config.geofence_enable:
-            self._check_stale_fence()
-            return
-        # Remember what the fence was BEFORE we touched it, so restore_params() can put
-        # it back. Learned the hard way: these parameters live in the flight controller
-        # and outlive the script. A 4 m "Always Land" fence left enabled turns the next
-        # MANUAL flight into an automatic landing the moment the pilot climbs past it -
-        # from the pilot's seat that looks like a random failsafe, with no connection to
-        # a companion run that ended minutes ago. That is not hypothetical: it is the
-        # mechanism of the 2026-08-21 crash. The strict variant therefore refuses to
-        # write any fence parameter whose previous value it could not read, and an
-        # unconfirmed write ends the mission - on the ground, before arming.
-        #
-        # Set the fence TYPE first (default 1 = max-altitude only, which works without a
-        # horizontal position estimate - indoor-safe), then the altitude, then enable.
-        self._remember_and_set_strict("FENCE_TYPE", self.config.fence_type)
-        self._remember_and_set_strict("FENCE_ALT_MAX", self.config.fence_alt_max_m)
-        self._remember_and_set_strict("FENCE_ACTION", self.config.fence_action)
-        self._remember_and_set_strict("FENCE_ENABLE", 1)
-        log.warning(
-            f"[FAILSAFE] Geofence ENABLED (type={self.config.fence_type}, "
-            f"alt_max={self.config.fence_alt_max_m} m, action={self.config.fence_action}). "
-            f"Note: propeller downwash spikes the BAROMETRIC altitude near the ground - "
-            f"up to 6.7 m in our flight logs - so a low altitude fence will breach on "
-            f"takeoff and FENCE_ACTION will yank the aircraft out of the pilot's mode."
-        )
-        log.info(f"[FAILSAFE] Previous fence saved for restore: "
-                 f"{ {k: v for k, v in self._params_before.items() if k.startswith('FENCE_')} }")
-
-    def _check_stale_fence(self) -> None:
-        """geofence_enable=False means hands off the fence - but not eyes off.
-
-        The 2026-08-21 crash fence was not set by the flight it crashed: it was a
-        leftover from an earlier companion run. With the fence now off by default,
-        nothing would ever notice such a leftover again - so when we do NOT manage
-        the fence ourselves, we at least check the FC is not flying with one that
-        some earlier run forgot. Only the ENABLE bit is touched; the other FENCE_*
-        values are left for the owner to inspect."""
         enable = self.drone.read_param("FENCE_ENABLE")
         if enable is None:
             log.warning("[FAILSAFE] Could not read FENCE_ENABLE - unable to verify "
                         "that no stale fence is armed on the FC")
-            return
+            return None
         if int(enable) == 0:
-            return
+            return None
         details = {name: self.drone.read_param(name)
                    for name in ("FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_ACTION")}
         log.warning(f"[FAILSAFE] The FC arrived with a fence ENABLED that this run did "
                     f"not ask for ({details}) - most likely left behind by an earlier "
-                    f"run that never restored it. Disabling it (FENCE_ENABLE=0); the "
-                    f"other FENCE_* parameters are left unchanged.")
-        try:
-            self.drone.set_param("FENCE_ENABLE", 0)
-        except TimeoutError:
-            log.warning("[FAILSAFE] Could not disable the stale fence - do NOT fly "
-                        "until FENCE_ENABLE has been checked by hand")
-
-    def restore_params(self) -> None:
-        """Put back every FC parameter this run changed. Called on EVERY exit path.
-
-        Not cosmetic: parameters live in the flight controller and outlive this
-        process. A 4 m FENCE_ACTION=2 fence left enabled forces the next MANUAL
-        flight into LAND the moment the barometer spikes past it - that is the
-        verified mechanism of the 2026-08-21 ceiling crash. The on-disk backup is
-        deleted only when everything was restored; whatever failed stays in the
-        file so the next run's recover_stale_params() can try again.
-        """
-        if not self._params_before:
-            return
-        log.info(f"[FAILSAFE] Restoring the FC parameters this run changed: "
-                 f"{self._params_before}")
-        failed = self._write_params(self._params_before)
-        self._params_before = {}
-        if failed:
-            self._persist(failed)
-        else:
-            self._unlink_backup()
+                    f"run, or suggested by Mission Planner. REFUSING TO FLY. The "
+                    f"companion no longer writes FC parameters (team decision "
+                    f"2026-08-24): set FENCE_ENABLE=0 in Mission Planner before flying.")
+        return "UNEXPECTED_FENCE_ENABLED"
 
     # ------------------------------------------------------------------
     # Phase timeout
@@ -418,9 +248,6 @@ class FailsafeMonitor:
             return True
         return False
 
-    # ------------------------------------------------------------------
-    # Combined check: call once per loop iteration
-    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # Mode monitoring
     # ------------------------------------------------------------------

@@ -16,18 +16,17 @@ confined to `Config.sitl()`.
 | `config.py`      | Connection + all parameters (SITL vs. Pi in one place)      |
 | `drone.py`       | Heartbeat, telemetry, basic commands, payload release       |
 | `camera.py`      | Camera interface: `MockCamera`, `ScriptedCamera`, `SimCamera`, `TimedCamera`, `RealCamera` (IMX500) |
-| `failsafe.py`    | Link loss, telemetry loss, battery, phase timeout, geofence |
+| `failsafe.py`    | Link loss, telemetry loss, battery, phase timeout, read-only fence check (`verify_fence_disabled`) |
 | `mission.py`     | State machine — GPS path + indoor SEARCH/APPROACH path      |
 | `release.py`     | Drop mechanism: `FcServo` (servo on FC) / `PiServo` (servo on Pi GPIO) |
 | `search.py`      | Search patterns (expanding spiral / lawnmower) in local NED |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |
-| `preflight.py`   | Read-only FC inspection: parameters, EKF flags, sensor health, EKF-altitude drift check, live `STATUSTEXT`. Run it, then try to arm — the autopilot's own objection appears verbatim |
+| `preflight.py`   | Read-only FC inspection: parameters, EKF flags, sensor health, EKF-altitude drift check, live `STATUSTEXT`. Also **verifies the live FC against the published flight set** (`params/flight_v2.param`, `--expected PATH` to override) and reports every mismatch — the companion no longer writes FC parameters (team decision 2026-08-24), it checks them. Run it, then try to arm — the autopilot's own objection appears verbatim |
 | `setparam.py`    | Set FC parameters with read-back verification (`python setparam.py NAME VALUE [--reboot]`). Refuses to run while armed |
 | `fclog.py`       | Continuous FC recorder (own router endpoint). Logs every `STATUSTEXT`, mode change, arm/disarm and EKF-flag transition, plus a "why did it land" dump before each disarm |
 | `tests/`         | `pytest` unit tests for the mission logic (no SITL needed)  |
-| `params/`        | FC parameter baseline (capture/restore) — see `params/README.md` |
-| `variants/`      | Ready-to-run code+param sets for the ArduCopter **4.8.0-dev** contingencies (with / without barometer) — decision tree in `variants/README.md`. The repo root is the main flavour: stock 4.6.3 with a working baro |
+| `params/`        | The published, versioned flight parameter set (`flight_v2.param`) that **owns** the FC configuration, plus the generated SITL mirror (`sitl_flight_v2.parm`) and the recovered real-FC baseline — see `params/README.md` |
 | `requirements.txt` | Pinned dependencies (pymavlink, pytest)                   |
 | `docs/ARCHITECTURE.md` | Components, relationships & mission flow (Mermaid diagrams) |
 | `docs/SIM_TO_REAL.md`  | Concrete SITL→hardware transition guide + safety checklist |
@@ -117,7 +116,7 @@ Indoor run (default `gps_denied=True`):
 ```
 [FC] ArduPilot flight software 4.6.3
 [ORIGIN] EKF origin confirmed: lat=50.131196 lon=8.692972
-[FAILSAFE] Safety envelope: climb<=50.0 cm/s, cruise<=100.0 cm/s, RTL_ALT=2.0 m
+[IDLE] FC parameters are Mission-Planner-owned (team decision 2026-08-24): the companion verifies them but does not write any. See params/README.md.
 [PREARM] Waiting for relative (optical flow) EKF position estimate ...
 [PREARM] EKF position estimate ready
 [MODE] Mode is now GUIDED
@@ -191,6 +190,15 @@ mode LOITER          # simulates the pilot taking over -> MODE_CHANGED_LOITER,
                      # and the mission must then command NOTHING further
 ```
 
+> **No Ctrl-C parameter-restore drill any more.** The companion no longer writes FC
+> parameters (team decision 2026-08-24 — Mission Planner + `params/flight_v2.param` own
+> them), so there is nothing to restore on exit and the old "kill mid-run, check the
+> parameters were put back" drill is obsolete. The save/restore/backup machinery
+> (`enforce_safety_envelope`, `restore_params()`, the `logs/fc_params_backup.json` mirror)
+> was **deleted on 2026-08-25** — the flight companion now writes no FC flight parameter
+> (its one remaining PARAM_SET is `FcServo`'s SITL-only `SERVO9_FUNCTION=0`), so there is no
+> such drill and no opt-in flag to run it under.
+
 ## Staged bring-up on a new aircraft
 
 The full mission has four unknowns at once — position hold, detector, search pattern,
@@ -198,7 +206,7 @@ release. Each milestone adds exactly **one**, so a failure names its own cause i
 leaving four candidates open:
 
 ```bash
-python main.py --milestone 1   # climb to 1 m, hold, land          → position hold
+python main.py --milestone 1   # climb to 0.8 m, hold, land        → position hold
 python main.py --milestone 2   # same + detector, logging only     → detector
 python main.py --milestone 3   # fly the search pattern            → pattern
 python main.py --milestone 4   # search + detect + centre, no drop → approach
@@ -221,11 +229,11 @@ worse than no rehearsal.
 | 5 | `[DROP] Release confirmed`. |
 
 Milestone 3 flies the spiral, which reaches `search_max_radius_m` **plus one**
-`search_step_m` — 7 m with the defaults. The geofence is **off by default** (a
-barometric altitude fence indoors caused the 2026-08-21 crash — see
-`docs/SIM_TO_REAL.md` §5c), and even enabled it is altitude-only; the only horizontal
-guard is the software check `max_position_radius_m` (15 m), so size the hall (or the
-radius) for that.
+`search_step_m` — 7 m with the defaults. The geofence is **off** in the published flight
+set (a barometric altitude fence indoors caused the 2026-08-21 crash — see
+`docs/SIM_TO_REAL.md` §5c); the companion never writes fence parameters and only checks,
+read-only, that no stale fence is armed. The only horizontal guard is the software check
+`max_position_radius_m` (15 m), so size the hall (or the radius) for that.
 
 ## When something goes wrong: recording the flight controller
 

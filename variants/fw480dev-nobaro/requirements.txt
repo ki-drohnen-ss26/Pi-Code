@@ -1,7 +1,0 @@
-# Runtime + test dependencies for the companion control code.
-# Pinned so SITL on the Mac and the real Raspberry Pi behave identically.
-
-pymavlink==2.4.49   # MAVLink protocol + connection handling (drone.py)
-
-# --- development / test only ---
-pytest>=8.0         # unit tests for the mission state machine (tests/), no SITL needed

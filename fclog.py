@@ -49,6 +49,8 @@ from pathlib import Path
 
 from pymavlink import mavutil
 
+from fctools import wait_for_vehicle
+
 SEVERITY = {0: "EMERGENCY", 1: "ALERT", 2: "CRITICAL", 3: "ERROR",
             4: "WARNING", 5: "NOTICE", 6: "INFO", 7: "DEBUG"}
 
@@ -60,28 +62,6 @@ EKF_FLAGS = [
 ]
 
 
-
-def wait_for_vehicle(master, timeout=30):
-    """Wait for a heartbeat FROM THE AUTOPILOT, not from whatever speaks first.
-
-    pymavlink's wait_heartbeat() returns on the first heartbeat of any kind. Over
-    mavlink-router that can be a ground station or another tool, and then
-    target_system stays 0 - every later parameter request goes to nobody and the
-    script simply hangs. drone.py has guarded against this for a while; these
-    diagnostic tools had not.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        master.wait_heartbeat(timeout=2)
-        if master.target_system != 0:
-            return True
-    print("\nNo autopilot heartbeat - target_system stayed 0.")
-    print("Something is on the link, but nothing that identifies itself as a vehicle.")
-    print("Check that:")
-    print("  * the flight controller is powered (USB or battery),")
-    print("  * mavlink-router is running:  systemctl status mavlink-router")
-    print("  * it actually sees the FC:    journalctl -u mavlink-router -n 20")
-    return False
 
 def describe_ekf(flags: int) -> str:
     return " ".join(name for bit, name in EKF_FLAGS if flags & bit) or "(none)"

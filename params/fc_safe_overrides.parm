@@ -1,8 +1,12 @@
 # Safety overrides for the REAL FC - load AFTER fc_baseline_463_20260821.parm.
 #
 # The baseline is a faithful copy of the aircraft as it crashed on 2026-08-21.
-# These lines override exactly the values the crash analysis (docs/SIM_TO_REAL.md
-# section 5c) identified as causal or unsafe. Load baseline -> load this -> reboot ->
+# These lines move the values the crash analysis (docs/SIM_TO_REAL.md section 5c)
+# identified as causal or unsafe to a safe state - EXCEPT the rangefinder height
+# source (EK3_SRC1_POSZ=2), which the assignment MANDATES and which therefore stays
+# at the crash value by requirement; it is made flyable not by overriding it but by
+# the safety protocol (preflight drift gate, hand-lift fusion proof, --takeover
+# starts, in-flight cross-check). Load baseline -> load this -> reboot ->
 # run `python preflight.py` and read its verdict before anything arms.
 
 # --- The crash quartet -------------------------------------------------------
@@ -11,12 +15,26 @@
 # the companion (failsafe.setup_geofence) manages it explicitly when wanted.
 FENCE_ENABLE,0
 
-# Root cause: rangefinder as the EKF's ONLY height source. EKF3 never fused a
-# height from it and the vertical estimate diverged quadratically on the ground
-# (-1070 m at arming). Barometer primary is the ArduPilot-recommended setup; the
-# rangefinder stays available to the EKF for terrain/low-altitude use.
-# !! Requires a WORKING barometer - stock 4.6.3 will not even boot without one.
-EK3_SRC1_POSZ,1
+# The rangefinder is the EKF's height source because the ASSIGNMENT MANDATES it
+# (rangefinder as height source, POSZ=2); the barometer as the EKF source (POSZ=1)
+# is NOT permitted by the task. This IS the 2026-08-21 crash configuration: EKF3
+# fused no height on the ground, the vertical estimate diverged quadratically
+# (-1070 m at arming) and a fence-forced LAND went to full throttle. It is flyable
+# ONLY under the safety protocol - preflight drift gate before every arming, a
+# hand-lift fusion proof, rangefinder-gated --takeover starts, and the in-flight
+# EKF-vs-rangefinder cross-check - and we are actively investigating why fusion did
+# not engage (a colleague team flies the SAME sensor with POSZ=2 successfully; a
+# full parameter diff against their aircraft is the next step). See
+# docs/SIM_TO_REAL.md section 5c. The barometer stays a WORKING witness/reference
+# (BAlt logged for sanity), and stock 4.6.3 will not even boot without one.
+EK3_SRC1_POSZ,2
+
+# Expected on-ground rangefinder reading in cm: the EKF uses this as the landed
+# reference height. The default 10 did not match our ~2 cm mounting, and that
+# mismatch is a prime suspect in the fusion investigation (the parameter diff with
+# the colleague team is pending; other hot suspects are RNGFND1_MIN_CM and
+# EK3_ALT_M_NSE). Set it to the sensor's real on-ground reading.
+RNGFND1_GNDCLEAR,2
 
 # The crash flight armed with a 1000 m vertical EKF error that an enabled pre-arm
 # check would have refused. 786390 = every check except GPS lock (indoor, no GPS).
@@ -25,6 +43,10 @@ ARMING_CHECK,786390
 
 # 4S Li-Ion: 16.4 V full, 11.2 V empty. The baseline's 12.4 V fires late.
 BATT_LOW_VOLT,12.8
+
+# Low-battery action = Land. The FC arrived with 2 = RTL, which indoors climbs
+# toward the ceiling; 1 matches the failsafe table in the docs (params/README.md).
+BATT_FS_LOW_ACT,1
 
 # --- Recommended, decide per session (uncomment deliberately) ----------------
 # FC-side reaction when the companion falls silent. 5=Land is right for the hall,

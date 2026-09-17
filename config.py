@@ -47,11 +47,15 @@ class Config:
     # ------------------------------------------------------------------
     # Mission / target
     # ------------------------------------------------------------------
-    # Default target = the SITL start point (CMAC, Canberra) slightly offset.
-    # Replace with real coordinates for an actual flight.
+    # target_lat/lon and cruise_alt drive the GPS/outdoor path (ENROUTE -> OVER_TARGET),
+    # which is Phase-1 SITL/GPS shakedown heritage: these are the SITL start point (CMAC,
+    # Canberra) slightly offset, kept so that path still flies against the simulator. The
+    # REAL mission is GPS-denied and navigates in local NED (see gps_denied below), where
+    # the target is FOUND by the camera, not flown to by coordinate - so these values do
+    # not describe a real delivery point and are not meant to be edited into one.
     target_lat: float = -35.36272
     target_lon: float = 149.16523
-    cruise_alt: float = 10.0       # flight altitude in metres (relative to start)
+    cruise_alt: float = 10.0       # GPS-path flight altitude [m] (relative to start)
     arrival_radius_m: float = 1.5  # target counts as reached within this distance
 
     # ------------------------------------------------------------------
@@ -82,39 +86,23 @@ class Config:
     # Only this many consecutive readings below the threshold abort the mission.
     battery_low_samples: int = 3
     phase_timeout_s: float = 60.0       # max duration per mission phase
-
-    # Geofence: DEFAULT OFF INDOORS, and that is the result of an accident, not caution.
-    #
-    # An altitude fence is only as good as the altitude it is fed, and near the ground
-    # the barometer is not usable: propeller downwash raises the local pressure, so the
-    # barometric altitude SPIKES the moment the aircraft comes light on its skids. Every
-    # one of our five flight logs shows it, at ~15 % throttle with the aircraft still
-    # centimetres off the floor:
-    #
-    #     log 1: BAlt 4.05 m     log 3: BAlt 5.26 m     log 5: BAlt 6.73 m on the crash
-    #     log 2: BAlt 4.65 m     log 4: BAlt 4.73 m            takeoff (14.1 m at impact)
-    #
-    # With fence_alt_max_m = 4.0 that breached on EVERY takeoff, and FENCE_ACTION = 2
-    # forced the vehicle out of the pilot's mode into LAND. Twice that ended in an
-    # auto-disarm the pilot had not asked for (and then "Arm: LAND mode not armable"
-    # until the battery was pulled); once, with a diverged EKF altitude, LAND commanded
-    # full throttle and the aircraft hit the ceiling.
-    #
-    # The lesson is not "use a bigger number". It is that a barometric altitude fence
-    # sized for an indoor hover sits inside the noise band of its own sensor, and that a
-    # fence whose action is a MODE CHANGE converts a bad measurement into a manoeuvre
-    # nobody commanded. Enable it only with fence_alt_max_m well above the downwash
-    # spike (> 8 m from our data) and only where that still leaves ceiling clearance.
-    geofence_enable: bool = False
-    # FENCE_TYPE bitmask. 1 = max altitude only — works WITHOUT a horizontal position,
-    # so it is indoor-safe (a circle/polygon fence would need GPS/position). Outdoor you
-    # can add the circle bit (2) / polygon bit (4).
-    fence_type: int = 1
-    # Size the altitude fence to the flight: indoor ~ search_altitude (default 2 m).
-    # NOTE: for the GPS path raise this above cruise_alt (10 m) or it trips on takeoff.
-    fence_alt_max_m: float = 4.0        # max altitude for the fence [m]
     heartbeat_timeout_s: float = 3.0    # no FC heartbeat within this -> LINK_LOSS
     telemetry_max_misses: int = 5       # consecutive missing telemetry reads -> NO_TELEMETRY
+
+    # FENCE / ENVELOPE LIMITS ARE NOT CONFIGURED HERE ANY MORE. Since the 2026-08-24
+    # ownership decision the companion writes NO FC parameter: the fence, the envelope
+    # limits (WPNAV_SPEED, WPNAV_SPEED_UP, RTL_ALT) and their values all live in
+    # params/flight_v2.param, owned by Mission Planner. failsafe.verify_fence_disabled()
+    # only READS the fence and refuses to fly if one is armed. The hard-won reason a
+    # fence is OFF indoors, kept so it does not vanish from the code: an altitude fence
+    # is only as good as the altitude it is fed, and near the ground propeller downwash
+    # spikes the BAROMETRIC altitude (4.05 / 4.65 / 5.26 / 4.73 / 6.73 m across our five
+    # flight logs, centimetres off the floor). A 4 m fence breached on EVERY takeoff, and
+    # FENCE_ACTION=2 forced the vehicle out of the pilot's mode into LAND - twice an
+    # auto-disarm nobody asked for, once (diverged EKF altitude) LAND at full throttle
+    # into the ceiling. A barometric altitude fence sized for an indoor hover sits inside
+    # its own sensor's noise band, and a fence whose action is a MODE CHANGE turns a bad
+    # measurement into a manoeuvre nobody commanded.
 
     # Abort if the FC leaves this mode. The pilot flipping out of GUIDED, a fence
     # breach or an EKF failsafe all change the mode behind our back - from that moment
@@ -130,24 +118,6 @@ class Config:
     # "rtl"  = fly back to the launch point. OUTDOOR ONLY - RTL first CLIMBS to RTL_ALT
     #          before returning, which in a hall means flying into the ceiling.
     recovery_action: str = "land"
-
-    # ------------------------------------------------------------------
-    # FC-side safety envelope (set + verified by the companion before every flight)
-    # ------------------------------------------------------------------
-    # These are NOT companion logic - they are what the autopilot does on its own when
-    # something goes wrong, and its defaults are made for outdoor flight: FENCE_ACTION
-    # defaults to 1 ("RTL or Land") and RTL climbs to RTL_ALT (default 15 m). We set
-    # them explicitly rather than trusting whatever is stored in the FC.
-    enforce_safety_envelope: bool = True
-    fence_action: int = 2           # 2 = Always Land (1 = RTL or Land -> climbs first)
-    rtl_alt_m: float = 2.0          # RTL altitude [m], in case RTL is triggered anyway
-    climb_rate_cms: float = 50.0    # WPNAV_SPEED_UP [cm/s]. The default 250 overshoots
-                                    # a 2 m takeoff by >2 m and trips a low fence.
-    # WPNAV_SPEED [cm/s] - HORIZONTAL speed. The firmware default is 1000 (10 m/s), which
-    # is a hall crossed in under a second. This is also the single most effective brake on
-    # a flyaway: when a diverging position estimate makes the controller chase a huge
-    # error, this caps how fast it can chase it.
-    cruise_speed_cms: float = 100.0
 
     # ------------------------------------------------------------------
     # Flyaway protection (GPS-denied)
@@ -329,7 +299,9 @@ class Config:
     #   imx500-package -i packerOut.zip -o <outdir>    (on the Pi)
     camera_model_path: str = "/home/drone/models/pad/network.rpk"
     camera_labels_path: str = "/home/drone/models/pad/labels.txt"
-    camera_confidence: float = 0.5   # ignore detections below this score
+    camera_confidence: float = 0.7   # ignore detections below this score. SCALE IS 0..1
+                                 # (0.7 = 70 %) - entering 70 here would reject every
+                                 # detection. Team decision 2026-08-24 for the pad .rpk.
     # Which class counts as the landing pad. None = accept any detected class. Set this
     # for a multi-class model: chasing the wrong class is worse than not detecting.
     camera_target_class: int | None = None
@@ -365,10 +337,6 @@ class Config:
     # Logging
     # ------------------------------------------------------------------
     log_dir: str = "logs"          # directory for timestamped mission log files
-    # Where the failsafe mirrors the FC parameters it changed, so a run that dies
-    # (battery pull, kill) can be cleaned up by the NEXT run instead of leaving a
-    # booby-trapped fence on the flight controller. "" = <log_dir>/fc_params_backup.json.
-    param_backup_file: str = ""
 
     # ------------------------------------------------------------------
     # Convenience constructors

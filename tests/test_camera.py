@@ -47,7 +47,8 @@ def _camera(config=None, **fake_kwargs):
 def test_best_detection_picks_highest_score_above_threshold():
     cam, config = _camera(
         boxes=[[0.1, 0.1, 0.3, 0.3], [0.4, 0.4, 0.6, 0.6], [0.0, 0.0, 0.9, 0.9]],
-        scores=[0.6, 0.9, 0.3],          # third is below camera_confidence (0.5)
+        scores=[0.6, 0.9, 0.3],          # camera_confidence is 0.7, so only 0.9 clears it
+                                         # (both 0.6 and 0.3 are below the threshold)
         classes=[0, 0, 0],
     )
     best = cam._best_detection({})

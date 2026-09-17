@@ -3,12 +3,20 @@ setparam.py
 ===========
 Set flight-controller parameters from the Pi, with read-back verification.
 
-    python setparam.py FENCE_ENABLE 0
-    python setparam.py EK3_SRC1_POSZ 1 LOG_DISARMED 1     # several at once
+    python setparam.py LOG_DISARMED 1                      # e.g. capture a debugging session
+    python setparam.py RNGFND1_GNDCLEAR 2 LOG_DISARMED 1  # several at once
     python setparam.py --show FENCE_ENABLE EK3_SRC1_POSZ  # read only, change nothing
     python setparam.py --reboot                            # reboot the FC, change nothing
-    python setparam.py EK3_SRC1_POSZ 1 --reboot            # set, verify, then reboot
+    python setparam.py RNGFND1_GNDCLEAR 2 --reboot         # set, verify, then reboot
     python setparam.py --sim ...                           # against SITL
+
+ROLE: this is a MANUAL OPERATOR tool - a human runs it from a shell as the GCS-equivalent,
+and the mission/companion code never imports or calls it. It is NOT the owner of the flight
+parameters either. Since the 2026-08-24 ownership decision Mission Planner and
+params/flight_v2.param are the single source of truth for what the aircraft flies, and the
+companion writes no FC parameter (the mission stack in drone.py/mission.py/failsafe.py issues
+no PARAM_SET at all). Use setparam by hand for SITL experiments, one-off diagnostics (e.g.
+LOG_DISARMED for a debugging session) and rebooting the FC - not to configure the flight set.
 
 Every write is READ BACK and confirmed. A silently ignored parameter is the failure mode
 that matters here: ArduPilot accepts a PARAM_SET for a name it does not know and simply
@@ -26,6 +34,7 @@ import time
 from pymavlink import mavutil
 
 from config import Config
+from fctools import read_param, set_param, wait_for_vehicle
 
 # Parameters that only take effect after a reboot. Warned about rather than blocked,
 # because setting them and rebooting later is a legitimate workflow.
@@ -34,54 +43,6 @@ NEEDS_REBOOT = (
     "LOG_BACKEND_TYPE", "BRD_",
 )
 
-
-
-def wait_for_vehicle(master, timeout=30):
-    """Wait for a heartbeat FROM THE AUTOPILOT, not from whatever speaks first.
-
-    pymavlink's wait_heartbeat() returns on the first heartbeat of any kind. Over
-    mavlink-router that can be a ground station or another tool, and then
-    target_system stays 0 - every later parameter request goes to nobody and the
-    script simply hangs. drone.py has guarded against this for a while; these
-    diagnostic tools had not.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        master.wait_heartbeat(timeout=2)
-        if master.target_system != 0:
-            return True
-    print("\nNo autopilot heartbeat - target_system stayed 0.")
-    print("Something is on the link, but nothing that identifies itself as a vehicle.")
-    print("Check that:")
-    print("  * the flight controller is powered (USB or battery),")
-    print("  * mavlink-router is running:  systemctl status mavlink-router")
-    print("  * it actually sees the FC:    journalctl -u mavlink-router -n 20")
-    return False
-
-def read_param(master, name, tries=4, timeout=2.0):
-    for _ in range(tries):
-        master.mav.param_request_read_send(
-            master.target_system, master.target_component, name.encode(), -1)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=timeout)
-            if msg and msg.param_id == name:
-                return msg.param_value
-    return None
-
-
-def set_param(master, name, value, tries=4, timeout=2.0):
-    """Write, then read back. Returns the confirmed value or None."""
-    for _ in range(tries):
-        master.mav.param_set_send(
-            master.target_system, master.target_component, name.encode(),
-            float(value), mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=timeout)
-            if msg and msg.param_id == name:
-                return msg.param_value
-    return None
 
 
 def main() -> None:

@@ -102,22 +102,13 @@ class DeliveryMission:
                 log.info(f"\n--- State: {self.state.name} ---")
                 self.state = dispatch[self.state]()
         except BaseException as exc:
-            # Any crash here used to kill the process outright, leaving the aircraft
-            # ARMED in GUIDED holding its last position target. GUID_TIMEOUT does not
-            # apply to position targets, so it would hover there until the battery ran
-            # out - with no companion left to rescue it. Bring it down first.
             log.error(f"[MISSION] Aborting on unhandled error: {exc!r}")
             self._emergency_land()
             raise
         finally:
-            # Whatever happened - clean exit, abort, crash, Ctrl+C - the flight
-            # controller must not keep this run's geofence or nav limits. They outlive
-            # the process and would shape the next MANUAL flight without any visible
-            # connection to us (the 2026-08-21 crash fence was exactly such a leftover).
-            try:
-                self.failsafe.restore_params()
-            except Exception:
-                log.exception("[MISSION] Could not restore the FC parameters")
+            # Nothing to restore any more by design: since the 2026-08-24 ownership
+            # decision the companion writes no FC parameter, so there is no baseline to
+            # put back on exit (the old fence/envelope restore lived here).
             log.info("\n=== MISSION END ===")
 
     def _emergency_land(self) -> None:
@@ -140,11 +131,12 @@ class DeliveryMission:
     # States (each returns the next state)
     # ------------------------------------------------------------------
     def _idle(self) -> State:
-        """Preparation: (origin), safety envelope, geofence, drop servo, GUIDED, arm."""
-        # First: if a previous run died before restoring the FC parameters it changed
-        # (battery pull, kill -9), put those back before touching anything else -
-        # otherwise this run would snapshot the leftovers as its own "before" values.
-        self.failsafe.recover_stale_params()
+        """Preparation: (origin), fence verification, drop servo, GUIDED, arm. Per the
+        2026-08-24 ownership decision the companion no longer WRITES FC parameters here;
+        it verifies the fence and refuses to fly if one it did not ask for is armed."""
+        log.info("[IDLE] FC parameters are Mission-Planner-owned (team decision "
+                 "2026-08-24): the companion verifies them but does not write any. "
+                 "See params/README.md.")
 
         # Indoors without GPS the EKF needs an origin before it can report a position.
         if self.config.gps_denied and self.config.set_origin_on_start:
@@ -156,8 +148,9 @@ class DeliveryMission:
                 # choose, so the flight log must say so.
                 log.warning("[IDLE] Continuing with the origin the FC already had")
 
-        self.failsafe.setup_safety_envelope()
-        self.failsafe.setup_geofence()
+        fence_problem = self.failsafe.verify_fence_disabled()
+        if fence_problem:
+            return self._fail(fence_problem)
         self.release.setup()
         self.release.reset()
 
@@ -208,7 +201,6 @@ class DeliveryMission:
         until the vehicle is armed, above `takeover_min_alt_m` and reporting a usable
         position estimate, and only then ask for GUIDED.
         """
-        log = logging.getLogger(__name__)
         log.warning("=" * 62)
         log.warning("[TAKEOVER] Waiting for the PILOT to arm and climb to "
                     f"{self.config.takeover_min_alt_m:.1f} m.")
@@ -406,16 +398,7 @@ class DeliveryMission:
             # timeout, and a silence longer than FS_GCS_TIMEOUT (5 s) makes the FC fire
             # its own GCS failsafe on a companion that is merely centring.
             self.drone.tick()
-            # Cheap mode check every iteration. The full failsafe.check() would block
-            # on a battery read, but noticing that the PILOT has taken over must not
-            # wait for the phase to end: from the moment the FC leaves GUIDED our
-            # setpoints are discarded anyway, and the flight log needs the moment the
-            # human took control, not the moment we got around to looking.
-            mode_reason = self.failsafe.mode_lost()
-            if mode_reason:
-                self.abort_reason = mode_reason
-                log.warning(f"[CAM] {mode_reason} - the pilot or an FC failsafe has "
-                            f"control, stopping")
+            if self._pilot_took_over("CAM"):
                 return State.ABORT
             offset = self.camera.get_target_offset()
             if not offset["detected"]:
@@ -518,13 +501,7 @@ class DeliveryMission:
         deadline = time.time() + self.config.waypoint_timeout_s
         while time.time() < deadline:
             self.drone.tick()   # see _over_target: keeps FS_GCS_* from firing on us
-            # Cheap mode check every iteration (same as _approach/_over_target): a
-            # pilot takeover mid-leg must stop the companion now, not a leg later.
-            mode_reason = self.failsafe.mode_lost()
-            if mode_reason:
-                self.abort_reason = mode_reason
-                log.warning(f"[SEARCH] {mode_reason} - the pilot or an FC failsafe has "
-                            f"control, stopping")
+            if self._pilot_took_over("SEARCH"):
                 return "mode_lost"
             if self.camera.get_target_offset()["detected"]:
                 log.info("[SEARCH] Target detected en route")
@@ -546,16 +523,7 @@ class DeliveryMission:
 
         while time.time() < deadline:
             self.drone.tick()   # see _over_target: keeps FS_GCS_* from firing on us
-            # Cheap mode check every iteration. The full failsafe.check() would block
-            # on a battery read, but noticing that the PILOT has taken over must not
-            # wait for the phase to end: from the moment the FC leaves GUIDED our
-            # setpoints are discarded anyway, and the flight log needs the moment the
-            # human took control, not the moment we got around to looking.
-            mode_reason = self.failsafe.mode_lost()
-            if mode_reason:
-                self.abort_reason = mode_reason
-                log.warning(f"[APPROACH] {mode_reason} - the pilot or an FC failsafe has "
-                            f"control, stopping")
+            if self._pilot_took_over("APPROACH"):
                 return State.ABORT
             offset = self.camera.get_target_offset()
             if not offset["detected"]:
@@ -580,6 +548,29 @@ class DeliveryMission:
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
+    def _pilot_took_over(self, tag: str) -> bool:
+        """Cheap per-iteration takeover check, shared by the servoing/search loops.
+
+        The loops that call this (OVER_TARGET, the continuous-cadence SEARCH leg, and
+        APPROACH) can each run for a whole phase timeout, and cannot afford the full
+        failsafe.check() every iteration - it blocks on a battery read. But noticing that
+        the PILOT (or an FC failsafe) has taken over must NOT wait for the phase to end:
+        from the moment the FC leaves GUIDED every setpoint we send is discarded anyway,
+        and the flight log needs the instant the human took control, not the moment we got
+        around to looking. So each loop does this cheap mode check on every pass instead.
+
+        On takeover it records the reason and logs the shared warning under the caller's
+        tag, then returns True; the caller keeps its own return path (State.ABORT vs the
+        "mode_lost" sentinel). Returns False while the FC is still in our mode.
+        """
+        mode_reason = self.failsafe.mode_lost()
+        if not mode_reason:
+            return False
+        self.abort_reason = mode_reason
+        log.warning(f"[{tag}] {mode_reason} - the pilot or an FC failsafe has "
+                    f"control, stopping")
+        return True
+
     def _nudge_from_offset(self, dx: float, dy: float) -> None:
         """Turn a ground offset in METRES (dx -> body right, dy -> body forward) into a
         clamped body-frame nudge. Shared by OVER_TARGET and APPROACH.

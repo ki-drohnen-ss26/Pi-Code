@@ -38,10 +38,11 @@ class ExpandingSquare:
     included, so the pattern reaches up to one `step` PAST `max_radius`. With the
     defaults (step 1.0, max_radius 6.0) the last point is (-6.0, 7.0).
 
-    Size `max_radius` with that overshoot in mind and against the actual hall: the
-    configured geofence is ALTITUDE-ONLY (`config.fence_type = 1`, and
-    `setup_geofence()` never writes `FENCE_RADIUS`), so nothing stops a horizontal
-    excursion. The fence protects the ceiling, not the walls.
+    Size `max_radius` with that overshoot in mind and against the actual hall: NO fence
+    is configured indoors (`FENCE_ENABLE=0` in the flight set, owned by Mission Planner
+    since 2026-08-24), so nothing stops a horizontal excursion. Even an altitude fence
+    would only guard the ceiling, not the walls - the horizontal guard is software:
+    failsafe.position_implausible().
 
     Schematic (N = up, E = right; S = launch at 0,0). One continuous path that
     spirals outward; the boxes show how each loop is `step` wider:

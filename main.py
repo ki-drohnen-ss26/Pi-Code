@@ -11,7 +11,7 @@ Usage:
     python main.py --tele             # only print telemetry (no flight), any of the above
 
 Staged bring-up on a new aircraft - each stage adds exactly ONE unknown:
-    python main.py --milestone 1   # climb to 1 m, hold, land        (position hold)
+    python main.py --milestone 1   # climb to 0.8m, hold, land        (position hold)
     python main.py --milestone 2   # same + the detector, logging only (detector)
     python main.py --milestone 3   # fly the search pattern            (pattern)
     python main.py --milestone 4   # search + detect + centre, no drop (approach)
@@ -31,7 +31,7 @@ to fail safely, and only one of the two mistakes is dangerous - see make_config(
 import logging
 import sys
 
-from camera import MockCamera, RealCamera, ScriptedCamera, SimCamera, TimedCamera
+from camera import MockCamera, RealCamera, SimCamera, TimedCamera
 from config import Config
 from drone import Drone
 from failsafe import FailsafeMonitor
@@ -74,7 +74,8 @@ def make_camera(config: Config, drone: Drone):
         camera = RealCamera(config, drone)
         camera.start()
         return camera
-    # For the OVER_TARGET correction loop with fixed frames, set ScriptedCamera manually.
+    # For the OVER_TARGET correction loop with fixed frames, wire camera.ScriptedCamera
+    # in here manually (import it first - it is a test helper, not a config-selectable source).
     raise ValueError(f"Unknown camera_source '{config.camera_source}'")
 
 
@@ -121,7 +122,7 @@ def make_config(argv: list) -> Config:
     elif "--pi-serial" in argv:    # direct UART, only without mavlink-router
         config = Config.pi_serial()
     else:
-        config = Config.pi()       # --pi is accepted but redundant: it is the default
+        config = Config.pi()
 
     _apply_bringup_flags(config, argv)
     return config
@@ -132,7 +133,7 @@ def make_config(argv: list) -> Config:
 # the flight-test order, not a preference - do not skip ahead.
 MILESTONES = {
     1: dict(label="hover only — position hold",
-            hover_test_s=20.0, hover_test_alt=1.0, camera_source="none"),
+            hover_test_s=20.0, hover_test_alt=0.8, camera_source="none"),
     2: dict(label="hover + detector (logs only, acts on nothing)",
             hover_test_s=20.0, hover_test_alt=1.0, camera_source="real"),
     3: dict(label="search pattern, no detection",
@@ -178,11 +179,6 @@ def _apply_bringup_flags(config: Config, argv: list) -> None:
                 setattr(config, key, value)
         config.milestone = number
 
-        # There is no IMX500 in the simulator, and rehearsing a milestone in SITL before
-        # flying it is exactly the right thing to do - so substitute the simulated
-        # detector instead of refusing to run. The substitution is logged, because a
-        # milestone that silently used a different camera than the one it names would be
-        # worse than no rehearsal at all.
         if config.release_mechanism == "fc" and config.camera_source == "real":
             config.camera_source = "auto"
             config.milestone_camera_substituted = True
@@ -260,8 +256,6 @@ def main() -> None:
     mission = DeliveryMission(drone, camera, failsafe, config, release)
 
     # --- start the mission ---
-    # DeliveryMission.run() already commands LAND before re-raising, so we only have to
-    # make sure the failure is visible and the exit code is non-zero.
     try:
         mission.run()
     except KeyboardInterrupt:
