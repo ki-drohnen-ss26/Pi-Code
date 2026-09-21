@@ -23,9 +23,11 @@ this run did not ask for is armed.
 
 import logging
 import math
+import os
 import time
 from typing import Optional
 
+import paramcheck
 from config import Config
 from drone import Drone
 
@@ -103,28 +105,24 @@ class FailsafeMonitor:
         records 366 m of it). But on the SIMULATOR "no samples at all" almost never
         means a broken sensor - it means a fresh or wiped SITL still at firmware
         defaults (RNGFND1_TYPE=0, FLOW_TYPE=0, EKF sources still on GPS) that never had
-        the indoor profile loaded. The fix is then a one-liner in the MAVProxy console,
-        not a change in this code - and that is exactly the hint the bare abort reason
-        does not give. Emitted only for the SITL profile (release_mechanism="fc", the
-        same test main.log_profile uses): on the real aircraft ("pi") a dead stream is a
-        genuine hardware fault, and pointing at a param file would be misleading.
+        the indoor profile loaded. The fix is then how the simulator was STARTED, not a
+        change in this code - and that is exactly the hint the bare abort reason does
+        not give. Emitted only for the simulation profile: on the real aircraft a dead
+        stream is a genuine hardware fault, and pointing at a parameter file would be
+        misleading.
         """
-        if self.config.release_mechanism != "fc":
+        if not self.config.is_simulation:
             return
         log.warning(
             "[PREARM] SITL is streaming no rangefinder/optical-flow data at all - on the "
             "simulator that is almost always a fresh or wiped SITL still at firmware "
-            "defaults (RNGFND1_TYPE=0, FLOW_TYPE=0), not a broken sensor. Load the SITL "
-            "mirror of the flight set in the MAVProxy console - load it TWICE (the "
-            "RNGFND1_* sub-parameters only exist after the first pass sets RNGFND1_TYPE "
-            "and the FC reboots, so the alphabetically-earlier "
-            "RNGFND1_GNDCLEAR/MAX_CM/MIN_CM are discarded on pass one):\n"
-            "    param load params/sitl_flight_v2.parm\n"
-            "    reboot\n"
-            "    param load params/sitl_flight_v2.parm\n"
-            "    reboot\n"
-            "(see params/README.md, which also documents the SIM_TERRAIN trap that makes "
-            "the rangefinder read a constant 0.00 m.)"
+            "defaults (RNGFND1_TYPE=0, FLOW_TYPE=0), not a broken sensor. Start the "
+            "simulator with the flight parameters instead of a bare sim_vehicle.py:\n"
+            "    python sitl.py\n"
+            "which passes the generated mirror as a startup defaults file, so the "
+            "rangefinder backend and its sub-parameters come up in the same boot (see "
+            "params/README.md, which also documents the SIM_TERRAIN trap that makes the "
+            "rangefinder read a constant 0.00 m)."
         )
 
     def verify_rangefinder_tracks_altitude(self, expected_alt_m: float) -> Optional[str]:
@@ -170,6 +168,86 @@ class FailsafeMonitor:
             return "OPTICAL_FLOW_LOST"
         log.info("[SENSORS] Rangefinder tracks altitude - position estimate has a height reference")
         return None
+
+    # ------------------------------------------------------------------
+    # Flight-parameter verification (read-only, before the mission arms)
+    # ------------------------------------------------------------------
+    def verify_flight_parameters(self) -> Optional[str]:
+        """Compare the live FC against the published flight set. Returns a reason
+        string to abort with, or None.
+
+        This is the other half of the 2026-08-24 ownership decision. Handing the FC
+        parameters to Mission Planner removed the surprise-overwrite failure mode that
+        caused the 2026-08-21 crash, but it opened a quieter one: nothing then noticed
+        when the aircraft in front of you stopped being the aircraft the code was
+        reasoned about. A parameter changed for one experiment and left behind is
+        invisible in the air and obvious in a diff - so the mission takes the diff
+        before it arms.
+
+        Still strictly read-only: it reports, it never writes. Per the ownership rule
+        the fix is made in Mission Planner, or the aircraft is captured and a new
+        versioned file published (`dumpparams.py`).
+
+        Which parameters, and which of them are worth refusing a flight over, lives in
+        paramcheck.py. `config.param_check` chooses what a CRITICAL difference does:
+        "abort" (default), "warn" or "off".
+        """
+        mode = (self.config.param_check or "off").lower()
+        if mode == "off":
+            return None
+
+        path = (self.config.expected_params_path
+                or paramcheck.newest_flight_set(simulated=self.config.is_simulation))
+        expected = paramcheck.load_param_file(path)
+        if expected is None:
+            # A missing file downgrades to "no verification", never to "all good" and
+            # never to a crash: the check is a guard, and a guard that blocks a flight
+            # because its own reference file moved would just get switched off.
+            log.warning(
+                "[PREARM] No published parameter file found "
+                f"({path or paramcheck.PARAMS_DIR}) - flying WITHOUT the parameter "
+                "check. Publish params/flight_v<N>.param (aircraft) or generate "
+                "params/sitl_flight_v<N>.parm (simulator)."
+            )
+            return None
+
+        names = [name for name in paramcheck.VERIFIED_PARAMS if name in expected]
+        log.info(f"[PREARM] Verifying {len(names)} parameters against "
+                 f"{os.path.basename(path)} (read-only) ...")
+        # Batched: one request burst per round, bounded by the round timeout. A loop of
+        # single reads would cost tries x timeout per name and could stall the pre-arm
+        # for minutes on a quiet link.
+        live = self.drone.read_params(names)
+
+        unreadable = [name for name, value in live.items() if value is None]
+        critical = paramcheck.compare(live, expected, paramcheck.CRITICAL_PARAMS)
+        informational = paramcheck.compare(live, expected, paramcheck.INFORMATIONAL_PARAMS)
+
+        for name, value, want in informational:
+            log.warning(f"[PREARM] {name} = {value} on the FC, published {want} "
+                        f"(informational, not blocking)")
+        for name, value, want in critical:
+            log.warning(f"[PREARM] {name} = {value} on the FC, published {want}  <-- MISMATCH")
+        if unreadable:
+            # An unreadable safety parameter is a finding, not an absence of one - but
+            # not one to ground a flight over on its own, because a busy link drops
+            # PARAM_VALUE replies and that is indistinguishable from a missing name.
+            log.warning(f"[PREARM] Could not read: {', '.join(unreadable)} - not verified")
+
+        if not critical:
+            log.info(f"[PREARM] Flight parameters match {os.path.basename(path)}")
+            return None
+
+        log.warning(
+            f"[PREARM] {len(critical)} flight-critical parameter(s) differ from "
+            f"{os.path.basename(path)}. The companion does not write FC parameters "
+            f"(team decision 2026-08-24): change them in Mission Planner, or capture "
+            f"the aircraft and publish a new versioned file (python dumpparams.py)."
+        )
+        if mode == "warn":
+            log.warning("[PREARM] param_check is 'warn' - flying anyway")
+            return None
+        return "FC_PARAMS_MISMATCH"
 
     # ------------------------------------------------------------------
     # Geofence (read-only verification before the mission)

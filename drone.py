@@ -274,6 +274,31 @@ class Drone:
         log.warning(f"[PARAM] Could not read {name}")
         return None
 
+    def read_params(self, names, rounds: int = 3, timeout: float = 2.0) -> dict:
+        """Read MANY parameters at once. Returns {name: value or None}.
+
+        Requests are sent in one burst on purpose: ArduPilot answers each
+        PARAM_REQUEST_READ independently, and the replies interleave with the normal
+        telemetry stream rather than queueing behind each other.
+        """
+        wanted = list(names)
+        found: dict = {}
+        for _ in range(rounds):
+            missing = [n for n in wanted if n not in found]
+            if not missing:
+                break
+            for name in missing:
+                self.master.mav.param_request_read_send(
+                    self.master.target_system, self.master.target_component,
+                    name.encode("utf-8"), -1)
+            deadline = time.time() + timeout
+            while time.time() < deadline and len(found) < len(wanted):
+                msg = self.master.recv_match(type="PARAM_VALUE", blocking=True,
+                                             timeout=max(0.05, deadline - time.time()))
+                if msg and msg.param_id in wanted:
+                    found[msg.param_id] = msg.param_value
+        return {name: found.get(name) for name in wanted}
+
     # ==================================================================
     # 2. Reading telemetry
     # ==================================================================
@@ -307,6 +332,20 @@ class Drone:
         if not msg:
             return None
         return {"north": msg.x, "east": msg.y, "down": msg.z}
+
+    def get_yaw(self, timeout: float = 1.0) -> Optional[float]:
+        """Heading in RADIANS from ATTITUDE, measured from north, clockwise positive.
+
+        Needed because the correction loop commands BODY-frame offsets: what the camera
+        reports is relative to the airframe, and anything that knows the world in the
+        earth frame (SimCamera does) has to rotate into it. ArduPilot yaws toward each
+        waypoint by default, so "the nose happens to point north" is not an assumption
+        that survives a search pattern.
+        """
+        msg = self.master.recv_match(type="ATTITUDE", blocking=True, timeout=timeout)
+        if msg is None:
+            return None
+        return msg.yaw
 
     def read_position_sensors(self, duration: float = 5.0) -> dict:
         """Listen for the sensors the GPS-denied position estimate is built on.

@@ -15,8 +15,11 @@ and the default GPS-denied indoor one (SEARCH/APPROACH) - to keep a change in ei
 from silently breaking the mission flow.
 """
 
+import math
+
 import pytest
 
+import paramcheck
 from camera import MockCamera, ScriptedCamera, SimCamera, TimedCamera
 from config import Config
 from failsafe import FailsafeMonitor
@@ -60,12 +63,24 @@ class FakeDrone:
         self._link_checks = 0
         self._north = 0.0  # local NED position, updated by goto_local / move_body_offset
         self._east = 0.0
+        # Heading in radians, north = 0, clockwise positive. Not decoration: body-frame
+        # nudges are rotated by it, and ArduPilot yaws toward each waypoint by default,
+        # so a real aircraft is almost never at yaw 0 by the time APPROACH starts.
+        self.yaw = 0.0
         # FC parameter values as read back by read_param(). The companion is read-only
-        # now (team decision 2026-08-24), so these only feed verify_fence_disabled():
-        # FENCE_ENABLE=0 means no stale fence is armed. A test that wants the
-        # refuse-to-fly path flips FENCE_ENABLE to 1.
-        self.params_before = {"FENCE_ENABLE": 0.0, "FENCE_TYPE": 7.0,
-                              "FENCE_ALT_MAX": 120.0, "FENCE_ACTION": 1.0}
+        # now (team decision 2026-08-24), so these feed the two read-only pre-arm
+        # gates: verify_flight_parameters() (does the live FC match the published set?)
+        # and verify_fence_disabled() (FENCE_ENABLE=0 means no stale fence is armed).
+        #
+        # The default fake aircraft is therefore one that MATCHES its published set -
+        # loaded from the real file, so a parameter renamed there is caught here rather
+        # than by a hand-copied dictionary that silently rots. A test that wants a
+        # refusal changes one value (see the fence and mismatch tests below).
+        self.params_before = dict(
+            paramcheck.load_param_file(
+                paramcheck.newest_flight_set(simulated=config.is_simulation)) or {})
+        self.params_before.update({"FENCE_ENABLE": 0.0, "FENCE_TYPE": 7.0,
+                                   "FENCE_ALT_MAX": 120.0, "FENCE_ACTION": 1.0})
         # Raw rangefinder reading as read by get_rangefinder(); None = no message.
         self.rangefinder_m = None
         self.position_sensors = {
@@ -101,6 +116,11 @@ class FakeDrone:
         self.calls.append(("read_param", name))
         return self.params_before.get(name)
 
+    def read_params(self, names, rounds=3, timeout=2.0):
+        for name in names:
+            self.calls.append(("read_param", name))
+        return {name: self.params_before.get(name) for name in names}
+
     def read_position_sensors(self, duration=5.0):
         self.calls.append(("read_position_sensors", duration))
         return self.position_sensors
@@ -121,9 +141,13 @@ class FakeDrone:
         return self._link_checks <= self.link_alive_ok
 
     def move_body_offset(self, forward, right, down=0.0):
-        # yaw=0 assumption: body forward=north, body right=east
-        self._north += forward
-        self._east += right
+        # Body frame -> earth frame, rotated by the vehicle's yaw, exactly like
+        # MAV_FRAME_BODY_OFFSET_NED on the real autopilot. This used to assume yaw = 0
+        # (forward = north, right = east), which made the whole approach loop look
+        # correct in tests while it diverged in SITL the moment the aircraft had yawed.
+        cos_y, sin_y = math.cos(self.yaw), math.sin(self.yaw)
+        self._north += forward * cos_y - right * sin_y
+        self._east += forward * sin_y + right * cos_y
         self.calls.append(("move_body_offset", forward, right))
 
     # --- preparation ---
@@ -179,6 +203,9 @@ class FakeDrone:
 
     def get_local_position(self, timeout=2.0):
         return {"north": self._north, "east": self._east, "down": -2.0}
+
+    def get_yaw(self, timeout=1.0):
+        return self.yaw
 
     def goto_local(self, north, east, down):
         # teleport to the waypoint (good enough for logic tests)
@@ -360,6 +387,34 @@ def test_indoor_search_finds_target_approaches_and_delivers():
     assert "drop" in actions
     assert actions.index("goto_local") < actions.index("drop")
     # ended within tolerance of the target
+    assert abs(drone._north - 2.5) <= config.centre_tolerance
+    assert abs(drone._east - 1.5) <= config.centre_tolerance
+
+
+@pytest.mark.parametrize("yaw_deg", [0, 45, -139, 90, 180])
+def test_approach_converges_whatever_way_the_nose_points(yaw_deg):
+    """The approach must not depend on the aircraft happening to face north.
+
+    It did, and the tests could not see it: the camera reported the north/east error
+    while `move_body_offset()` rotates its argument by the vehicle's yaw, and the fake
+    drone assumed yaw = 0 on both sides, so the two errors cancelled. In SITL, where
+    ArduPilot yaws toward each waypoint, the aircraft reached APPROACH at yaw -139
+    degrees, every correction went off at 139 degrees to the error, and the drone chased
+    the pad out of its own field of view until the battery died (2026-09-21). Hence the
+    real yaw here, and -139 among the cases."""
+    config = Config.sitl()
+    config.sim_target_north = 2.5
+    config.sim_target_east = 1.5
+    drone = FakeDrone(config)
+    drone.yaw = math.radians(yaw_deg)
+    camera = SimCamera(drone, config.sim_target_north, config.sim_target_east,
+                       config.sim_fov_radius_m)
+    mission = _build_mission(drone, config, camera=camera)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert "drop" in drone.actions()
     assert abs(drone._north - 2.5) <= config.centre_tolerance
     assert abs(drone._east - 1.5) <= config.centre_tolerance
 
@@ -1095,6 +1150,99 @@ def test_stale_fence_from_an_earlier_run_refuses_to_fly():
     assert "arm" not in drone.actions()           # never armed on a stale fence
     # The companion writes nothing - not to clear the fence, not anything else.
     assert not any(c[0] == "set_param" for c in drone.calls)
+
+
+def test_flight_critical_parameter_drift_refuses_to_fly():
+    """The other half of the ownership decision: handing the parameters to Mission
+    Planner removed the surprise-overwrite failure mode, but nothing then noticed when
+    the live aircraft stopped matching the published set. The mission takes that diff
+    before it arms - read-only, and it refuses rather than correcting."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    # One value moved on the aircraft, e.g. somebody switched the EKF height source
+    # back to the barometer for an experiment and left it there.
+    drone.params_before["EK3_SRC1_POSZ"] = 1.0
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "FC_PARAMS_MISMATCH"
+    assert "arm" not in drone.actions()
+    assert not any(c[0] == "set_param" for c in drone.calls)   # still writes nothing
+
+
+def test_informational_parameter_drift_does_not_block_the_flight():
+    """A gate that cries wolf gets switched off. ARMING_CHECK is knowingly in flux -
+    the team dropped the compass bit while the hall's magnetic problem is open - so it
+    is reported and flown past, not treated as a reason to refuse."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    drone.params_before["ARMING_CHECK"] = 41346.0     # compass bit removed, 41350 published
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason != "FC_PARAMS_MISMATCH"
+    assert "arm" in drone.actions()
+
+
+def test_param_check_warn_mode_reports_and_flies_anyway():
+    """`param_check = "warn"` is the escape hatch for a session where the diff is known
+    and accepted. It must still fly, and still write nothing."""
+    config = Config.sitl()
+    config.param_check = "warn"
+    drone = FakeDrone(config)
+    drone.params_before["WPNAV_SPEED"] = 250.0
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason != "FC_PARAMS_MISMATCH"
+    assert "arm" in drone.actions()
+    assert not any(c[0] == "set_param" for c in drone.calls)
+
+
+def test_unreadable_parameter_does_not_ground_the_aircraft():
+    """A dropped PARAM_VALUE reply is indistinguishable from a name the firmware does
+    not know, and a busy link drops a few of them. Silence is reported, never flown
+    into a refusal - otherwise one lost packet grounds the aircraft."""
+    config = Config.sitl()
+    drone = FakeDrone(config)
+    del drone.params_before["EK3_SRC1_POSZ"]          # read_param() then returns None
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason != "FC_PARAMS_MISMATCH"
+    assert "arm" in drone.actions()
+
+
+def test_param_check_can_be_switched_off_entirely():
+    """`param_check = "off"` must not even read the parameters - a bench session with
+    no published set should not spend thirty seconds on requests it cannot use."""
+    config = Config.sitl()
+    config.param_check = "off"
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    read = {c[1] for c in drone.calls if c[0] == "read_param"}
+    assert "EK3_SRC1_POSZ" not in read
+    assert "FENCE_ENABLE" in read      # the fence check is separate and still runs
+
+
+def test_simulated_and_real_profiles_verify_against_different_files():
+    """SITL is compared against the generated mirror, the aircraft against the flight
+    set. The mirror deviates on purpose (SITL sensor backends, GPS off, the
+    RNGFND1_MIN_CM validity floor, the simulated pack's voltages); measuring SITL
+    against the flight set would report those intended deviations as faults and teach
+    everyone to ignore the check."""
+    sim = paramcheck.newest_flight_set(simulated=True)
+    real = paramcheck.newest_flight_set(simulated=False)
+    assert sim and real and sim != real
+    assert paramcheck.load_param_file(sim)["RNGFND1_TYPE"] == 100      # SITL backend
+    assert paramcheck.load_param_file(real)["RNGFND1_TYPE"] == 10      # MTF-01P over MAVLink
 
 
 def test_continuous_cadence_counts_unreached_waypoints():

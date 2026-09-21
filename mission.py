@@ -135,8 +135,8 @@ class DeliveryMission:
         2026-08-24 ownership decision the companion no longer WRITES FC parameters here;
         it verifies the fence and refuses to fly if one it did not ask for is armed."""
         log.info("[IDLE] FC parameters are Mission-Planner-owned (team decision "
-                 "2026-08-24): the companion verifies them but does not write any. "
-                 "See params/README.md.")
+                 "2026-08-24): the companion verifies them read-only before every "
+                 "mission but writes none. See params/README.md.")
 
         # Indoors without GPS the EKF needs an origin before it can report a position.
         if self.config.gps_denied and self.config.set_origin_on_start:
@@ -148,9 +148,22 @@ class DeliveryMission:
                 # choose, so the flight log must say so.
                 log.warning("[IDLE] Continuing with the origin the FC already had")
 
+        # The fence check runs FIRST although the parameter check below is the broader
+        # one: an armed fence has its own, better-explained refusal
+        # (UNEXPECTED_FENCE_ENABLED, with the fence's shape in the log), and a generic
+        # "a parameter differs" would be the wrong name for the failure that crashed
+        # this aircraft once already.
         fence_problem = self.failsafe.verify_fence_disabled()
         if fence_problem:
             return self._fail(fence_problem)
+
+        # Is the aircraft in front of us the one this code was reasoned about? The
+        # companion writes no parameter, so the only thing keeping the live FC and the
+        # published flight set together is somebody noticing when they drift apart -
+        # and noticing has to happen here, not in a tool a human remembers to run.
+        param_problem = self.failsafe.verify_flight_parameters()
+        if param_problem:
+            return self._fail(param_problem)
         self.release.setup()
         self.release.reset()
 

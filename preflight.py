@@ -23,15 +23,9 @@ import time
 
 from pymavlink import mavutil
 
+import paramcheck
 from config import Config
 from fctools import read_param, wait_for_vehicle
-
-# Where the documented, versioned flight parameter set lives by default. Per the
-# 2026-08-24 ownership decision the FC parameters have exactly one source of truth
-# (Mission Planner + this published file), and this tool VERIFIES the live FC against
-# it read-only. Kept relative to the script so it works from any working directory.
-DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "params", "flight_v2.param")
 
 # Grouped so the output reads like a checklist rather than a parameter dump.
 GROUPS = {
@@ -71,40 +65,19 @@ EKF_FLAGS = [
 
 
 
-def load_expected(path):
-    """Parse a documented parameter file into {NAME: float}, tolerantly.
+def _expected_path_from_argv(argv, simulated):
+    """--expected PATH, otherwise the highest-numbered published set.
 
-    Mission Planner and ArduPilot tooling emit several shapes of the same thing:
-    `NAME,VALUE` (our flight_v2.param), `NAME VALUE` or `NAME\tVALUE`, sometimes with a
-    trailing comment. Blank lines and `#`/`//` comments are skipped. A line whose value
-    is not a number is skipped rather than aborting the whole check - the goal is a
-    best-effort comparison, not a strict parser. Returns None if the file is absent."""
-    if not path or not os.path.exists(path):
-        return None
-    expected = {}
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#") or line.startswith("//"):
-                continue
-            parts = line.replace(",", " ").replace("\t", " ").split()
-            if len(parts) < 2:
-                continue
-            name = parts[0]
-            try:
-                expected[name] = float(parts[1])
-            except ValueError:
-                continue
-    return expected
-
-
-def _expected_path_from_argv(argv):
-    """--expected PATH, defaulting to params/flight_v2.param next to this script."""
+    Resolved by version rather than by a hard-coded name so publishing a v3 needs no
+    source edit here (see paramcheck.newest_flight_set). A simulated run is compared
+    against the generated mirror, because the mirror deviates from the aircraft on
+    purpose and measuring SITL against the flight set would report those intended
+    deviations as faults."""
     if "--expected" in argv:
         i = argv.index("--expected")
         if i + 1 < len(argv):
             return argv[i + 1]
-    return DEFAULT_EXPECTED
+    return paramcheck.newest_flight_set(simulated=simulated)
 
 
 def main():
@@ -114,11 +87,12 @@ def main():
     # Read-only verification against the documented flight parameter set (team decision
     # 2026-08-24: Mission Planner + params/flight_v2.param are the single source of
     # truth). A missing file downgrades to "no verification", never a crash.
-    expected_path = _expected_path_from_argv(sys.argv)
-    expected = load_expected(expected_path)
+    expected_path = _expected_path_from_argv(sys.argv, sim)
+    expected = paramcheck.load_param_file(expected_path)
     if expected is None:
-        print(f"Note: no expected parameter file at {expected_path} - skipping the "
-              f"read-only comparison against the documented flight set.\n")
+        print(f"Note: no expected parameter file at "
+              f"{expected_path or paramcheck.PARAMS_DIR} - skipping the read-only "
+              f"comparison against the documented flight set.\n")
     else:
         print(f"Verifying against {expected_path} ({len(expected)} documented "
               f"parameters).\n")
@@ -244,9 +218,9 @@ def main():
             print(f"    {label:14s} {state}")
         if (present & 0x08) and not (health & 0x08):
             print("\n  !! THE BAROMETER IS UNHEALTHY. It is not the EKF height source here")
-            print("  !! (the rangefinder is, by assignment), but it is our independent")
-            print("  !! altitude witness/reference - and stock 4.6.3 will not even boot")
-            print("  !! without it. Do not fly.")
+            print("  !! (the rangefinder is, by our own configuration choice), but it is")
+            print("  !! our independent altitude witness/reference, and stock 4.6.3 will")
+            print("  !! not even boot without it. Do not fly.")
 
     # --- is the height estimate stable while standing still? ----------------
     # This drift line is the ground GO/NO-GO gate, and the crash chain behind it is
@@ -297,15 +271,16 @@ def main():
         posz = read_param(master, "EK3_SRC1_POSZ", tries=3, timeout=1.5)
         if posz is not None and abs(posz - 2.0) < 0.1:
             print("\n  !! EK3_SRC1_POSZ = 2: the rangefinder is the EKF's ONLY height source.")
-            print("  !! This is REQUIRED - the assignment mandates the rangefinder as the")
-            print("  !! height source; the barometer is NOT a permitted EKF source. It is")
-            print("  !! MANDATED AND WORKING: milestone 1 flew fully green under POSZ=2 in")
+            print("  !! This is OUR CONFIGURATION CHOICE, not an assignment requirement.")
+            print("  !! The task asks for altitude hold using the LiDAR; which EKF source")
+            print("  !! carries the height is ours to pick, and the barometer (POSZ = 1)")
+            print("  !! stays available if we decide the evidence points that way. It")
+            print("  !! WORKS as configured: milestone 1 flew fully green under POSZ=2 in")
             print("  !! SITL (2026-08-25). It was ALSO the configuration of the 2026-08-21")
             print("  !! crash (the EKF fused no height, the vertical estimate diverged on")
             print("  !! the ground, a fence-forced LAND went to full throttle) - but the")
             print("  !! 2026-08-25 SITL work showed the blocker was the RNGFND1_MIN_CM")
             print("  !! validity floor rejecting the landed reading, NOT POSZ=2 itself. So")
-            print("  !! it flies under the safety protocol, and the altitude-drift line")
             print("  !! above is the GO/NO-GO gate: drifting on the ground = the EKF is")
             print("  !! fusing no height = DO NOT FLY. If it drifts, check RNGFND1_MIN_CM")
             print("  !! (the validity floor - the landed reading must clear it; SITL proved")

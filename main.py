@@ -95,22 +95,7 @@ def make_release(config: Config, drone: Drone):
 
 def make_config(argv: list) -> Config:
     """Pick the preset from the command line instead of editing source on the drone.
-
     **The default is the REAL AIRCRAFT. Simulation is opt-in via `--sim`.**
-
-    This way round on purpose, because forgetting the flag must fail on the safe side,
-    and the two mistakes are not equally bad:
-
-    * A real aircraft accidentally running SIMULATION values fails **silently and
-      dangerously**. `battery_min_voltage` would be 10.8 V - *below* a 4S Li-Ion's
-      empty voltage of 11.2 V - so the low-battery abort could never fire. The drop
-      would be commanded on an FC output that carries no servo. And `camera_source`
-      "auto" resolves to SimCamera, which reports a target that does not exist, so the
-      aircraft flies to an empty spot and drops there.
-    * Simulation accidentally running REAL values fails **immediately and harmlessly**:
-      `PiServo` raises "needs gpiozero (Raspberry Pi only)" before anything takes off.
-
-    So the dangerous direction is the one that now needs an explicit flag.
     """
     if "--sim" in argv or "--sitl" in argv:
         # QGroundControl also binds 14550. To run both, add a second output in the
@@ -179,9 +164,12 @@ def _apply_bringup_flags(config: Config, argv: list) -> None:
                 setattr(config, key, value)
         config.milestone = number
 
-        if config.release_mechanism == "fc" and config.camera_source == "real":
+        if config.is_simulation and config.camera_source == "real":
             config.camera_source = "auto"
             config.milestone_camera_substituted = True
+            if config.hover_test_s > 0:
+                config.sim_target_north = 0.0
+                config.sim_target_east = 0.0
 
     if "--hover" in argv:
         config.hover_test_s = _value_after("--hover", 20.0)
@@ -200,10 +188,9 @@ def log_profile(config: Config) -> None:
     aircraft is now the default, the simulation banner is the one that must stand out -
     seeing it while standing next to an armed drone means stop.
     """
-    simulated = config.release_mechanism == "fc"
-    if simulated:
+    if config.is_simulation:
         log.warning("=" * 62)
-        log.warning("[PROFILE] SIMULATION (SITL) - do NOT use for a real flight")
+        log.warning("[PROFILE] SIMULATION (SITL)")
         log.warning("=" * 62)
     else:
         log.info("[PROFILE] REAL AIRCRAFT")

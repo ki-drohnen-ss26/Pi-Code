@@ -91,12 +91,30 @@ class ScriptedCamera:
 class SimCamera:
     """Simulated detector for SITL and tests. Pretends a target sits at a fixed local
     NED position and "detects" it once the drone is within `fov_radius` (ground
-    distance). Returns the ground offset to the target as dx (east error) / dy (north
-    error), so the same APPROACH / OVER_TARGET servo loop drives the drone onto it.
+    distance). Returns the ground offset to the target in the BODY frame (dx right,
+    dy forward), so the same APPROACH / OVER_TARGET servo loop drives the drone onto it.
 
     This lets the whole search → approach → drop flow be validated before the real AI
-    camera exists. `drone` only needs a `get_local_position()` returning
-    `{"north": .., "east": ..}` — the real Drone and the test FakeDrone both provide it.
+    camera exists. `drone` needs a `get_local_position()` returning
+    `{"north": .., "east": ..}` and a `get_yaw()` returning radians; the real Drone and
+    the test FakeDrone both provide them.
+
+    THE BODY-FRAME ROTATION IS THE WHOLE POINT, and leaving it out cost us a full
+    milestone-5 SITL run on 2026-09-21. This class knows the target's position in the
+    EARTH frame, but a downward-facing camera does not see the world that way: it sees
+    the target somewhere in its IMAGE, and the image is bolted to the airframe, so it
+    turns when the aircraft turns. Reporting the raw north/east error modelled a camera
+    that is magically yaw-stabilised, which no camera is - and the mission then handed
+    an earth-frame error to `move_body_offset()`, which rotates its argument by the
+    vehicle's yaw.
+
+    That mismatch is invisible while the nose points north and fatal to the loop as soon
+    as it does not. ArduPilot yaws toward each waypoint by default, so after a few legs
+    of the search pattern the aircraft sat at yaw -139 degrees: every correction went off
+    at 139 degrees to the error, the drone chased the pad out of its own field of view,
+    fell back to SEARCH, re-detected and repeated until the simulated battery died. It
+    had looked healthy until then only because the simulated pad sat exactly on a spiral
+    corner, so the aircraft arrived already centred and the servo loop never ran.
     """
 
     def __init__(self, drone, target_north: float, target_east: float, fov_radius: float = 1.5):
@@ -113,10 +131,19 @@ class SimCamera:
         de = self._te - pos["east"]
         dist = math.hypot(dn, de)
         detected = dist <= self._fov
+        if not detected:
+            return {"detected": False, "dx": 0.0, "dy": 0.0, "distance": dist}
+
+        # Earth (NED) error -> body frame, by the vehicle's yaw. A drone with no yaw to
+        # report is treated as nose-north, which is what the old behaviour silently
+        # assumed; it keeps a minimal test double working instead of raising.
+        get_yaw = getattr(self._drone, "get_yaw", None)
+        yaw = (get_yaw() if get_yaw else 0.0) or 0.0
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
         return {
-            "detected": detected,
-            "dx": de if detected else 0.0,  # east error  -> body "right"
-            "dy": dn if detected else 0.0,  # north error -> body "forward"
+            "detected": True,
+            "dx": -dn * sin_y + de * cos_y,   # body right
+            "dy": dn * cos_y + de * sin_y,    # body forward
             "distance": dist,
         }
 

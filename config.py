@@ -43,6 +43,7 @@ class Config:
     connection_string: str = "udpin:127.0.0.1:14550"
     baud: int = 115200            # only used for a serial connection
     gcs_system_id: int = 255      # the ID we announce as the ground station
+    is_simulation: bool = False
 
     # ------------------------------------------------------------------
     # Mission / target
@@ -111,6 +112,30 @@ class Config:
     expect_mode: str = "GUIDED"
 
     # ------------------------------------------------------------------
+    # Flight-parameter verification before every mission (read-only)
+    # ------------------------------------------------------------------
+    # The companion writes no FC parameter (ownership decision 2026-08-24), which only
+    # works if something notices when the live aircraft has drifted away from the
+    # published set. So the mission reads a curated subset back from the FC before it
+    # arms and compares it against the published file. It still writes nothing: a
+    # difference is reported, and the fix is made in Mission Planner.
+    #
+    #   "abort" = refuse to fly when a CRITICAL parameter differs (the default)
+    #   "warn"  = report every difference and fly anyway
+    #   "off"   = skip the check entirely
+    #
+    # See paramcheck.py for which parameters are critical and why. The informational
+    # ones (ARMING_CHECK, the FLTMODE map, the battery thresholds) are always reported
+    # and never block, because the team is knowingly carrying differences there.
+    param_check: str = "abort"
+    # Which published file to compare against. Empty = resolve the highest-numbered one
+    # automatically: params/flight_v<N>.param for the aircraft, the generated mirror
+    # params/sitl_flight_v<N>.parm for a simulated run. Publishing a v3 therefore needs
+    # no source edit. Set a path to pin one file (--expected does the same for
+    # preflight.py).
+    expected_params_path: str = ""
+
+    # ------------------------------------------------------------------
     # Recovery: what we do after the drop and on every abort
     # ------------------------------------------------------------------
     # "land" = descend where we are. Indoors this is almost always right: LAND needs no
@@ -176,7 +201,7 @@ class Config:
     # local NED, pre-arm waits for the RELATIVE EKF position. False = the GPS/Phase-1
     # path (global lat/lon, absolute EKF position).
     gps_denied: bool = True
-    search_altitude: float = 2.0        # indoor cruise/search height [m]
+    search_altitude: float = 1.0        # indoor cruise/search height [m]
     local_arrival_radius_m: float = 0.5  # local-NED waypoint reached within this [m]
 
     # EKF origin (Phase 3). Indoors there is no GPS to seed the EKF origin/home, so the
@@ -250,7 +275,13 @@ class Config:
     # SEARCH needs its own budget: the default spiral has 25 waypoints, so reusing
     # phase_timeout_s (60 s) for the whole phase aborts long before the pattern is
     # flown. waypoint_timeout_s bounds a SINGLE leg, search_timeout_s the whole phase.
-    search_timeout_s: float = 300.0
+    # Sized from a measurement, not a guess: the default spiral (25 waypoints, 169 m of
+    # path) took 219 s end to end in SITL at WPNAV_SPEED = 100 cm/s on 2026-09-21. The
+    # old 300 s left 27 % headroom, which a slower real aircraft would eat, and the
+    # abort would then land mid-pattern under the honest but unhelpful name
+    # TIMEOUT_SEARCH. Raise this together with search_max_radius_m: the path grows with
+    # the square of the radius.
+    search_timeout_s: float = 420.0
     waypoint_timeout_s: float = 30.0
     # Consecutive unreachable waypoints before we give up. Repeatedly missing a
     # waypoint means the vehicle is not following us (mode changed) or the position
@@ -261,8 +292,14 @@ class Config:
     # ------------------------------------------------------------------
     # Simulation target (SimCamera pretends the pad is here, local NED [m])
     # ------------------------------------------------------------------
-    sim_target_north: float = 2.0
-    sim_target_east: float = 2.0
+    # Deliberately NOT on a spiral corner. The pattern visits (2.0, 2.0) exactly, and
+    # with the target there the drone arrives already centred: APPROACH returns DROP on
+    # its first frame and the visual-servoing loop - the whole point of the milestone-4
+    # rehearsal - is never executed. Placed half a step off, the same run has to nudge
+    # its way in. (The unit tests had picked these values for that reason long before
+    # the SITL default caught up; found in a full milestone sweep on 2026-09-21.)
+    sim_target_north: float = 2.5
+    sim_target_east: float = 1.5
     sim_fov_radius_m: float = 1.5    # camera "sees" the target within this ground radius
 
     # ------------------------------------------------------------------
@@ -357,9 +394,14 @@ class Config:
         3. `camera_source="auto"` - resolves to SimCamera/MockCamera. On the real
            aircraft this would be dangerous (see the field comment above), which is why
            it is set here rather than being the shared default.
+
+        `is_simulation=True` is not a fourth deviation but the label on the other three:
+        it states plainly what the profile is, so the banner, the fresh-SITL hint and the
+        choice of expected parameter file stop inferring it from the drop servo.
         """
         return cls(
             connection_string=f"udpin:{host}:{port}",
+            is_simulation=True,
             release_mechanism="fc",
             battery_min_voltage=10.8,
             camera_source="auto",

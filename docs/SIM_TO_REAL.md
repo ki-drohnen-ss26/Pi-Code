@@ -43,13 +43,19 @@ endpoint, and every deviation from reality lives in exactly one place, `Config.s
 | `battery_min_voltage` | `10.8 V` — matches SITL's simulated ~12.6 V pack; the real threshold would abort on the first reading | `12.8 V` — our 4S Li-Ion (16.4 V full, 11.2 V empty) |
 | `camera_source` | `"auto"` — resolves to `SimCamera`/`MockCamera` | `"timed"` — honest camera-less default; `"real"` once an `.rpk` is on board |
 
+> **`Config.sitl()` also sets `is_simulation = True`.** That is not a fourth deviation but
+> the label on the other three: the profile banner, the fresh-SITL hint and the choice of
+> expected parameter file (§2) read that field. They used to infer the profile from
+> `release_mechanism == "fc"`, which happened to be true on the simulator and said the
+> wrong thing.
+
 ## What stays the same vs what changes
 
 | Area | SITL | Real hardware |
 |------|------|---------------|
 | Connection | `udpin:127.0.0.1:14550` | `udpin:127.0.0.1:14550` (via mavlink-router) |
 | Mission logic | identical | identical |
-| Pre-arm | GPS/EKF converge in seconds | Flight set runs `ARMING_CHECK = 41350` (was `0` on the crash-day FC); the companion's `wait_ready_to_arm()` is an added gate (§2) |
+| Pre-arm | GPS/EKF converge in seconds; the parameter check compares against the SITL mirror | Flight set runs `ARMING_CHECK = 41350` (was `0` on the crash-day FC); the companion's `wait_ready_to_arm()` and its read-only parameter check are added gates (§2) |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
 | Camera | Mock / Sim (`Config.sitl()` sets `"auto"`) | `TimedCamera` today (`camera_source="timed"` — no detection at all); `RealCamera` (IMX500, model on the sensor NPU, §3a) once an `.rpk` is aboard |
 | Drop servo | `FcServo` (FC output, value echoed back) | `PiServo` (servo on Pi GPIO) — **calibrate PWM, test on bench** |
@@ -75,6 +81,35 @@ adapter to the FC.
   longer writes it (§5a) — and do **not** load `../params/sitl_flight_v2.parm` (the SITL
   mirror) onto the flight controller, it is a SITL file (see `../params/README.md`).
   `arm()` retries with pauses instead of giving up or blocking.
+- **The companion verifies the flight parameters before every mission, read-only.**
+  `mission._idle()` calls `FailsafeMonitor.verify_flight_parameters()` right after the
+  fence check and before arming: it reads a curated subset back from the FC and compares
+  it against the published set (`paramcheck.py`). It still writes nothing, per the
+  ownership decision (§5a); a difference is reported and the fix is made in Mission
+  Planner.
+  - **CRITICAL** (a difference aborts the mission with `FC_PARAMS_MISMATCH`):
+    `EK3_SRC1_POSXY`, `EK3_SRC1_VELXY`, `EK3_SRC1_POSZ`, `EK3_SRC1_VELZ`, `EK3_SRC1_YAW`,
+    `AHRS_EKF_TYPE`, `RNGFND1_TYPE`, `RNGFND1_MIN_CM`, `RNGFND1_MAX_CM`, `RNGFND1_ORIENT`,
+    `RNGFND1_GNDCLEAR`, `FLOW_TYPE`, `WPNAV_SPEED`, `WPNAV_SPEED_UP`, `BATT_FS_LOW_ACT`,
+    `BATT_FS_CRT_ACT`, `FS_THR_ENABLE`, `RTL_ALT`. These are the values the companion's
+    own safety reasoning depends on, so a difference means the aircraft in front of you
+    is not the aircraft this code was reasoned about.
+  - **INFORMATIONAL** (reported, never blocking): `ARMING_CHECK`, `BATT_MONITOR`,
+    `BATT_LOW_VOLT`, `BATT_CRT_VOLT`, `FS_EKF_ACTION`, `FS_GCS_ENABLE`, `FLOW_ORIENT_YAW`.
+    `ARMING_CHECK` sits here deliberately: the team removed the compass bit on the
+    aircraft (41350 to 41346) while the hall's magnetic problem is open, and the FLTMODE
+    map is currently done transmitter-side. A gate that cries wolf gets switched off.
+  - A parameter the FC does not answer for is reported as "could not read" and does
+    **not** block. A busy link drops PARAM_VALUE replies, and that is indistinguishable
+    from a name the firmware does not know.
+  - `FENCE_ENABLE` is deliberately **not** in the list. `verify_fence_disabled()` already
+    refuses on it, with the better-named `UNEXPECTED_FENCE_ENABLED` and a log of the
+    fence's actual shape (§5a, §5c). That is why the fence check runs first.
+  - `config.param_check` is `"abort"` (the default), `"warn"` or `"off"`. An empty
+    `config.expected_params_path` means resolve by VERSION: the highest
+    `params/flight_v<N>.param` for the aircraft, the highest
+    `params/sitl_flight_v<N>.parm` for a simulated run (`config.is_simulation` decides
+    which). Publishing a v3 therefore needs no source edit anywhere.
 - **Indoor / no GPS (Phase 2, implemented):** `config.gps_denied = True` makes
   `wait_ready_to_arm(require_abs=False)` wait for `EKF_POS_HORIZ_REL` (relative, from
   optical flow), and navigation uses `goto_local()` (local NED) instead of `goto()`
@@ -89,7 +124,8 @@ adapter to the FC.
   hand and the companion takes over in the air — gated on the **rangefinder** height
   and on EKF/rangefinder agreement, not on the EKF altitude alone (§5c explains why).
 
-  **To validate the indoor path in SITL, load the generated mirror of the flight set.**
+  **To validate the indoor path in SITL, give the simulator the generated mirror of the
+  flight set.**
   `../params/sitl_flight_v2.parm` is derived from the published `flight_v2.param` by
   `generate_sitl_flight_params.py`, so SITL tests the SAME parameters we fly: the
   behavioural ones are mirrored 1:1 while the physical ones (real board mounting,
@@ -98,27 +134,67 @@ adapter to the FC.
   the flight set cannot be loaded wholesale. The mirror also carries the SITL sensor
   backends on, the EKF sources on optical flow + rangefinder, GPS off (`GPS1_TYPE 0`) and
   `SIM_TERRAIN 0`, so one file covers what used to take three hand-loaded phase overlays.
-  Still start the simulator at the coordinates the companion uses as its EKF origin
-  (`--custom-location=50.131196,8.692972,112,0`), otherwise pre-arm fails with *"Check mag
-  field"*. Load it **twice** with a reboot between, on **ArduCopter 4.6.3** (the release our
-  flight controller runs):
 
-  ```
-  param load .../params/sitl_flight_v2.parm
-  reboot
-  param load .../params/sitl_flight_v2.parm
-  reboot
+  **Hand it to the simulator at startup, with `python sitl.py`:**
+
+  ```bash
+  python sitl.py                 # ArduCopter SITL, wiped, flight parameters loaded
+  python sitl.py --speedup 5     # five times faster than real time
+  python sitl.py --no-wipe       # keep the simulator's existing parameter storage
+  python sitl.py --print-only    # print the command instead of running it
   ```
 
-  The double load is not optional: the file is an alphabetically-sorted dump, and the
-  `RNGFND1_*` sub-parameters only exist after `RNGFND1_TYPE` is set and the FC reboots, so a
-  single pass leaves `RNGFND1_MIN_CM`/`MAX_CM`/`GNDCLEAR` at firmware defaults and the
-  rangefinder reads 0.00 m on the ground (it aborted a mission this way on 2026-08-24). The
-  second pass — with the backend now present — fills them. Verify after the second reboot
-  with `param show RNGFND1_MIN_CM RNGFND1_MAX_CM RNGFND1_GNDCLEAR EK3_SRC1_POSZ FENCE_ENABLE
-  WPNAV_SPEED ARMING_CHECK` → expected `0 / 800 / 10 / 2 / 0 / 100 / 41350`. The mandated
-  rangefinder height source (`EK3_SRC1_POSZ 2`) is already in the mirror, so there is no
-  longer a separate mandate overlay to top it with.
+  The launcher resolves the ArduPilot checkout (`ARDUPILOT_HOME`, else
+  `../Simulation/ardupilot`, else `~/ardupilot`), resolves the highest-numbered mirror,
+  and runs, on **ArduCopter 4.6.3** (the release our flight controller runs):
+
+  ```
+  sim_vehicle.py -v ArduCopter --no-rebuild --console \
+    --custom-location=50.13119602511582,8.692972038286195,112.0,0 \
+    --add-param-file=<repo>/params/sitl_flight_v2.parm \
+    --out=udp:127.0.0.1:14550 --speedup 1 -w
+  ```
+
+  Run it from the environment that has `sim_vehicle.py` **and** `mavproxy.py` on PATH (our
+  `ardupilot` conda env), and run `python main.py --sim` from the Pi-Code environment in a
+  second terminal. Two pieces of that command line are load-bearing. `--custom-location`
+  starts the simulator at the coordinates the companion uses as its EKF origin; anywhere
+  else and pre-arm fails with *"Check mag field"* (the EKF-origin bullet below explains
+  why). `-w` wipes the parameter storage, which matters twice: every run starts from the
+  same parameter state, and the wipe also resets the simulated battery, which drains
+  across runs and otherwise aborts a later mission with a puzzling `LOW_BATTERY`.
+
+  **Why a startup defaults file, and why the old two-pass `param load` is superseded.**
+  The mirror is an alphabetically-sorted dump, and the `RNGFND1_*` sub-parameters
+  (`MIN_CM`/`MAX_CM`/`GNDCLEAR`/`ORIENT`) only exist once `RNGFND1_TYPE` has created the
+  backend. Loading the file into a RUNNING simulator therefore sends those names before
+  they exist and they are dropped in silence, leaving them at firmware defaults with the
+  rangefinder reading 0.00 m on the ground (it aborted a mission that way on 2026-08-24).
+  The documented remedy used to be `param load` plus `reboot`, twice. **That procedure was
+  reproduced on 2026-09-21 and it failed:** after the first reboot the `RNGFND1_*`
+  sub-parameters were still reported unknown, the second pass changed nothing
+  (*"changed 0"*), and after the second reboot MAVProxy lost the link and never got it
+  back. Passing the mirror as a **startup defaults file** (`--add-param-file`) removes the
+  dance rather than working around it: ArduPilot holds back a default whose parameter does
+  not exist yet and applies it the moment the driver creates it, so `RNGFND1_TYPE` and all
+  of its sub-parameters land in the SAME boot. One start, no reboot, no second pass.
+
+  **A bare `sim_vehicle.py` is not a substitute.** On firmware defaults `RNGFND1_TYPE = 0`
+  and `FLOW_TYPE = 0`, and the mission aborts in IDLE with `NO_RANGEFINDER_DATA`. That
+  abort is correct behaviour: the fault is the simulator's configuration, not the code.
+
+  **Verify once the banner is up**, in the MAVProxy console:
+  `param show RNGFND1_MIN_CM RNGFND1_MAX_CM RNGFND1_GNDCLEAR EK3_SRC1_POSZ FENCE_ENABLE
+  WPNAV_SPEED ARMING_CHECK` → expected `0 / 800 / 10 / 2 / 0 / 100 / 41350`, plus
+  `RNGFND1_TYPE 100`, `FLOW_TYPE 10`, `GPS1_TYPE 0`, `SIM_TERRAIN 0` and
+  `SIM_FLOW_ENABLE 1`. The boot banner is the faster check: 1646 parameters loaded,
+  *"EKF3 IMU0 fusing optical flow"* and *"started relative aiding"*. The companion then
+  goes over the same ground itself before it arms (the parameter check above), comparing a
+  simulated run against the MIRROR and never against the flight set, because the mirror
+  deviates from the aircraft on purpose. The rangefinder height source
+  (`EK3_SRC1_POSZ 2`) is our own configuration choice rather than an assignment
+  requirement (§5c), and it is already in the mirror, so there is no separate overlay to
+  top it with.
 
   **Real hardware (no GPS reception) — handled in Phase 3:** indoors there is no GPS to
   set the origin/home, so the companion does it itself:
@@ -131,7 +207,8 @@ adapter to the FC.
     one. Set
     `origin_lat`/`origin_lon` to the **real hall** coordinate
     so the magnetic declination matches. For SITL you **must** launch the sim at the same
-    spot (`sim_vehicle.py ... --custom-location=lat,lon,alt,0`) — the simulated compass is
+    spot; `python sitl.py` builds that `--custom-location` out of
+    `config.origin_lat`/`origin_lon`/`origin_alt` for you. The simulated compass is
     modelled at the SITL home, so a mismatch is not a small yaw
     offset but a hard pre-arm block: *"PreArm: Check mag field (z diff:976>200)"*. The
     976 mGauss is exactly the difference between the northern and southern hemisphere
@@ -180,6 +257,31 @@ conventions.** Calibrate once:
 
 Getting this wrong means the drone "corrects" **away** from the target. Verify in SITL
 with `ScriptedCamera`, then re-verify on the real camera (mounting may differ).
+
+**Check the FRAME as well as the signs. We got this wrong in our own simulator, and it
+cost a full milestone-5 run on 2026-09-21.** `SimCamera` returned the target's
+NORTH/EAST error, but `mission._nudge_from_offset()` feeds `dx`/`dy` to
+`Drone.move_body_offset()`, which uses `MAV_FRAME_BODY_OFFSET_NED` and is therefore
+rotated by the vehicle's **yaw**. A real downward camera sees the target in the IMAGE,
+and the image is bolted to the airframe, so the body frame is the correct contract and
+`SimCamera` was the unfaithful side. The bug is invisible while the nose points north.
+ArduCopter yaws toward each waypoint by default, so after a few legs of the search
+pattern the aircraft sat at yaw −139°: every correction went off at 139° to the error,
+the drone chased the pad out of its own field of view, fell back to SEARCH, re-detected
+and repeated until the simulated battery died. 146 nudges, four re-detections, never
+converged. Two things had hidden it for so long: the simulated pad sat at (2.0, 2.0),
+exactly on a spiral corner, so the aircraft arrived already centred and the servo loop
+never ran at all, and the unit-test `FakeDrone` assumed yaw = 0 on both sides, so the two
+errors cancelled. The fix: `SimCamera` rotates the earth-frame error into the body frame
+using `Drone.get_yaw()` (ATTITUDE, radians, from north, clockwise positive), `FakeDrone`
+rotates `move_body_offset()` by its yaw the way the real autopilot does, a parametrised
+regression test covers yaw 0°/45°/−139°/90°/180°, and the default simulated target moved
+to (2.5, 1.5), off a spiral corner, so a SITL rehearsal actually exercises the servo
+loop. (A milestone-2 rehearsal now moves the simulated pad under the hover spot for the
+same reason: before that it detected nothing at all.) After the fix milestone 5 converged
+in 3 nudges and released. The mounting table above fixes a swapped or inverted axis; it
+cannot fix an offset delivered in the wrong frame, because that error is zero at one
+heading and maximal at another.
 
 ### 3a. `RealCamera` (IMX500) — units and the model format
 
@@ -331,7 +433,9 @@ sensors did their job.
 - The companion **stopped writing FC parameters altogether** (team decision 2026-08-24,
   §5a). The crash fence was a companion-written parameter that outlived its run; the
   durable fix is that the companion no longer owns any FC parameter — Mission Planner and
-  the published `../params/flight_v2.param` do, and `preflight.py` verifies them. With the
+  the published `../params/flight_v2.param` do, and the companion verifies them
+  read-only: `preflight.py` on demand, and a pre-arm parameter check in every mission run
+  (§2, §5a). With the
   fence off, a stale `FENCE_ENABLE=1` found on the FC at startup is no longer cleared by
   the companion: it **refuses to fly** (`UNEXPECTED_FENCE_ENABLED`) and asks the operator
   to disable the fence in Mission Planner. The old write/restore/backup path
@@ -349,13 +453,16 @@ sensors did their job.
   on the **rangefinder** and refuses the handover when EKF and rangefinder disagree
   (`EKF_ALT_DIVERGED`).
 
-**What is still open.** `EK3_SRC1_POSZ = 2` — the rangefinder as the EKF's height
-source — is **mandated by the assignment** (the barometer as the EKF source is not
-permitted), so it stays on the FC by requirement, not by oversight. It is also the
-configuration in which the vertical estimate diverged above, so we fly it only under the
-**safety protocol** (see *What changed as a result*: preflight drift gate before every
-arming, geofence off, the rangefinder-gated `--takeover`, and the in-flight
-EKF-vs-rangefinder cross-check) while we investigate why EKF3 never fused a height. The
+**What is still open.** `EK3_SRC1_POSZ = 2`, the rangefinder as the EKF's height source,
+is **our own configuration choice**, not an assignment requirement. The assignment
+(Aufgabe 4) requires that the LiDAR and the optical flow be USED for position hold and
+altitude hold; it says nothing about which EKF source parameter carries the vertical
+position, so `EK3_SRC1_POSZ = 1` (barometer) remains an available option and we could
+still take it. It is also the configuration in which the vertical estimate diverged
+above, so we fly it only under the **safety protocol** (see *What changed as a result*:
+preflight drift gate before every arming, geofence off, the rangefinder-gated
+`--takeover`, and the in-flight EKF-vs-rangefinder cross-check) while we investigate why
+EKF3 never fused a height. The
 open investigation: a colleague team flies the **same** sensor with `POSZ = 2`
 successfully, so the next step is a full parameter diff against their aircraft — prime
 suspect `RNGFND1_GNDCLEAR` (the EKF's expected on-ground reading; ours was the default
@@ -378,8 +485,9 @@ after the crash: stock 4.6.3 halts with **"Config Error: Baro: unable to initial
 driver"** (in that state the FC streams no sensor data at all, so the zeros in
 FC_Check.pdf prove nothing about the rangefinder or flow — both were demonstrably
 healthy in the same day's logs). That cost us the barometer as an independent altitude
-**witness** and stopped stock 4.6.3 from booting at all (it is not, and by the mandate
-cannot be, the EKF height source). Two findings point at repairable wiring rather than a
+**witness** and stopped stock 4.6.3 from booting at all (it is not the EKF height source
+in our chosen configuration, though nothing forbids making it one). Two findings point at
+repairable wiring rather than a
 dead baro chip:
 
 1. The crash **tore off the GPS connector** (FC_Check.pdf §1.4: "in der Nähe des
@@ -406,8 +514,8 @@ See [`ROADMAP.md`](ROADMAP.md) ("Incident 2026-08-21") for the decision tracking
 > dead, only unreachable behind the hung single I2C bus. No new FC needed. This restores
 > the barometer as our independent altitude **witness** and lets stock 4.6.3 boot — it
 > does **not** change the EKF height source, which is the rangefinder
-> (`EK3_SRC1_POSZ = 2`) by assignment. Remaining before flight: reload the recovered
-> baseline + safe overrides (which now set `POSZ = 2` and `RNGFND1_GNDCLEAR = 2`,
+> (`EK3_SRC1_POSZ = 2`) by our own configuration choice. Remaining before flight: reload
+> the recovered baseline + safe overrides (which now set `POSZ = 2` and `RNGFND1_GNDCLEAR = 2`,
 > `../params/README.md`), recalibrate the compass, run `python preflight.py` and clear
 > its ground-drift gate, and do the hand-lift fusion test — then fly only under the
 > safety protocol above. Still open: the parameter diff against the colleague team's
@@ -432,8 +540,8 @@ See [`ROADMAP.md`](ROADMAP.md) ("Incident 2026-08-21") for the decision tracking
 > On the **real aircraft** the same mechanism is the **leading hypothesis**, still to be
 > confirmed via the colleague parameter diff: the landed reading is `0.02 m`, clearing a
 > `0.01 m` (`MIN_CM 1`) floor by a single centimetre. `POSZ = 2` is therefore
-> **exonerated as the blocker per se** — it stays **mandated**, and under this one
-> deviation the mirror flew a **fully green milestone 1** in SITL (EKF ready on the
+> **exonerated as the blocker per se**. It stays our chosen height source, and under this
+> one deviation the mirror flew a **fully green milestone 1** in SITL (EKF ready on the
 > ground, climb to 0.8 m, rangefinder track confirmed, 20 s hover at 0.03 m worst drift,
 > LAND). None of this revises the Link 1–3 history above; it names the fusion sub-cause
 > that history left incomplete. See `ROADMAP.md` ("Incident 2026-08-21", the 2026-08-25
@@ -481,8 +589,12 @@ unconfigured MTF-01P safe to fly.
 FC parameter.** FC parameters have exactly one owner: **Mission Planner plus the
 published, versioned flight parameter set** (`../params/flight_v2.param` — the full 1159-
 parameter dump copied from the aircraft; a v3 with the `FLTMODE` switch mapping follows).
-The companion's job is now to **verify** that set read-only (`preflight.py`), not to
-enforce it.
+The companion's job is now to **verify** that set read-only, not to enforce it, and it
+does so in two places: `preflight.py` when an operator runs it, and
+`FailsafeMonitor.verify_flight_parameters()` before **every** mission arms (§2). Both
+resolve "the published set" by VERSION, the highest `params/flight_v<N>.param` for the
+aircraft and the highest `params/sitl_flight_v<N>.parm` for a simulated run, so
+publishing a v3 needs no source edit anywhere.
 
 Two reasons, both learned the hard way:
 
@@ -507,6 +619,20 @@ If the live FC differs from the flight set, the fix is now to **change the FC ba
 Mission Planner** (or capture the aircraft and publish a new versioned param file) — not
 to let the companion silently patch it.
 
+Capturing the aircraft is deliberately two commands, because a check nobody can update is
+a check that gets switched off:
+
+```bash
+python dumpparams.py                            # publish params/flight_v<next>.param
+python params/generate_sitl_flight_params.py    # regenerate the SITL mirror
+```
+
+`dumpparams.py` downloads the live FC's full parameter list, re-requests any reply the
+link lost (a handful of the ~1600 replies routinely go missing) and writes Mission
+Planner's `NAME,VALUE` format. It sends no PARAM_SET: it is read-only on the aircraft.
+Review the diff and commit both files, so a flight log can be matched to the exact
+configuration it was flown under.
+
 > **`RTL_ALT` name-versioning still applies to whoever sets it.** It is **centimetres** on
 > ArduPilot 4.5/4.6 and was renamed to `RTL_ALT_M` (metres) in 4.7 — our FC runs 4.6.3, so
 > `RTL_ALT` in centimetres is correct. `param load` silently skips names the firmware does
@@ -522,7 +648,7 @@ Pi brownout) was cleaned up by the *next* run's `failsafe.recover_stale_params()
 useful for a throwaway SITL setup whose parameters no overlay otherwise carried.
 
 That gap was then closed by the flight set itself: `../params/sitl_flight_v2.parm` mirrors
-the envelope/fence limits (`FENCE_ENABLE 0`, `WPNAV_SPEED 100`, the mandated
+the envelope/fence limits (`FENCE_ENABLE 0`, `WPNAV_SPEED 100`, our chosen
 `EK3_SRC1_POSZ 2`), so a SITL run flies correctly with no companion writes at all. With the
 opt-in reduced to dead code, **the whole write/restore/backup machinery was deleted on
 2026-08-25** — `setup_safety_envelope()`, `restore_params()`, `recover_stale_params()`,

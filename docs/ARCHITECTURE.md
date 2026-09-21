@@ -20,6 +20,8 @@ flowchart TB
     mission["DeliveryMission — mission.py state machine"]
     drone["Drone — drone.py MAVLink actions"]
     fs["FailsafeMonitor — failsafe.py"]
+    pc["paramcheck.py — published parameter set, read-only"]
+    pre["preflight.py — manual pre-flight sweep"]
     fc[("Flight Controller / SITL")]
 
     subgraph cam["Camera — Protocol, camera.py"]
@@ -51,6 +53,8 @@ flowchart TB
     mission -.->|reads| cfg
     fs --> drone
     fs -.->|reads| cfg
+    fs -.->|"reads (verify_flight_parameters)"| pc
+    pre -.->|reads| pc
     drone -.->|reads| cfg
     drone <-->|"MAVLink: UDP — SITL directly, Pi via mavlink-router"| fc
     fcservo -->|"DO_SET_SERVO"| drone
@@ -60,11 +64,12 @@ flowchart TB
 | Component | Responsibility |
 |-----------|----------------|
 | `main.py` | Chooses the `Config`, sets up logging, wires the objects, starts the mission. The SITL-vs-aircraft choice is made here from the command line (`make_config(sys.argv)`), not by editing `config.py`, so the same checked-out code runs on the Mac and on the drone. |
-| `Config` | All parameters. The **dataclass defaults are the flight configuration**, so `Config.pi()` overrides only the endpoint and every simulation deviation is confined to `Config.sitl()` (drop-servo path, battery threshold, camera source). `main.py` defaults to the real aircraft; `--sim` opts into the simulator, and the active profile is logged on every start. |
-| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. The link is UDP in **both** worlds: against SITL directly, on the Pi through mavlink-router, which owns the UART to the FC and fans the stream out to us and to a ground station. A direct UART link is only the `--pi-serial` fallback for setups without the router. |
-| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera` for simulation, `TimedCamera` for camera-less **real** flight tests — it is the current default on the aircraft (`camera_source="timed"`) and does no detection at all, it just reports "centred" after a fixed time so the search and drop can be flown without the AI camera — and `RealCamera` for the IMX500 AI camera (network runs on the sensor's NPU, so the Pi's CPU stays free for MAVLink). Same contract throughout, so the mission never changes. Chosen by `config.camera_source`. `RealCamera` returns **ground metres**, not image fractions — see [SIM_TO_REAL.md §3a](SIM_TO_REAL.md) for why, and for the `cam_*` mounting calibration. |
+| `Config` | All parameters. The **dataclass defaults are the flight configuration**, so `Config.pi()` overrides only the endpoint and every simulation deviation is confined to `Config.sitl()` (drop-servo path, battery threshold, camera source). `main.py` defaults to the real aircraft; `--sim` opts into the simulator, and the active profile is logged on every start. `is_simulation` is a real field, set only by `Config.sitl()` and never inferred: the profile banner, the fresh-SITL hint and the choice of expected parameter file all ask that question, and they used to answer it from `release_mechanism == "fc"`, which happened to be true but said the wrong thing. `param_check` ("abort", "warn", "off") and `expected_params_path` configure the pre-arm parameter check. |
+| `Drone` | Wraps the MAVLink link. Low-level actions: heartbeat in **and out**, telemetry, verified EKF origin, mode/arm/verified takeoff/goto/goto_local/land/RTL, body-frame nudges, heading from `ATTITUDE` (`get_yaw()`, radians from north, clockwise positive), FC servo helpers. `tick()` keeps our GCS heartbeat alive and mirrors autopilot `STATUSTEXT` into the log. Hardware-agnostic. The link is UDP in **both** worlds: against SITL directly, on the Pi through mavlink-router, which owns the UART to the FC and fans the stream out to us and to a ground station. A direct UART link is only the `--pi-serial` fallback for setups without the router. |
+| `Camera` | A `Protocol` returning `{detected, dx, dy, distance}`. `MockCamera`/`ScriptedCamera`/`SimCamera` for simulation, `TimedCamera` for camera-less **real** flight tests — it is the current default on the aircraft (`camera_source="timed"`) and does no detection at all, it just reports "centred" after a fixed time so the search and drop can be flown without the AI camera — and `RealCamera` for the IMX500 AI camera (network runs on the sensor's NPU, so the Pi's CPU stays free for MAVLink). Same contract throughout, so the mission never changes. Chosen by `config.camera_source`. `RealCamera` returns **ground metres**, not image fractions — see [SIM_TO_REAL.md §3a](SIM_TO_REAL.md) for why, and for the `cam_*` mounting calibration. Those metres are in the **body** frame (`dx` right, `dy` forward), because `mission._nudge_from_offset()` hands them to `Drone.move_body_offset()`, which uses `MAV_FRAME_BODY_OFFSET_NED` and is therefore rotated by the vehicle's yaw. A real downward camera sees the target in its IMAGE, and the image is bolted to the airframe, so the body frame is the honest contract. `SimCamera` is the one implementation that knows the world in the earth frame, so it rotates its north/east error into the body frame with `Drone.get_yaw()`; reporting the raw earth-frame error modelled a yaw-stabilised camera that does not exist (see the `APPROACH` bullet below). |
 | `ReleaseMechanism` | A `Protocol` (`setup/reset/drop/confirm`) for the payload drop. `FcServo` drives a servo on an FC output over MAVLink (SITL); `PiServo` drives a servo on a Pi GPIO pin directly. Chosen by `config.release_mechanism` — the mission never changes. |
-| `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout, position envelope, and the continuous EKF-vs-rangefinder altitude cross-check (`EKF_ALT_DIVERGED`). Returns a reason string; the mission decides to ABORT. Since the 2026-08-24 ownership decision it **verifies** FC parameters read-only rather than writing them (`verify_fence_disabled()` is a read-only stale-fence check that can abort with `UNEXPECTED_FENCE_ENABLED`); the old crash-proof save/restore path was **deleted on 2026-08-25** — the flight companion writes no FC flight parameter at all (the one PARAM_SET it still issues anywhere is `FcServo`'s SITL-only `SERVO9_FUNCTION=0`, a servo-output setup, not flight configuration). |
+| `FailsafeMonitor` | Companion-side safety: link loss, telemetry loss, battery, phase timeout, position envelope, and the continuous EKF-vs-rangefinder altitude cross-check (`EKF_ALT_DIVERGED`). Returns a reason string; the mission decides to ABORT. Since the 2026-08-24 ownership decision it **verifies** FC parameters read-only rather than writing them (`verify_fence_disabled()` is a read-only stale-fence check that can abort with `UNEXPECTED_FENCE_ENABLED`, and `verify_flight_parameters()` reads a curated subset of the configuration back from the FC before arming and aborts with `FC_PARAMS_MISMATCH` when a flight-critical value differs from the published set); the old crash-proof save/restore path was **deleted on 2026-08-25** — the flight companion writes no FC flight parameter at all (the one PARAM_SET it still issues anywhere is `FcServo`'s SITL-only `SERVO9_FUNCTION=0`, a servo-output setup, not flight configuration). |
+| `paramcheck` | The one shared, read-only answer to "does the flight controller carry the parameters we published?". It parses a published parameter file, resolves the newest one by VERSION (`params/flight_v<N>.param` for the aircraft, the generated mirror `params/sitl_flight_v<N>.parm` for a simulated run, so publishing a v3 needs no source edit anywhere) and diffs live values against it. The verified list is split in two: CRITICAL (EKF sources, rangefinder and flow backends, the speed envelope, the battery failsafe actions) refuses a flight, INFORMATIONAL (`ARMING_CHECK`, the battery thresholds, `FLOW_ORIENT_YAW`) is reported and flown, because a gate that cries wolf gets switched off. Deliberately free of `drone.py` and `pymavlink`: it reads files and compares dictionaries, so both callers share one parser and one comparison. Read by `FailsafeMonitor.verify_flight_parameters()` (the pre-arm gate) and by `preflight.py` (the manual sweep); `dumpparams.py` closes the loop by publishing the next `flight_v<N>.param` from the live aircraft. |
 | `DeliveryMission` | The state machine that sequences the delivery and runs the failsafe check before each state. |
 | `logbook` | Configures logging to console + a timestamped file under `logs/`. |
 
@@ -166,7 +171,19 @@ stateDiagram-v2
   pattern is exhausted without a hit → `ABORT` (reason `TARGET_NOT_FOUND`).
 - **`APPROACH`** (`mission._approach`) does visual servoing: it nudges the drone in the
   body frame from the camera's `dx/dy` until centred, then `DROP`. If the target is lost
-  for too many frames in a row it falls back to `SEARCH`.
+  for too many frames in a row it falls back to `SEARCH`. **`dx` and `dy` are ground
+  metres in the BODY frame** (`dx` right, `dy` forward), not north/east:
+  `_nudge_from_offset()` passes them straight to `Drone.move_body_offset()`, which uses
+  `MAV_FRAME_BODY_OFFSET_NED` and is rotated by the vehicle's yaw. `SimCamera` therefore
+  rotates the earth-frame error it knows into the body frame with `Drone.get_yaw()`.
+  Until 2026-09-21 it did not, and the mismatch was invisible only while the nose pointed
+  north. ArduCopter yaws toward each waypoint by default, so a few legs into the search
+  pattern the aircraft sat at yaw -139 degrees: every correction went off at 139 degrees
+  to the error, the drone chased the pad out of its own field of view, fell back to
+  `SEARCH`, re-detected and repeated until the simulated battery died (146 nudges, four
+  re-detections, never converged). A parametrised regression test now pins the rotation
+  at yaw 0, 45, -139, 90 and 180 degrees, and the default simulated pad was moved off a
+  spiral corner to (2.5, 1.5) so a SITL rehearsal actually runs the servo loop.
 - The indoor path goes **`APPROACH → DROP` directly**; `OVER_TARGET` is the GPS path's
   fine-centring state. The `Camera` contract is unchanged, so the detector can be
   swapped (`SimCamera` → `RealCamera`) without touching the mission.
@@ -198,7 +215,13 @@ stateDiagram-v2
 
 `--sim --milestone N` rehearses a stage in the simulator; the simulated detector is
 substituted for the IMX500 and the substitution is logged, so a rehearsal can never
-quietly use a different camera than the milestone names.
+quietly use a different camera than the milestone names. A rehearsal of **milestone 2**,
+the one stage that both hovers and asks for the camera, additionally moves the simulated
+pad under the hover spot, because `SimCamera` only "sees" within `sim_fov_radius_m` of it.
+Before that, the pad sat out in the search area, a milestone-2 rehearsal detected nothing
+at all, and it exercised neither the detection path nor the log line the milestone exists
+to produce. The search milestones keep the offset pad, since finding it is the point
+there.
 
 Two guards run alongside these and exist because of one specific failure — a GPS-denied
 position estimate that loses its height reference does not stop, it *drifts*, and the
@@ -255,6 +278,10 @@ sequenceDiagram
     FS->>Dr: read_param("FENCE_ENABLE")  (read-only stale-fence check)
     Dr->>FC: PARAM_REQUEST_READ FENCE_ENABLE
     FS-->>Mis: None, OR "UNEXPECTED_FENCE_ENABLED" -> ABORT (a fence this run did not ask for; disable it in Mission Planner)
+    Mis->>FS: verify_flight_parameters()  (after the fence check, before arming)
+    FS->>Dr: read_params(paramcheck.VERIFIED_PARAMS)  (batched, bounded per round)
+    Dr->>FC: PARAM_REQUEST_READ (one burst per round, read-only)
+    FS-->>Mis: None, OR "FC_PARAMS_MISMATCH" -> ABORT (param_check abort by default, or warn, or off)
     Mis->>Rel: setup()  (FcServo)
     Rel->>Dr: configure_drop_servo()
     Dr->>FC: PARAM_SET SERVO9_FUNCTION=0
@@ -304,14 +331,34 @@ sequenceDiagram
 > the FC left our mode) or goes to `RECOVER` — see the state diagram above.
 >
 > **Parameter ownership (team decision 2026-08-24; machinery deleted 2026-08-25).** The
-> companion writes **no** FC parameter: Mission Planner + the published
-> `params/flight_v2.param` own the flight configuration and `preflight.py` verifies it
-> read-only. `_idle()` logs one info line ("FC parameters are Mission-Planner-owned; the
+> companion writes **no** FC parameter: Mission Planner + the published, versioned flight
+> set (`params/flight_v<N>.param`, highest N wins) own the flight configuration, and it is
+> verified read-only twice, by `preflight.py` on the ground and by the mission itself
+> before it arms. `_idle()` logs one info line ("FC parameters are Mission-Planner-owned; the
 > companion verifies read-only") and calls `verify_fence_disabled()`, a **read-only
 > stale-fence check**: it reads `FENCE_ENABLE`, and if a fence this run did not ask for is
 > armed it **aborts with `UNEXPECTED_FENCE_ENABLED`** (the operator disables it in Mission
 > Planner) — it never writes `FENCE_ENABLE=0`. The published set carries the fence off
 > (`FENCE_ENABLE 0`, the default since the 2026-08-21 incident — see SIM_TO_REAL.md §5c).
+>
+> **The pre-arm parameter check (`FC_PARAMS_MISMATCH`).** Right after the fence check and
+> before the sensor gate, `_idle()` calls `failsafe.verify_flight_parameters()`. It reads
+> the curated subset in `paramcheck.VERIFIED_PARAMS` back from the FC and compares it with
+> the published file: a CRITICAL difference aborts with `FC_PARAMS_MISMATCH`, an
+> informational one is logged and flown. This is the other half of the ownership decision.
+> Handing the parameters to Mission Planner removed the surprise-overwrite failure mode
+> that caused the 2026-08-21 crash, but it opened a quieter one, because nothing then
+> noticed when the aircraft in front of you stopped being the aircraft the code was
+> reasoned about. A parameter the FC does not answer for is reported as "could not read"
+> and does **not** block: a busy link drops `PARAM_VALUE` replies, and that is
+> indistinguishable from a name the firmware does not know. The fence stays out of the
+> list on purpose, since `verify_fence_disabled()` already refuses on it under a better
+> name. A simulated run is compared against the generated mirror
+> `params/sitl_flight_v<N>.parm` rather than the flight set, because the mirror deviates
+> from the aircraft deliberately (SITL sensor backends, GPS off, the `RNGFND1_MIN_CM`
+> validity floor, the simulated pack's battery voltages). `config.param_check` chooses
+> "abort" (the default), "warn" or "off"; `config.expected_params_path` pins one file
+> instead of resolving the newest.
 >
 > The old write/restore/backup path — `setup_safety_envelope()`, `recover_stale_params()`,
 > `restore_params()`, `_set_rtl_altitude()`, the `enforce_safety_envelope` opt-in and the
@@ -348,12 +395,14 @@ differs.
 
 **Unchanged from sequence 1:** `connect()` / heartbeat, the failsafe `check()` before
 every state, the rest of IDLE (the ownership info line, the read-only
-`verify_fence_disabled()` check, release `setup()`/`reset()`, GUIDED, arm), and the final
+`verify_fence_disabled()` and `verify_flight_parameters()` checks, release
+`setup()`/`reset()`, GUIDED, arm), and the final
 DROP → RECOVER (LAND) block —
 the mission calls are identical, so they are not redrawn below. (IDLE also gains the
 optional `set_origin()` **and** the pre-arm sensor gate
 `failsafe.verify_position_sensors()` — indoor only, it proves the rangefinder and the
-optical flow actually stream data before anything arms; see the Changed table.)
+optical flow actually stream data before anything arms; see the Changed table. The sensor
+gate runs after those two read-only checks.)
 `TAKEOFF` is **not** in this list: the state is the same call, but it climbs to a
 different altitude, and right after the climb
 `failsafe.verify_rangefinder_tracks_altitude()` proves the rangefinder follows the
@@ -409,10 +458,12 @@ sequenceDiagram
     note over Mis: target detected -> APPROACH
     loop until centred (else lost -> SEARCH)
         Mis->>Cam: get_target_offset()
-        Cam-->>Mis: {detected, dx, dy}
+        Cam->>Dr: get_yaw()  (SimCamera only, to rotate its earth-frame error into the body frame)
+        Dr->>FC: read ATTITUDE
+        Cam-->>Mis: {detected, dx, dy} in the BODY frame (dx right, dy forward)
         Mis->>Mis: _nudge_from_offset(dx, dy)
         Mis->>Dr: move_body_offset(forward, right)
-        Dr->>FC: SET_POSITION_TARGET_LOCAL_NED (BODY_OFFSET)
+        Dr->>FC: SET_POSITION_TARGET_LOCAL_NED (BODY_OFFSET, rotated by the vehicle yaw)
     end
 
     note over Mis: centred -> DROP -> RECOVER (land)
