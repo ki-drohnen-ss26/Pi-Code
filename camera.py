@@ -272,6 +272,39 @@ class RealCamera:
     # ------------------------------------------------------------------
     # Detection
     # ------------------------------------------------------------------
+    def get_detection(self) -> dict:
+        """Return the strongest target candidate and its confidence.
+
+        This is the read-only interface used by ``camera_test.py``.  ``detected``
+        means that the candidate passed ``camera_confidence``; when a weaker
+        candidate exists its confidence is still returned so camera placement and
+        lighting can be diagnosed without changing the flight threshold.
+        """
+        if self._picam2 is None:
+            raise RuntimeError("RealCamera.start() was never called")
+
+        metadata = self._picam2.capture_metadata()
+        candidate = self._best_candidate(metadata)
+        if candidate is None:
+            return {
+                "detected": False,
+                "confidence": None,
+                "class_id": None,
+                "label": None,
+                "box": None,
+            }
+
+        x0, y0, x1, y1, score, class_id = candidate
+        label = (self._labels[class_id] if 0 <= class_id < len(self._labels)
+                 else str(class_id))
+        return {
+            "detected": score >= self._c.camera_confidence,
+            "confidence": score,
+            "class_id": class_id,
+            "label": label,
+            "box": (x0, y0, x1, y1),
+        }
+
     def get_target_offset(self) -> dict:
         """One frame -> the mission's {detected, dx, dy, distance} contract."""
         log = logging.getLogger(__name__)
@@ -311,6 +344,19 @@ class RealCamera:
         [0, 1]. Only the wanted class counts when `camera_target_class` is set - a
         model trained on several classes must not send the drone after the wrong one.
         """
+        best = self._best_candidate(metadata)
+        if best is None or best[4] < self._c.camera_confidence:
+            return None
+        return best
+
+    def _best_candidate(self, metadata):
+        """Highest-confidence candidate for the configured target class.
+
+        Unlike :meth:`_best_detection`, this intentionally does not apply the
+        confidence threshold.  The bench test can therefore show, for example,
+        ``NOT FOUND, confidence=0.54, threshold=0.70`` instead of hiding the most
+        useful diagnostic value.
+        """
         log = logging.getLogger(__name__)
         outputs = self._imx500.get_outputs(metadata, add_batch=True)
         if outputs is None:
@@ -329,8 +375,7 @@ class RealCamera:
         boxes, scores, classes = outputs[0][0], outputs[1][0], outputs[2][0]
         best = None
         for box, score, class_id in zip(boxes, scores, classes):
-            if score < self._c.camera_confidence:
-                continue
+            score = float(score)
             class_id = int(class_id)
             if (self._c.camera_target_class is not None
                     and class_id != self._c.camera_target_class):
@@ -344,7 +389,7 @@ class RealCamera:
                              f"(x0={decoded[0]:.3f}, y0={decoded[1]:.3f}, "
                              f"x1={decoded[2]:.3f}, y1={decoded[3]:.3f}) - verify per "
                              f"docs/SIM_TO_REAL.md §3a")
-                best = (*decoded, float(score), class_id)
+                best = (*decoded, score, class_id)
         return best
 
     def _decode_box(self, box) -> tuple:

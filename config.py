@@ -69,9 +69,9 @@ class Config:
     # DEFAULT = the real aircraft. Config.sitl() switches this to "fc".
     release_mechanism: str = "pi"
     drop_servo: int = 9            # "fc": servo output (SERVO9 = AUX OUT 1 on many FCs)
-    drop_gpio_pin: int = 18        # "pi": BCM GPIO pin (18 = phys pin 12, hardware-PWM capable)
-    drop_pwm: int = 1900           # release pulse [us] (hatch open) - used by both paths
-    neutral_pwm: int = 1100        # rest pulse [us] (hatch closed) - used by both paths
+    drop_gpio_pin: int = 18        # "pi": BCM GPIO pin (18 = physical pin 12, hardware-PWM capable)
+    neutral_pwm: int = 1767           # release: ~60 deg above 1100 us neutral for the MS18
+    drop_pwm: int = 1100        # rest pulse [us] (hatch closed) - used by both paths
 
     # ------------------------------------------------------------------
     # Failsafe / safety

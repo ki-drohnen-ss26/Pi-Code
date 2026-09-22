@@ -224,6 +224,7 @@ class DeliveryMission:
         """Record ground diagnostics, then command and verify disarming."""
         log.warning(f"[ARM_TEST] Armed on the ground; holding for "
                     f"{self.config.arm_test_s:.0f} s. No takeoff command will be sent.")
+
         diagnostics = self.drone.read_arm_test_diagnostics(self.config.arm_test_s)
 
         if not diagnostics["armed_throughout"]:

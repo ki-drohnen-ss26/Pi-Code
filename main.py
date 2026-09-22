@@ -18,6 +18,9 @@ Staged bring-up on a new aircraft - each stage adds exactly ONE unknown:
     python main.py --milestone 5   # search + detect + centre, no drop  (approach)
     python main.py --milestone 6   # the full delivery                  (release)
 
+The payload-servo bench test is deliberately a separate entry point:
+    python servo_test.py          # cycle release/reset without connecting to the FC
+
 Rehearse any of them in the simulator first with `--sim --milestone N`; the simulated
 detector is substituted for the IMX500 and the substitution is logged. Individual
 switches (--hover / --alt / --no-drop) still work and override a milestone.

@@ -397,7 +397,7 @@ class Drone:
         }
 
     def read_arm_test_diagnostics(self, duration: float) -> dict:
-        """Record ground sensor/EKF behaviour while milestone 1 remains armed.
+        """Record ground sensor/EKF behaviour while a ground milestone remains armed.
 
         This is diagnostic only: missing data is reported to the operator but never
         delays the disarm command beyond ``duration``. It cannot prove in-flight sensor
