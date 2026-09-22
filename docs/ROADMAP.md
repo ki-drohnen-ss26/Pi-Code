@@ -200,7 +200,7 @@ detected on the Pi (`imx500 [4056x3040]`), and the mounting calibration is expos
 test flights. **The model blocker is resolved (2026-09-21):** the `.rpk` re-export
 (`yolo export … format=imx` → `imx500-package`) has landed, and object detection now
 works on the real aircraft. Still ahead: the companion's own autonomous `--milestone`
-bring-up flights with the real camera (milestones 2, 4 and 5) have not been flown yet,
+bring-up flights with the real camera (milestones 3, 5 and 6) have not been flown yet,
 and the axis calibration (`cam_swap_axes`/`cam_invert_x`/`cam_invert_y`) still needs
 confirming in the air rather than only on the bench.
 
@@ -233,15 +233,20 @@ the command line with `--milestone N` so no source is edited between flights.
 2. Manual `PosHold`/`Loiter` → confirms optical-flow position hold. **☑ Loiter flying
    (2026-08-24 evening)**; the earlier oscillation was cured by halving
    `ATC_RAT_PIT`/`ATC_RAT_RLL` P/I (0.135→0.0675) and D (0.0036→0.0018) (v1→v2 tune).
-3. `--milestone 1` — companion hover at 0.8 m. The logged **drift** is the result, not the
+3. `--milestone 1` — ground arm test only: run the full pre-arm sequence, arm, hold armed
+   on the ground for `arm_test_s` seconds (default 5 s) while logging rangefinder,
+   optical-flow and EKF drift diagnostics, then disarm. The aircraft never leaves the
+   ground; the point is to prove arming and disarming both work cleanly before ever
+   risking a climb.
+4. `--milestone 2` — companion hover at 0.8 m. The logged **drift** is the result, not the
    fact that it hovered: a broken flow setup still flies, it just walks away.
-4. `--milestone 2` — same flight with the detector running, logging only. Verify the
+5. `--milestone 3` — same flight with the detector running, logging only. Verify the
    **sign** of `dx`/`dy` here (pad to the right → positive `dx`), on the ground first.
-5. `--milestone 3` — the search pattern, no detector. Ends in `TARGET_NOT_FOUND`; that
+6. `--milestone 4` — the search pattern, no detector. Ends in `TARGET_NOT_FOUND`; that
    is the pass condition. Note the spiral reaches `search_max_radius_m` **plus one**
    `search_step_m` and nothing bounds it horizontally.
-6. `--milestone 4` — search, detect and centre with nothing able to fall out.
-7. `--milestone 5` — the full indoor delivery.
+7. `--milestone 5` — search, detect and centre with nothing able to fall out.
+8. `--milestone 6` — the full indoor delivery.
 
 - **2026-08-25 (from the hall dataflash logs):** **AltHold verified clean in the hall**
   (36 s stable, 0.12 m position excursion). **Loiter is blocked by the hall's magnetics** —
@@ -263,7 +268,7 @@ the command line with `--milestone N` so no source is edited between flights.
   field, which no calibration can remove. Flying compassless is not an escape either: on the
   `flight_v2` SITL mirror (4.6.3) `COMPASS_USE=0` + `EK3_SRC1_YAW=0` flapped EKF aiding on/off
   and refused arming with *"Need Position Estimate"* (5/5), while the same mirror with the
-  compass flew milestone 1 green — so the compass is mandatory and the fix must make *it*
+  compass flew milestone 2 green — so the compass is mandatory and the fix must make *it*
   usable in the hall. The ranked options (field-mapping a stable takeoff zone, the
   colleague-team comparison, an `EK3_MAG_M_NSE` damping experiment, a hand-lift
   building-vs-self test, or escalation) live in `project-docs` → Problems → "Loiter drifts in
@@ -279,13 +284,13 @@ the command line with `--milestone N` so no source is edited between flights.
   Problems → [Loiter drifts in the hall](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/hall-magnetics.md).
   Companion `--milestone` flights in the hall are the next step, not yet attempted.
 - **2026-09-21 (SITL sweep on ArduCopter 4.6.3): every `--milestone` stage is green IN
-  SIMULATION.** Milestone 1: climb to 0.8 m, rangefinder track 0.84 m, 20 s hover, worst
-  horizontal drift 0.04 to 0.06 m, LAND, disarm. Milestone 2: the same at 1.0 m, and the
+  SIMULATION.** Milestone 2: climb to 0.8 m, rangefinder track 0.84 m, 20 s hover, worst
+  horizontal drift 0.04 to 0.06 m, LAND, disarm. Milestone 3: the same at 1.0 m, and the
   substituted simulated detector now logs *"Camera sees the target"* every second (the
   rehearsal moves the simulated pad under the hover spot, so the detection path and its log
-  line are actually exercised instead of staring at empty floor). Milestone 3: all 25 spiral
+  line are actually exercised instead of staring at empty floor). Milestone 4: all 25 spiral
   waypoints flown in 219 s, ending in `TARGET_NOT_FOUND`, which is the pass condition.
-  Milestone 4: detects, centres, releases nothing. Milestone 5: detects, centres in 3
+  Milestone 5: detects, centres, releases nothing. Milestone 6: detects, centres in 3
   nudges, `[DROP] Release confirmed`, LAND. The full mission (`main.py --sim`, no milestone
   flag) is green too, and the pre-mission parameter check reports *"Flight parameters match
   sitl_flight_v2.parm"*. This validates the companion logic of every stage end to end. It
@@ -331,7 +336,7 @@ Driven entirely by things that actually went wrong in SITL:
   fallback) was originally *set + restored* by the companion before/after every flight,
   mirrored to disk so even a killed run was cleaned up by the next one. **Superseded on
   2026-08-25** by the parameter-ownership decision: those limits now live in
-  `params/flight_v2.param` (owned by Mission Planner) and the companion only verifies them
+  `params/flight_v3.param` (owned by Mission Planner) and the companion only verifies them
   read-only. The stale-fence trigger of the 2026-08-21 incident (a leftover `FENCE_ACTION=2`)
   is now caught read-only by `verify_fence_disabled()`, which refuses to fly rather than
   writing anything.
@@ -357,7 +362,7 @@ Driven entirely by things that actually went wrong in SITL:
   rotates `move_body_offset()` by its yaw the way the real autopilot does, and a
   parametrised regression test covers yaw 0, 45, -139, 90 and 180 degrees. The default
   simulated target moved to (2.5, 1.5), off a spiral corner, so a SITL rehearsal actually
-  exercises the servo loop. Milestone 5 then converged in 3 nudges and released.
+  exercises the servo loop. Milestone 6 then converged in 3 nudges and released.
 
 **Done when:** `pytest` covers each of the above and a SITL run logs the
 firmware version, the autopilot's own messages and a named abort reason. ☑
@@ -379,7 +384,7 @@ firmware version, the autopilot's own messages and a named abort reason. ☑
 | 2     | GPS-denied nav + target search | ☑ done (SITL: optical-flow search→approach→drop verified; the approach loop's earth-frame/body-frame bug found and fixed 2026-09-21) |
 | 3     | GPS-denied real HW: origin, fence, TimedCamera | ☑ done (SITL on ArduCopter **4.6.3**: origin set + verified by the companion, GPS off, full indoor mission green) |
 | 3b    | Diagnostics & safety hardening | ☑ done (STATUSTEXT logging, companion heartbeat, verified origin/takeoff, mode monitoring, LAND instead of RTL, FC safety envelope) |
-| 4     | Real AI camera                 | ☑ `RealCamera` implemented + wired; IMX500 detected on the Pi. The `.rpk` re-export landed 2026-09-21, and **object detection now works on the real aircraft**. Open: fly the axis calibration (milestone 2), not yet confirmed in the air |
+| 4     | Real AI camera                 | ☑ `RealCamera` implemented + wired; IMX500 detected on the Pi. The `.rpk` re-export landed 2026-09-21, and **object detection now works on the real aircraft**. Open: fly the axis calibration (milestone 3), not yet confirmed in the air |
 | 5     | Pi provisioning & HIL prep     | ☑ Pi image, `mavlink-router` (systemd, `/dev/serial0` @ 921600 → `127.0.0.1:14550`), pymavlink, gpiozero/lgpio all **verified on hardware**. MTF-01P configured and streaming (see note below) |
 | 6     | Bench integration (no props)   | ◑ Companion↔FC link verified against the real FC (heartbeat, `--tele`, ArduPilot 4.6.3). Servo drop + arm/disarm still open |
 | 7     | Flight tests                   | ◑ **manual modes flying on the real aircraft:** both **AltHold and Loiter** work with the chosen `EK3_SRC1_POSZ=2`; the v1→v2 oscillation was fixed by **halving `ATC_RAT_PIT`/`ATC_RAT_RLL` P/I (0.135→0.0675) and D (0.0036→0.0018)**. Loiter is good in the lab and, as of 2026-09-21, flyable (though still imperfect) in the hall too with an "arm and go" procedure that minimises ground dwell before climbing; see [project-docs → Problems → Loiter drifts in the hall](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/hall-magnetics.md) for the mechanism. **All five `--milestone` stages and the full mission are green in SITL (2026-09-21, 4.6.3)**, so the companion logic is validated; the companion's own autonomous `--milestone` flights (GUIDED, software controlled) have not been flown on the real aircraft yet, now that AltHold and Loiter work well enough to attempt them |
@@ -402,7 +407,7 @@ the *decisions and blockers* that came out of it.
   downwash spike on every takeoff, and `FENCE_ACTION=2` then forced LAND over the pilot).
 - **Parameter ownership (2026-08-24): the companion no longer writes any FC parameter.**
   FC parameters now have one owner — Mission Planner plus the published, versioned flight
-  parameter set (`params/flight_v2.param`); the companion verifies them read-only
+  parameter set (`params/flight_v3.param`); the companion verifies them read-only
   (`preflight.py`). Two reasons: (1) a **single source of truth** for the flight
   configuration, and (2) **no surprise overwrites** — the 2026-08-21 crash fence was
   precisely a companion-written parameter that outlived its run. A
@@ -513,7 +518,7 @@ documented evidence of a concrete working parameter set in this lab, so
 `EK3_SRC1_POSXY` (ours: 0) now joins `EK3_SRC1_POSZ` and `RNGFND1_GNDCLEAR` as concrete
 values to compare in that diff. The same script also warns that optical flow is
 typically poor below ~0.5 m ("keep above ~0.5 m") — which bears on our minimum test
-altitudes, including the 0.8 m first-flight choice for milestone 1.
+altitudes, including the 0.8 m first-flight choice for milestone 2.
 
 *Breakthrough (2026-08-25) — the on-ground blocker in SITL is the `RNGFND1_MIN_CM`
 validity floor, not `POSZ`.* A clean 2×2 matrix on a wiped, mirror-loaded SITL (each cell
@@ -530,9 +535,9 @@ landed rangefinder reads exactly `0.00 m`, so `MIN_CM 1` flags it out-of-range-l
 gets no range, optical flow cannot be scaled, and no relative position (nor, under `POSZ 2`,
 any height) initialises. The **real aircraft sits 1 cm above** the same floor (reads
 `0.02 m` with `MIN_CM 1`), so this gate is now the leading suspect for the crash-day
-divergence. With this deviation the mirror flew a **fully green milestone 1** in SITL under
+divergence. With this deviation the mirror flew a **fully green milestone 2** in SITL under
 the chosen `POSZ 2`: EKF ready on the ground, climb to 0.8 m, rangefinder track confirmed,
-20 s hover at **0.03 m** worst horizontal drift, LAND — the milestone-1 logic is validated
+20 s hover at **0.03 m** worst horizontal drift, LAND — the milestone-2 logic is validated
 end-to-end. *Next real-aircraft steps:* the colleague parameter diff
 (`EK3_SRC1_POSZ` / `EK3_SRC1_POSXY` / `RNGFND1_MIN_CM` / `RNGFND1_GNDCLEAR`) and a team
 decision whether to set `RNGFND1_MIN_CM = 0` on the aircraft — applied via Mission Planner

@@ -1,7 +1,7 @@
 # Flight-controller parameters
 
 A reproducible flight needs a known flight-controller (FC) parameter set. This folder
-holds the SITL mirror of the flight set (`sitl_flight_v2.parm`) so a simulated run always
+holds the SITL mirror of the flight set (`sitl_flight_v3.parm`) so a simulated run always
 flies the same parameters we fly, **plus** — since 2026-08-22 — the recovered baseline of
 the **real** flight controller:
 `fc_baseline_463_20260821.parm` was reconstructed from the crash day's dataflash log
@@ -14,9 +14,9 @@ top** — see *Restoring the real FC after the wipe* below.
 ## Parameter ownership (team decision, 2026-08-24)
 
 FC parameters have exactly **one owner**: **Mission Planner plus the published, versioned
-flight parameter set** (`flight_v2.param`). The companion computer **no longer writes any
+flight parameter set** (`flight_v3.param`). The companion computer **no longer writes any
 FC parameter** — it **verifies** them read-only in `preflight.py`, which loads
-`flight_v2.param` (override with `--expected PATH`) and prints every parameter on the live
+`flight_v3.param` (override with `--expected PATH`) and prints every parameter on the live
 FC that differs from the published set. Two reasons: a **single source of truth** for the
 flight configuration, and **no surprise overwrites** — the 2026-08-21 crash fence was
 precisely a companion-written parameter that outlived its run. So when the live FC differs
@@ -24,8 +24,9 @@ from the flight set, the fix is to **change it in Mission Planner** (or capture 
 aircraft and publish a new versioned file), never to let the companion patch it. The old
 write/restore machinery in `failsafe.py` (`enforce_safety_envelope`, `setup_safety_envelope()`,
 `restore_params()`, the `logs/fc_params_backup.json` mirror) was **deleted on 2026-08-25** —
-the companion is now structurally unable to change an FC parameter. A v3 of the flight set,
-adding the `FLTMODE` switch mapping, is expected next.
+the companion is now structurally unable to change an FC parameter. `flight_v3.param`
+(2026-09-22) captured the rangefinder-dropout troubleshooting changes; a `flight_v4`
+adding the `FLTMODE` switch mapping is still expected.
 
 ## Publishing a new flight set (two commands)
 
@@ -82,13 +83,15 @@ for a simulated run (`paramcheck.newest_flight_set()`). `preflight.py`'s hard-co
 
 | File           | Firmware | What it is                                              |
 |----------------|----------|---------------------------------------------------------|
-| `flight_v2.param` | 4.6.3 | **THE PUBLISHED FLIGHT SET — the single source of truth (2026-08-24).** Full 1159-parameter dump copied from the aircraft today, and the versioned set that now **owns** the FC configuration (see the ownership note below). Carries the deliberate team values: `ARMING_CHECK 41350`, `BATT_LOW_VOLT 12.4`, the halved `ATC_RAT_PIT`/`ATC_RAT_RLL` tune, `EK3_SRC1_POSZ 2`. `preflight.py` verifies the live FC against this file. **v3 with the `FLTMODE` switch mapping is expected next** (mapping is currently done transmitter-side). Owned by Mission Planner, not written by the companion. |
-| `fc_baseline_463_20260821.parm` | 4.6.3 | **REAL FC — forensic/rescue record.** Full baseline of the actual aircraft, recovered from the 2026-08-21 dataflash log (1154 parameters). Contains the CRASH configuration. Superseded as the live configuration by `flight_v2.param`; kept for the crash forensics and the post-wipe rescue path. |
-| `fc_safe_overrides.parm` | 4.6.3 | **RECOMMENDATION RECORD (no longer param-loaded wholesale, 2026-08-24).** The corrections proposed by the crash analysis. Several were **declined** by the team: `BATT_LOW_VOLT` (kept at `12.4`, not the suggested `12.8`) and `ARMING_CHECK` (kept at `41350`, the fuller mask declined). `RNGFND1_GNDCLEAR` is **adopted at `5`** (2026-09-21): the true mounting is ~2 cm, but Mission Planner refuses anything below 5, the parameter's own minimum, so 5 is the closest achievable value, not a re-measurement. Apply any adopted line **individually via Mission Planner** — do **not** load the whole file onto the FC any more; the live flight configuration is `flight_v2.param`. |
-| `sitl_flight_v2.parm` | 4.6.3 | **THE SITL MIRROR OF THE FLIGHT SET — the one file for daily SITL use (2026-08-24).** Generated from `flight_v2.param` by `generate_sitl_flight_params.py`: the behavioural parameters mirrored 1:1, the physical ones dropped, the SITL sensor backends bolted on. **Start the simulator with it as a startup defaults file** (`python sitl.py`; see *SITL mirror of the flight set* below). Supersedes the step-by-step phase overlays for everyday work (they stay for the incremental sensor bring-up). **SITL only — never onto the real FC.** |
-| `generate_sitl_flight_params.py` | — | The generator for `sitl_flight_v2.parm`. Dependency-free; reads `flight_v2.param`, applies the split rule (see below), writes the mirror. Re-run it whenever a new `flight_vN` is published — edit the generator, never the generated `.parm`. |
+| `flight_v3.param` | 4.6.3 | **THE PUBLISHED FLIGHT SET — the single source of truth (2026-09-22).** Full 1161-parameter dump captured via Mission Planner's own "Save to file" (not `dumpparams.py` — the capture happened on a teammate's laptop mid test session) after two live changes made straight to the aircraft during real milestone-2 test flights: `RNGFND1_GNDCLEAR 10 -> 5` and `EK3_RNG_M_NSE 0.5 -> 0.2`, both attempts at the intermittent-rangefinder-dropout problem (see [project-docs → Problems → Rangefinder dropout](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/rangefinder-dropout-2026-09-22.md) — **neither fixed it**, the dropout is still open). Everything else is routine auto-learned drift (accel/gyro/compass calibration, `MOT_THST_HOVER`, boot/flight counters) between the same two capture days. `preflight.py` and the pre-mission check verify the live FC against this file (version-resolved automatically, no source change needed). |
+| `flight_v2.param` | 4.6.3 | **Superseded by `flight_v3.param` (2026-09-22).** Published 2026-08-24, the first versioned set to **own** the FC configuration after the crash. Carries `ARMING_CHECK 41346`, `BATT_LOW_VOLT 12.4`, the halved `ATC_RAT_PIT`/`ATC_RAT_RLL` tune, `EK3_SRC1_POSZ 2`, but the pre-2026-09-21 `RNGFND1_GNDCLEAR 10`. Kept for history / diffing. |
+| `fc_baseline_463_20260821.parm` | 4.6.3 | **REAL FC — forensic/rescue record.** Full baseline of the actual aircraft, recovered from the 2026-08-21 dataflash log (1154 parameters). Contains the CRASH configuration. Superseded as the live configuration by `flight_v3.param`; kept for the crash forensics and the post-wipe rescue path. |
+| `fc_safe_overrides.parm` | 4.6.3 | **RECOMMENDATION RECORD (no longer param-loaded wholesale, 2026-08-24).** The corrections proposed by the crash analysis. Several were **declined** by the team: `BATT_LOW_VOLT` (kept at `12.4`, not the suggested `12.8`) and `ARMING_CHECK` (kept at `41346`, the fuller mask declined). `RNGFND1_GNDCLEAR` was **adopted at `5`** (2026-09-21, now carried in `flight_v3.param`): the true mounting is ~2 cm, but Mission Planner refuses anything below 5, the parameter's own minimum, so 5 is the closest achievable value, not a re-measurement — and, per the 2026-09-22 test flights, not the fix either. Apply any further adopted line **individually via Mission Planner** — do **not** load the whole file onto the FC any more; the live flight configuration is `flight_v3.param`. |
+| `sitl_flight_v3.parm` | 4.6.3 | **THE SITL MIRROR OF THE FLIGHT SET — the one file for daily SITL use (2026-09-22).** Generated from `flight_v3.param` by `generate_sitl_flight_params.py`: the behavioural parameters mirrored 1:1, the physical ones dropped, the SITL sensor backends bolted on. **Start the simulator with it as a startup defaults file** (`python sitl.py`; see *SITL mirror of the flight set* below). **SITL only — never onto the real FC.** |
+| `sitl_flight_v2.parm` | 4.6.3 | **Superseded by `sitl_flight_v3.parm`.** Kept for history / diffing. |
+| `generate_sitl_flight_params.py` | — | The generator for `sitl_flight_v3.parm`. Dependency-free; reads `flight_v3.param`, applies the split rule (see below), writes the mirror. Re-run it whenever a new `flight_vN` is published — edit the generator, never the generated `.parm`. |
 
-For SITL use, start the simulator with `sitl_flight_v2.parm`, the generated mirror of the
+For SITL use, start the simulator with `sitl_flight_v3.parm`, the generated mirror of the
 flight set (`python sitl.py`; see *SITL mirror of the flight set* below). It is the
 **only** SITL parameter file: the MTF-01P stand-in (simulated flow + rangefinder),
 GPS-off and the rangefinder height source (`EK3_SRC1_POSZ 2`) are all baked in.
@@ -110,7 +113,7 @@ removed on 2026-08-25; their hard-won lessons (`SIM_TERRAIN 0`, the choice of
 
 > ## ⚠️ Every `sitl_*` file in this folder is a SITL artefact
 >
-> `sitl_flight_v2.parm` is SITL-only.
+> `sitl_flight_v3.parm` is SITL-only.
 > **It may never be loaded onto the real flight controller.** (The two
 > `fc_*.parm` files above are the exception: they are FOR the real FC and carry the
 > same danger in reverse — they would misconfigure SITL.) The SITL files carry:
@@ -206,7 +209,7 @@ module was replaced.
 
 > **Since the 2026-08-24 ownership decision the companion writes NONE of the flight
 > parameters, and the write/restore machinery that once could was deleted on 2026-08-25.**
-> The envelope and fence values now live in `flight_v2.param` and are set via Mission
+> The envelope and fence values now live in `flight_v3.param` and are set via Mission
 > Planner; `preflight.py` verifies them read-only. The table below documents the values
 > and *why* they matter; "Owned by" is where each is set. The only FC write the companion
 > still makes is the SITL drop-servo setup at the bottom of the table.
@@ -215,10 +218,10 @@ The envelope/fence values (now owned by the flight set, verified by `preflight.p
 
 | Parameter         | Value | Owned by                        | Why                                                              |
 |-------------------|-------|---------------------------------|------------------------------------------------------------------|
-| `WPNAV_SPEED_UP`  | `50` cm/s | `flight_v2.param` (Mission Planner) | The default 250 cm/s overshot a 2 m takeoff by more than 2 m in SITL. |
-| `WPNAV_SPEED`     | `100` cm/s | `flight_v2.param` (Mission Planner) | The default 1000 cm/s crosses a hall in under a second; also the brake on a flyaway. |
-| `RTL_ALT`         | `200` cm | `flight_v2.param` (Mission Planner) | In case RTL is triggered from elsewhere. **Centimetres on 4.5/4.6**; renamed to `RTL_ALT_M` (metres) in 4.7. Firmware default is 1500 cm = 15 m. |
-| `FENCE_ENABLE`    | `0`   | `flight_v2.param` (Mission Planner) | Fence **off** — a barometric altitude fence indoors caused the 2026-08-21 crash. The companion never sets it; `verify_fence_disabled()` only reads it and **aborts** (`UNEXPECTED_FENCE_ENABLED`) if an unasked-for fence is armed. If you ever want a fence, size the altitude limit well above the downwash spike (> 8 m) and set `FENCE_ACTION` to "Always Land" (`2`) — the firmware default `1` **climbs** to `RTL_ALT` on a breach, into the ceiling — all in Mission Planner. |
+| `WPNAV_SPEED_UP`  | `50` cm/s | `flight_v3.param` (Mission Planner) | The default 250 cm/s overshot a 2 m takeoff by more than 2 m in SITL. |
+| `WPNAV_SPEED`     | `100` cm/s | `flight_v3.param` (Mission Planner) | The default 1000 cm/s crosses a hall in under a second; also the brake on a flyaway. |
+| `RTL_ALT`         | `200` cm | `flight_v3.param` (Mission Planner) | In case RTL is triggered from elsewhere. **Centimetres on 4.5/4.6**; renamed to `RTL_ALT_M` (metres) in 4.7. Firmware default is 1500 cm = 15 m. |
+| `FENCE_ENABLE`    | `0`   | `flight_v3.param` (Mission Planner) | Fence **off** — a barometric altitude fence indoors caused the 2026-08-21 crash. The companion never sets it; `verify_fence_disabled()` only reads it and **aborts** (`UNEXPECTED_FENCE_ENABLED`) if an unasked-for fence is armed. If you ever want a fence, size the altitude limit well above the downwash spike (> 8 m) and set `FENCE_ACTION` to "Always Land" (`2`) — the firmware default `1` **climbs** to `RTL_ALT` on a breach, into the ceiling — all in Mission Planner. |
 | `SERVO9_FUNCTION` | `0`   | `FcServo.setup()` / `drone.configure_drop_servo()` | "Disabled" = MAVLink/mission-controlled, so `DO_SET_SERVO` works for the drop (`config.drop_servo`). **The one remaining companion FC write, and SITL only** (`release_mechanism="fc"`); the real build uses `"pi"` (servo on a Pi GPIO), where the FC has no drop servo. |
 
 Indoors the companion also sends `SET_GPS_GLOBAL_ORIGIN` (a message, not a parameter)
@@ -267,7 +270,9 @@ companion's own safety reasoning depends on:
 `BATT_LOW_VOLT`, `BATT_CRT_VOLT`, `FS_EKF_ACTION`, `FS_GCS_ENABLE`, `FLOW_ORIENT_YAW`.
 `ARMING_CHECK` sits in this half **deliberately**: the team removed the compass bit on the
 aircraft (`41350` to `41346`) while the hall's magnetic problem is open, and the `FLTMODE`
-map is currently done transmitter-side and only lands in flight-set v3. A gate that cries
+map is still done transmitter-side — `flight_v3.param` turned out to be the
+rangefinder-dropout troubleshooting capture instead (2026-09-22), so the switch mapping
+is now expected in a `flight_v4`. A gate that cries
 wolf over a difference the team is knowingly carrying gets switched off, and then it
 guards nothing.
 
@@ -295,21 +300,27 @@ one file; empty (the default) resolves the highest version, as described under *
 a new flight set* above. When the reference file is missing the check downgrades to "no
 verification" with a warning, never to "all good".
 
-> **`RNGFND1_GNDCLEAR` is decided at `5`, and `flight_v2.param` needs a fresh capture to
-> say so.** The value was `10` in the published set, and this section used to say the
-> prose recommended `2` (the MTF-01P's true mounting height) with the decision still
-> open. It is now decided, but not at `2`: on 2026-09-21 the team tried to set the real
-> aircraft to `2` in Mission Planner and found the parameter refuses anything below `5`,
-> its own valid range floor. `5` is therefore the closest achievable value, not a
-> re-measurement of the mounting, which is still physically ~2 cm.
+> **`RNGFND1_GNDCLEAR` is decided at `5` — published in `flight_v3.param` (2026-09-22).**
+> The value was `10` before; this section used to say the prose recommended `2` (the
+> MTF-01P's true mounting height) with the decision still open. It is decided, but not
+> at `2`: on 2026-09-21 the team tried to set the real aircraft to `2` in Mission Planner
+> and found the parameter refuses anything below `5`, its own valid range floor. `5` is
+> therefore the closest achievable value, not a re-measurement of the mounting, which is
+> still physically ~2 cm.
 >
-> Until someone runs `python dumpparams.py` against the aircraft to publish a
-> `flight_v3.param` that actually carries `5`, `flight_v2.param` still says `10`, so
-> the pre-mission parameter check and `preflight.py` will keep reporting the corrected
-> aircraft (now at `5`) as a **CRITICAL mismatch** against the stale `10`. That is the
-> check doing its job, not a bug: capture the new version to close it. (`RNGFND1_GNDCLEAR`
-> was also the second suspect in the crash-day divergence, see *What the mirror taught
-> us* below.)
+> **This did not fix the problem it was chasing.** `RNGFND1_GNDCLEAR 5` and (separately)
+> `EK3_RNG_M_NSE 0.2` were both tried, live, during the 2026-09-22 real milestone-2 test
+> session, specifically to address an EKF-altitude-runs-away-from-the-real-rangefinder
+> pattern seen in an earlier flight that same day. It recurred in most of the flights
+> made *after* both changes were live. The dataflash logs show why neither parameter
+> could have helped: the rangefinder value itself froze (bit-for-bit identical for 6+
+> seconds while the current draw proved the aircraft was genuinely climbing), so there
+> was no fresh measurement for either parameter to act on. See
+> [project-docs → Problems → Rangefinder dropout](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/rangefinder-dropout-2026-09-22.md)
+> for the full log evidence and the still-open root cause. (`RNGFND1_GNDCLEAR` was also
+> the second suspect in the crash-day divergence, see *What the mirror taught us* below —
+> a different mechanism, same symptom class: the EKF trusting a rangefinder reading that
+> was not the ground truth.)
 
 ## Reset SITL to firmware defaults (clean slate)
 
@@ -327,12 +338,12 @@ everyday simulated run starts from a wiped EEPROM and then loads the flight para
 
 ## SITL mirror of the flight set
 
-**Use `sitl_flight_v2.parm` for everyday SITL — it is the one file that makes the
+**Use `sitl_flight_v3.parm` for everyday SITL — it is the one file that makes the
 simulator fly the SAME parameters we fly.** It is generated from the published flight set
-(`flight_v2.param`) by `generate_sitl_flight_params.py`, so there is no longer a chain of
+(`flight_v3.param`) by `generate_sitl_flight_params.py`, so there is no longer a chain of
 overlays to keep in sync with what Mission Planner publishes.
 
-**Why not just `param load flight_v2.param` into SITL?** Because a full dump of the real
+**Why not just `param load flight_v3.param` into SITL?** Because a full dump of the real
 aircraft is loaded with values bound to the physical airframe that would *break* the
 simulator rather than configure it. Three concrete ones:
 
@@ -359,9 +370,9 @@ the mirrored 1 cm floor blocks all on-ground EKF fusion) and the battery voltage
 `BATT_ARM_VOLT 0` / `BATT_LOW_VOLT 10.5` / `BATT_CRT_VOLT 10` (real-pack thresholds vs SITL's
 ~12.6 V simulated pack; the failsafe **actions** stay mirrored) — and two SIM-side lines are
 **appended** (`SIM_FLOW_ENABLE 1`, `SIM_TERRAIN 0`). A blacklist (not a whitelist) means a
-behavioural parameter a future `flight_v3` adds is mirrored automatically.
+behavioural parameter a future `flight_v4` adds is mirrored automatically.
 
-**Regenerate when a new flight set lands** (e.g. the coming v3 with the `FLTMODE` mapping):
+**Regenerate when a new flight set lands** (e.g. the coming v4 with the `FLTMODE` mapping):
 
 ```
 /opt/miniconda3/envs/ki_drohnen_pi/bin/python3 params/generate_sitl_flight_params.py --date 2026-08-24
@@ -387,7 +398,7 @@ It resolves the ArduPilot checkout (`ARDUPILOT_HOME`, else `../Simulation/ardupi
 ```
 sim_vehicle.py -v ArduCopter --no-rebuild --console \
   --custom-location=50.13119602511582,8.692972038286195,112.0,0 \
-  --add-param-file=<repo>/params/sitl_flight_v2.parm \
+  --add-param-file=<repo>/params/sitl_flight_v3.parm \
   --out=udp:127.0.0.1:14550 --speedup 1 -w
 ```
 
@@ -429,11 +440,11 @@ that pins the rangefinder at a constant 0.00 m is documented in the next section
 
 Measured on 2026-09-21 with this one-command start: **1646 parameters** loaded, the boot
 banner carrying *"EKF3 IMU0 fusing optical flow"* and *"started relative aiding"*, and the
-mission's own pre-arm check reporting *"Flight parameters match sitl_flight_v2.parm"*.
+mission's own pre-arm check reporting *"Flight parameters match sitl_flight_v3.parm"*.
 
 ### What the mirror taught us (SITL session, 2026-08-25)
 
-Loading the mirror onto a wiped SITL and flying milestone 1 under our chosen
+Loading the mirror onto a wiped SITL and flying milestone 2 under our chosen
 `EK3_SRC1_POSZ 2` surfaced four places the sim must deviate from the flight set — and one
 clean result that reframed the whole on-ground fusion question.
 
@@ -468,7 +479,7 @@ parameter's own minimum; see the note earlier in this file.)
   against SITL's ~12.6 V simulated pack. The failsafe **actions** (`BATT_FS_*_ACT`) stay
   mirrored.
 
-After adapting these, the full milestone-1 mission ran **green** in SITL under `POSZ 2`: EKF
+After adapting these, the full milestone-2 mission ran **green** in SITL under `POSZ 2`: EKF
 ready on the ground, GUIDED, armed, climb to 0.8 m, rangefinder-track check passed (0.84 m),
 20 s hover with **0.03 m** worst horizontal drift, LAND, disarm.
 
@@ -480,7 +491,7 @@ Overlaying `COMPASS_USE`/`USE2`/`USE3 = 0` and `EK3_SRC1_YAW = 0` on the `flight
 mirror (ArduCopter 4.6.3) **refused arming**: EKF3 optical-flow aiding flapped on and off
 in a ~1 s cycle ("started relative aiding" / "stopped aiding"), the position estimate
 never stabilised, and pre-arm failed with *"Need Position Estimate"* on all five attempts
-— while the identical mirror **with** the compass flew milestone 1 green the same day. On
+— while the identical mirror **with** the compass flew milestone 2 green the same day. On
 this stack (flow + rangefinder, no GPS) the EKF needs a yaw source of bounded uncertainty,
 so **the compass stays mandatory** and this overlay is deliberately **kept out of the
 mirror**.

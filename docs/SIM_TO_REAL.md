@@ -78,7 +78,7 @@ adapter to the FC.
   RangeFinder — the deliberate 2026-08-24 team choice; the fuller `786390` mask that also
   restores the INS/RC checks was recommended but declined for now, recorded in
   project-docs). Change it in Mission Planner / via the flight set — the companion no
-  longer writes it (§5a) — and do **not** load `../params/sitl_flight_v2.parm` (the SITL
+  longer writes it (§5a) — and do **not** load `../params/sitl_flight_v3.parm` (the SITL
   mirror) onto the flight controller, it is a SITL file (see `../params/README.md`).
   `arm()` retries with pauses instead of giving up or blocking.
 - **The companion verifies the flight parameters before every mission, read-only.**
@@ -126,7 +126,7 @@ adapter to the FC.
 
   **To validate the indoor path in SITL, give the simulator the generated mirror of the
   flight set.**
-  `../params/sitl_flight_v2.parm` is derived from the published `flight_v2.param` by
+  `../params/sitl_flight_v3.parm` is derived from the published `flight_v3.param` by
   `generate_sitl_flight_params.py`, so SITL tests the SAME parameters we fly: the
   behavioural ones are mirrored 1:1 while the physical ones (real board mounting,
   `INS_`/`COMPASS_` calibrations, the MTF-01P MAVLink backends, serial wiring,
@@ -151,7 +151,7 @@ adapter to the FC.
   ```
   sim_vehicle.py -v ArduCopter --no-rebuild --console \
     --custom-location=50.13119602511582,8.692972038286195,112.0,0 \
-    --add-param-file=<repo>/params/sitl_flight_v2.parm \
+    --add-param-file=<repo>/params/sitl_flight_v3.parm \
     --out=udp:127.0.0.1:14550 --speedup 1 -w
   ```
 
@@ -202,7 +202,7 @@ adapter to the FC.
     `origin_lon`/`origin_alt`). `_idle` then calls `Drone.set_origin()` →
     `SET_GPS_GLOBAL_ORIGIN` before arming, so `LOCAL_POSITION_NED`, home and
     `goto_local()` have a reference. Our SITL setup now runs GPS-off too (the mirror
-    `../params/sitl_flight_v2.parm` sets `GPS1_TYPE 0`), so this path is exercised there as
+    `../params/sitl_flight_v3.parm` sets `GPS1_TYPE 0`), so this path is exercised there as
     well; `set_origin()` reads the origin back and warns if the autopilot kept a different
     one. Set
     `origin_lat`/`origin_lon` to the **real hall** coordinate
@@ -259,7 +259,7 @@ Getting this wrong means the drone "corrects" **away** from the target. Verify i
 with `ScriptedCamera`, then re-verify on the real camera (mounting may differ).
 
 **Check the FRAME as well as the signs. We got this wrong in our own simulator, and it
-cost a full milestone-5 run on 2026-09-21.** `SimCamera` returned the target's
+cost a full milestone-6 run on 2026-09-21.** `SimCamera` returned the target's
 NORTH/EAST error, but `mission._nudge_from_offset()` feeds `dx`/`dy` to
 `Drone.move_body_offset()`, which uses `MAV_FRAME_BODY_OFFSET_NED` and is therefore
 rotated by the vehicle's **yaw**. A real downward camera sees the target in the IMAGE,
@@ -277,8 +277,8 @@ using `Drone.get_yaw()` (ATTITUDE, radians, from north, clockwise positive), `Fa
 rotates `move_body_offset()` by its yaw the way the real autopilot does, a parametrised
 regression test covers yaw 0°/45°/−139°/90°/180°, and the default simulated target moved
 to (2.5, 1.5), off a spiral corner, so a SITL rehearsal actually exercises the servo
-loop. (A milestone-2 rehearsal now moves the simulated pad under the hover spot for the
-same reason: before that it detected nothing at all.) After the fix milestone 5 converged
+loop. (A milestone-3 rehearsal now moves the simulated pad under the hover spot for the
+same reason: before that it detected nothing at all.) After the fix milestone 6 converged
 in 3 nudges and released. The mounting table above fixes a swapped or inverted axis; it
 cannot fix an offset delivered in the wrong frame, because that error is zero at one
 heading and maximal at another.
@@ -303,7 +303,7 @@ exist: the IMX500/picamera2 samples emit `(y0, x0, y1, x1)` normalised to 0..1, 
 Ultralytics `format=imx` exports have been seen emitting `(x0, y0, x1, y1)` in
 input-tensor **pixels**. `config.cam_box_order` selects the order (`"yxyx"` default /
 `"xyxy"`); pixel-valued boxes are normalised automatically. `RealCamera` logs the
-first raw box next to its decoded form — check that line on the bench (milestone 2)
+first raw box next to its decoded form — check that line on the bench (milestone 3)
 before trusting any dx/dy: a wrong order shows up as swapped axes, a wrong scale as
 corrections that are far too large.
 
@@ -433,7 +433,7 @@ sensors did their job.
 - The companion **stopped writing FC parameters altogether** (team decision 2026-08-24,
   §5a). The crash fence was a companion-written parameter that outlived its run; the
   durable fix is that the companion no longer owns any FC parameter — Mission Planner and
-  the published `../params/flight_v2.param` do, and the companion verifies them
+  the published `../params/flight_v3.param` do, and the companion verifies them
   read-only: `preflight.py` on demand, and a pre-arm parameter check in every mission run
   (§2, §5a). With the
   fence off, a stale `FENCE_ENABLE=1` found on the FC at startup is no longer cleared by
@@ -543,7 +543,7 @@ See [`ROADMAP.md`](ROADMAP.md) ("Incident 2026-08-21") for the decision tracking
 > confirmed via the colleague parameter diff: the landed reading is `0.02 m`, clearing a
 > `0.01 m` (`MIN_CM 1`) floor by a single centimetre. `POSZ = 2` is therefore
 > **exonerated as the blocker per se**. It stays our chosen height source, and under this
-> one deviation the mirror flew a **fully green milestone 1** in SITL (EKF ready on the
+> one deviation the mirror flew a **fully green milestone 2** in SITL (EKF ready on the
 > ground, climb to 0.8 m, rangefinder track confirmed, 20 s hover at 0.03 m worst drift,
 > LAND). None of this revises the Link 1–3 history above; it names the fusion sub-cause
 > that history left incomplete. See `ROADMAP.md` ("Incident 2026-08-21", the 2026-08-25
@@ -578,8 +578,8 @@ indoors is **altitude-only** (`FENCE_TYPE = 1`) — it guards the ceiling, not t
 | `verify_position_sensors()` | before arming | The rangefinder or the flow produce **no messages at all**. Note it does **not** abort on a reading of `0.00 m`: on the floor a healthy sensor reads zero too, so the value proves nothing there. |
 | `verify_rangefinder_tracks_altitude()` | right after the climb | The rangefinder does not follow the height — at 1 m it still reads `0.00`. **This is the check that catches the flyaway precondition**, and it runs at takeoff altitude where an abort is a short descent instead of after a whole search pattern's worth of drift. |
 | `position_implausible()` | every failsafe check in flight | The reported position leaves `max_position_radius_m` (15 m). This is the software stand-in for the horizontal fence we cannot set. Whether the aircraft is running away or the estimate is, the answer is the same: land. |
-| `altitude_implausible()` | every failsafe check in flight | The EKF altitude and the raw rangefinder disagree by more than `alt_disagree_max_m` (2 m) for `alt_disagree_samples` (3) consecutive checks — the exact signature of the 2026-08-21 crash (EKF −1070 m, rangefinder 0.02 m). The sensor check above proves the SENSOR responds; this one watches the ESTIMATE for the rest of the flight. |
-| `WPNAV_SPEED` | flight set (`flight_v2.param`) | Caps horizontal speed at 100 cm/s. The firmware default is **1000 cm/s** — a hall crossed in under a second, and the difference between a drift you can take over from and one you cannot. Now owned by Mission Planner + the flight set, verified by `preflight.py` (§5a). |
+| `altitude_implausible()` | every failsafe check in flight, and (2026-09-22) inside `drone.takeoff()`'s own climb loop | The EKF altitude and the raw rangefinder disagree by more than `alt_disagree_max_m` (0.5 m, tightened from 2 m on 2026-09-22) for `alt_disagree_samples` (3) consecutive checks — the exact signature of the 2026-08-21 crash (EKF −1070 m, rangefinder 0.02 m), reproduced on real milestone-2 climbs on 2026-09-22 (see `project-docs` → Problems → [Rangefinder dropout mid-flight](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/rangefinder-dropout-2026-09-22.md)). The sensor check above proves the SENSOR responds; this one watches the ESTIMATE for the rest of the flight — now including the climb itself, which is where all five 2026-09-22 divergences actually happened. |
+| `WPNAV_SPEED` | flight set (`flight_v3.param`) | Caps horizontal speed at 100 cm/s. The firmware default is **1000 cm/s** — a hall crossed in under a second, and the difference between a drift you can take over from and one you cannot. Now owned by Mission Planner + the flight set, verified by `preflight.py` (§5a). |
 
 **What they do not replace.** A pilot with a kill switch, and `ARMING_CHECK` restored.
 The guards make the failure survivable and diagnosable; they do not make an
@@ -589,8 +589,9 @@ unconfigured MTF-01P safe to fly.
 
 **Team decision 2026-08-24 (parameter ownership).** The companion **no longer writes any
 FC parameter.** FC parameters have exactly one owner: **Mission Planner plus the
-published, versioned flight parameter set** (`../params/flight_v2.param` — the full 1159-
-parameter dump copied from the aircraft; a v3 with the `FLTMODE` switch mapping follows).
+published, versioned flight parameter set** (`../params/flight_v3.param` — the full 1161-
+parameter dump copied from the aircraft; a `flight_v4` with the `FLTMODE` switch mapping
+follows).
 The companion's job is now to **verify** that set read-only, not to enforce it, and it
 does so in two places: `preflight.py` when an operator runs it, and
 `FailsafeMonitor.verify_flight_parameters()` before **every** mission arms (§2). Both
@@ -601,7 +602,7 @@ publishing a v3 needs no source edit anywhere.
 Two reasons, both learned the hard way:
 
 - **Single source of truth.** One place holds the flight configuration. A parameter is
-  what Mission Planner shows and what `flight_v2.param` records — not something a
+  what Mission Planner shows and what `flight_v3.param` records — not something a
   companion run quietly changed and (maybe) changed back.
 - **No surprise overwrites.** The 2026-08-21 crash fence was *precisely* a
   companion-written parameter (`FENCE_ALT_MAX = 4.0`, written by the old
@@ -649,7 +650,7 @@ restored every one on exit (`restore_params()`), and mirrored the saved baseline
 Pi brownout) was cleaned up by the *next* run's `failsafe.recover_stale_params()`. It was
 useful for a throwaway SITL setup whose parameters no overlay otherwise carried.
 
-That gap was then closed by the flight set itself: `../params/sitl_flight_v2.parm` mirrors
+That gap was then closed by the flight set itself: `../params/sitl_flight_v3.parm` mirrors
 the envelope/fence limits (`FENCE_ENABLE 0`, `WPNAV_SPEED 100`, our chosen
 `EK3_SRC1_POSZ 2`), so a SITL run flies correctly with no companion writes at all. With the
 opt-in reduced to dead code, **the whole write/restore/backup machinery was deleted on
@@ -714,7 +715,7 @@ log should state what it was flown against.
       failsafe does **not** replace it.
 - [ ] `ARMING_CHECK` sane on the FC. The team **deliberately runs `41350`**
       (2026-08-24 decision) = Baro 2 + Compass 4 + Board voltage 128 + Battery 256 +
-      System 8192 + RangeFinder 32768, carried by `../params/flight_v2.param`. The fuller
+      System 8192 + RangeFinder 32768, carried by `../params/flight_v3.param`. The fuller
       `786390` mask (adds the INS/RC checks, every check except the GPS lock) was
       **recommended but declined for now** — kept on record in project-docs, not adopted.
       Do **not** rely on the old crash-day `0` (every pre-arm check off): that is exactly

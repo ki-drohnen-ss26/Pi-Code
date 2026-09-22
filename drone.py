@@ -668,6 +668,7 @@ class Drone:
         deadline = time.time() + timeout
         stable_since: Optional[float] = None
         peak = 0.0
+        alt_disagrees = 0
         while time.time() < deadline:
             self.tick()
             # If the FC leaves GUIDED mid-climb (pilot takeover, fence breach, EKF
@@ -684,6 +685,24 @@ class Drone:
                 continue
             alt = pos["rel_alt"]
             peak = max(peak, alt)
+
+            if self.config.gps_denied and self.config.alt_disagree_max_m > 0:
+                rng = self.get_rangefinder(timeout=0.5)
+                if rng is not None and rng <= 7.5:   # None/near-max = no reading, not a fault
+                    if abs(alt - rng) > self.config.alt_disagree_max_m:
+                        alt_disagrees += 1
+                        log.warning(
+                            f"[TAKEOFF] EKF altitude {alt:.2f} m vs rangefinder {rng:.2f} m "
+                            f"({alt_disagrees}/{self.config.alt_disagree_samples})"
+                        )
+                        if alt_disagrees >= self.config.alt_disagree_samples:
+                            log.warning(
+                                "[TAKEOFF] EKF altitude diverged from the rangefinder during "
+                                "the climb - stopping before the mismatch grows further"
+                            )
+                            return False
+                    else:
+                        alt_disagrees = 0
 
             if abs(alt - altitude) <= eff_tol:
                 if stable_since is None:

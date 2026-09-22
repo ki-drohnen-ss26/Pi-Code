@@ -174,13 +174,21 @@ class Config:
     # one search_step_m, so anything well beyond that is the filter running away rather
     # than the aircraft flying. 0 disables the check.
     max_position_radius_m: float = 15.0
-    # The VERTICAL twin, checked continuously in failsafe.check(): abort when the EKF
-    # altitude and the raw rangefinder disagree by more than this. The 2026-08-21 crash
-    # had exactly this signature (EKF -1070 m, rangefinder 0.02 m, on the floor). The
-    # rangefinder measures distance to the SURFACE below, so flying over tall clutter
-    # can disagree legitimately - hence a loose threshold plus several consecutive
-    # samples before aborting. 0 disables the check.
-    alt_disagree_max_m: float = 2.0
+    # The VERTICAL twin, checked continuously in failsafe.check() AND inside
+    # drone.takeoff()'s own climb loop: abort when the EKF altitude and the raw
+    # rangefinder disagree by more than this. The 2026-08-21 crash had exactly this
+    # signature (EKF -1070 m, rangefinder 0.02 m, on the floor). The rangefinder
+    # measures distance to the SURFACE below, so flying over tall clutter can
+    # disagree legitimately - hence several consecutive samples before aborting, not
+    # a single one. 0 disables the check.
+    # 0.5 m, not the original 2.0 m: on 2026-09-22 the real aircraft ran this exact
+    # divergence during milestone-2 climbs to 0.8-1.2 m (the MTF-01P's data froze for
+    # several seconds while the EKF free-integrated on IMU alone) and NEVER crossed a
+    # 2.0 m gap in five separate attempts - the check could not have fired even once.
+    # At these indoor bring-up altitudes "drift of centimetres, not metres" is the
+    # project's own success bar (see mission-planning.md), so 0.5 m of vertical
+    # disagreement is already a real fault, not tall-clutter noise.
+    alt_disagree_max_m: float = 0.5
     alt_disagree_samples: int = 3
 
     # ------------------------------------------------------------------

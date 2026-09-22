@@ -23,7 +23,7 @@ confined to `Config.sitl()`.
 | `search.py`      | Search patterns (expanding spiral / lawnmower) in local NED |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |
-| `preflight.py`   | Read-only FC inspection: parameters, EKF flags, sensor health, EKF-altitude drift check, live `STATUSTEXT`. Also **verifies the live FC against the published flight set** (`params/flight_v2.param`, `--expected PATH` to override) and reports every mismatch — the companion no longer writes FC parameters (team decision 2026-08-24), it checks them. Run it, then try to arm — the autopilot's own objection appears verbatim |
+| `preflight.py`   | Read-only FC inspection: parameters, EKF flags, sensor health, EKF-altitude drift check, live `STATUSTEXT`. Also **verifies the live FC against the published flight set** (`params/flight_v3.param`, `--expected PATH` to override) and reports every mismatch — the companion no longer writes FC parameters (team decision 2026-08-24), it checks them. Run it, then try to arm — the autopilot's own objection appears verbatim |
 | `setparam.py`    | Set FC parameters with read-back verification (`python setparam.py NAME VALUE [--reboot]`). Refuses to run while armed |
 | `dumpparams.py`  | Capture the live FC's complete parameter set into the next versioned file (`params/flight_v<N+1>.param`). The publish half of the parameter workflow; read-only on the aircraft |
 | `sitl.py`        | Start SITL already carrying the flight parameters, in one command. Replaces the old "load the mirror twice with a reboot each time" procedure |
@@ -106,7 +106,7 @@ comes from the simulated optical flow and rangefinder.
 > code.
 >
 > The procedure that replaced the companion's writes was "load
-> `params/sitl_flight_v2.parm` into a running simulator twice, rebooting each time",
+> `params/sitl_flight_v3.parm` into a running simulator twice, rebooting each time",
 > because the `RNGFND1_*` sub-parameters only exist once `RNGFND1_TYPE` is set and the
 > FC has rebooted. That procedure is **superseded**, and on 2026-09-21 it was observed
 > to fail outright: after the first reboot the sub-parameters were still unknown, the
@@ -114,7 +114,7 @@ comes from the simulated optical flow and rangefinder.
 > mirror as a startup defaults file avoids the problem instead of working around it.
 > ArduPilot holds back a default whose parameter does not exist yet and applies it when
 > the driver creates it, so the backend and its sub-parameters all land in the same
-> boot. Verified: 1646 parameters, flow fusing, milestone 1 green immediately
+> boot. Verified: 1646 parameters, flow fusing, milestone 2 green immediately
 > afterwards.
 
 > **macOS tip:** if `--map` throws `No module named 'map'`, the MAVProxy map
@@ -148,8 +148,8 @@ Indoor run (default `gps_denied=True`):
 [FC] ArduPilot flight software 4.6.3
 [ORIGIN] EKF origin confirmed: lat=50.131196 lon=8.692972
 [IDLE] FC parameters are Mission-Planner-owned (team decision 2026-08-24): the companion verifies them read-only before every mission but writes none. See params/README.md.
-[PREARM] Verifying 25 parameters against sitl_flight_v2.parm (read-only) ...
-[PREARM] Flight parameters match sitl_flight_v2.parm
+[PREARM] Verifying 25 parameters against sitl_flight_v3.parm (read-only) ...
+[PREARM] Flight parameters match sitl_flight_v3.parm
 [PREARM] Waiting for relative (optical flow) EKF position estimate ...
 [PREARM] EKF position estimate ready
 [MODE] Mode is now GUIDED
@@ -238,9 +238,9 @@ flight set in `params/`. The companion writes none of them. What it does do is
 **verify** them, read-only, before every single mission, milestone flights included:
 
 ```
-[PREARM] Verifying 25 parameters against flight_v2.param (read-only) ...
+[PREARM] Verifying 25 parameters against flight_v3.param (read-only) ...
 [PREARM] EK3_SRC1_POSZ = 1.0 on the FC, published 2.0  <-- MISMATCH
-[PREARM] 1 flight-critical parameter(s) differ from flight_v2.param. ...
+[PREARM] 1 flight-critical parameter(s) differ from flight_v3.param. ...
 [ABORT] FC_PARAMS_MISMATCH
 ```
 
@@ -294,11 +294,12 @@ release. Each milestone adds exactly **one**, so a failure names its own cause i
 leaving four candidates open:
 
 ```bash
-python main.py --milestone 1   # climb to 0.8 m, hold, land        → position hold
-python main.py --milestone 2   # same + detector, logging only     → detector
-python main.py --milestone 3   # fly the search pattern            → pattern
-python main.py --milestone 4   # search + detect + centre, no drop → approach
-python main.py --milestone 5   # the full delivery                 → release
+python main.py --milestone 1   # ground arm test only, no takeoff  → arm/disarm
+python main.py --milestone 2   # climb to 0.8 m, hold, land        → position hold
+python main.py --milestone 3   # same + detector, logging only     → detector
+python main.py --milestone 4   # fly the search pattern            → pattern
+python main.py --milestone 5   # search + detect + centre, no drop → approach
+python main.py --milestone 6   # the full delivery                 → release
 ```
 
 Rehearse each one against SITL first (`--sim --milestone N`). The simulator has no
@@ -308,8 +309,8 @@ than no rehearsal. For a hover milestone the simulated pad is also moved under t
 spot, otherwise it sits out in the search area and the rehearsal detects nothing at all.
 
 > **All five milestones and the full mission were flown green in SITL on 2026-09-21**
-> against ArduCopter 4.6.3. Milestone 1: 0.8 m, 20 s, worst drift 0.04 m. Milestone 3:
-> all 25 spiral waypoints in 219 s, ending in `TARGET_NOT_FOUND`. Milestone 5: centred
+> against ArduCopter 4.6.3. Milestone 2: 0.8 m, 20 s, worst drift 0.04 m. Milestone 4:
+> all 25 spiral waypoints in 219 s, ending in `TARGET_NOT_FOUND`. Milestone 6: centred
 > in three nudges, `[DROP] Release confirmed`. That says the companion logic is sound,
 > and nothing about the hall: on the real aircraft the milestone flights are still
 > blocked by the hall's magnetic problem (see `docs/ROADMAP.md`, Phase 7).
@@ -318,13 +319,14 @@ spot, otherwise it sits out in the search area and the rehearsal detects nothing
 
 | Milestone | Pass condition |
 |---|---|
-| 1 | `[HOVER] Done. Worst horizontal drift: …` — a working optical-flow hold stays within tens of centimetres. A drifting one walks away steadily *while still looking like it is flying*, which is why this number matters more than "it hovered". |
-| 2 | `[HOVER] Camera sees the target: dx=… dy=… m` with the pad below. Check the **sign**: pad to the drone's right must give a **positive `dx`**. Wrong sign → set `cam_invert_x`, or the aircraft will correct *away* from the pad. `dx`/`dy` are in the **body** frame (right / forward), not north/east, because the correction is flown as a body-frame offset that the autopilot rotates by the vehicle's yaw. Getting that wrong cost a full milestone-5 SITL run on 2026-09-21. |
-| 3 | The pattern is flown to the end and the run stops with `TARGET_NOT_FOUND`. That abort **is** the pass condition — there is no detector in the loop. |
-| 4 | `[DROP] skip_drop is set — releasing NOTHING`, after the aircraft centred over the pad. |
-| 5 | `[DROP] Release confirmed`. |
+| 1 | `[ARM_TEST] PASS: automatic arm and disarm both confirmed`, with the aircraft never leaving the ground. Proves arming and disarming both work cleanly on this aircraft before any climb is risked: an FC-side disarm during the hold aborts by name (`ARM_TEST_DISARMED_EARLY`), and a companion disarm command the FC rejects raises loudly (`ARM_TEST_DISARM_FAILED`) instead of continuing silently. |
+| 2 | `[HOVER] Done. Worst horizontal drift: …` — a working optical-flow hold stays within tens of centimetres. A drifting one walks away steadily *while still looking like it is flying*, which is why this number matters more than "it hovered". |
+| 3 | `[HOVER] Camera sees the target: dx=… dy=… m` with the pad below. Check the **sign**: pad to the drone's right must give a **positive `dx`**. Wrong sign → set `cam_invert_x`, or the aircraft will correct *away* from the pad. `dx`/`dy` are in the **body** frame (right / forward), not north/east, because the correction is flown as a body-frame offset that the autopilot rotates by the vehicle's yaw. Getting that wrong cost a full milestone-6 SITL run on 2026-09-21. |
+| 4 | The pattern is flown to the end and the run stops with `TARGET_NOT_FOUND`. That abort **is** the pass condition — there is no detector in the loop. |
+| 5 | `[DROP] skip_drop is set — releasing NOTHING`, after the aircraft centred over the pad. |
+| 6 | `[DROP] Release confirmed`. |
 
-Milestone 3 flies the spiral, which reaches `search_max_radius_m` **plus one**
+Milestone 4 flies the spiral, which reaches `search_max_radius_m` **plus one**
 `search_step_m` — 7 m with the defaults. The geofence is **off** in the published flight
 set (a barometric altitude fence indoors caused the 2026-08-21 crash — see
 `docs/SIM_TO_REAL.md` §5c); the companion never writes fence parameters and only checks,
@@ -363,7 +365,7 @@ records while armed — which excludes every pre-arm problem.
 ## Starting from the pilot's hands instead of the ground
 
 ```bash
-python main.py --milestone 1 --takeover
+python main.py --milestone 2 --takeover
 ```
 
 The companion then **does not arm and does not take off**. It waits until the pilot has

@@ -1,9 +1,9 @@
 # ======================================================================================
-# sitl_flight_v2.parm - the SITL MIRROR of the published flight set. GENERATED FILE.
+# sitl_flight_v3.parm - the SITL MIRROR of the published flight set. GENERATED FILE.
 # ======================================================================================
 #
-# Source:     params/flight_v2.param  (the published, Mission-Planner-owned flight set)
-# Generated:  regenerate: see params/README.md
+# Source:     params/flight_v3.param  (the published, Mission-Planner-owned flight set)
+# Generated:  2026-09-22
 # Generator:  params/generate_sitl_flight_params.py   (edit the generator, never this file)
 #
 # WHAT THIS IS. The behavioural parameters of the flight set - the ones that define how
@@ -23,9 +23,9 @@
 # thresholds refuse arming / land constantly against SITL's ~12.6 V pack; ACTIONS stay mirrored).
 #
 # >>> LOAD THIS FILE TWICE, WITH A REBOOT EACH TIME <<<
-#     param load params/sitl_flight_v2.parm
+#     param load params/sitl_flight_v3.parm
 #     reboot
-#     param load params/sitl_flight_v2.parm
+#     param load params/sitl_flight_v3.parm
 #     reboot
 #   WHY TWICE: ArduPilot only creates the RNGFND1_* sub-parameters (MIN_CM/MAX_CM/GNDCLEAR/
 #   ORIENT) after RNGFND1_TYPE is set AND the FC reboots. This file is sorted alphabetically,
@@ -34,7 +34,7 @@
 #   sim_vehicle.py --add-param-file <this file> at start with -w. Labelled untested on purpose.)
 #
 # VERIFY after the second reboot:
-#     param show RNGFND1_MIN_CM RNGFND1_MAX_CM RNGFND1_GNDCLEAR EK3_SRC1_POSZ FENCE_ENABLE WPNAV_SPEED ARMING_CHECK   ->   expected 0 / 800 / 10 / 2 / 0 / 100 / 41350
+#     param show RNGFND1_MIN_CM RNGFND1_MAX_CM RNGFND1_GNDCLEAR EK3_SRC1_POSZ FENCE_ENABLE WPNAV_SPEED ARMING_CHECK   ->   expected 0 / 800 / 5 / 2 / 0 / 100 / 41346
 #
 # NEVER load this onto the real aircraft - it is a SITL artefact. Regenerate when a new
 # flight_vN lands: see params/README.md, subsection "SITL mirror of the flight set".
@@ -168,7 +168,7 @@ EK3_POSNE_M_NSE  0.5
 EK3_POS_I_GATE   500
 EK3_PRIMARY      0
 EK3_RNG_I_GATE   500
-EK3_RNG_M_NSE    0.5
+EK3_RNG_M_NSE    0.2
 EK3_RNG_USE_HGT  -1
 EK3_RNG_USE_SPD  2
 EK3_SRC1_POSXY   0
@@ -556,7 +556,7 @@ RELAY3_FUNCTION  0
 RELAY4_FUNCTION  0
 RELAY5_FUNCTION  0
 RELAY6_FUNCTION  0
-RNGFND1_GNDCLEAR 10
+RNGFND1_GNDCLEAR 5
 RNGFND1_MAX_CM   800
 RNGFND1_MIN_CM   0
 RNGFND1_ORIENT   25

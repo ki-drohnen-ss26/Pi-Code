@@ -90,6 +90,20 @@ class FakeDrone:
         # Flight mode the FC reports. Tests flip this to simulate the pilot taking over.
         self.mode = "GUIDED"
         self.origin_ok = origin_ok
+        # Diagnostics returned by read_arm_test_diagnostics() (milestone 1, arm/disarm
+        # only). Defaults describe a healthy ground arm test; a test that wants an
+        # unhealthy reading overrides one field, a test that wants the FC to disarm
+        # itself mid-window sets arm_test_disarmed_early = True instead.
+        self.arm_test_diagnostics = {
+            "armed_throughout": True,
+            "rangefinder_samples": 10, "rangefinder_min": 0.02, "rangefinder_max": 0.03,
+            "flow_samples": 10, "flow_quality_min": 60, "flow_quality_max": 90,
+            "ekf_flags_last": 0x08, "ekf_pos_horiz_rel_seen": True,
+            "local_position_samples": 10, "horizontal_drift_max": 0.01,
+            "local_vertical_span": 0.01,
+            "relative_altitude_samples": 10, "relative_altitude_span": 0.02,
+        }
+        self.arm_test_disarmed_early = False
 
     # --- used by the failsafe ---
     def tick(self):
@@ -174,11 +188,25 @@ class FakeDrone:
         return self.arm_ok
 
     def disarm(self):
-        self._armed = False
         self.calls.append(("disarm",))
+        if not self._armed:
+            return True
+        if self.disarm_ok:
+            self._armed = False
+            return True
+        return False   # rejected: real disarm() leaves the motors as they were
 
     def is_armed(self):
         return self._armed
+
+    def read_arm_test_diagnostics(self, duration):
+        self.calls.append(("read_arm_test_diagnostics", duration))
+        if not self.arm_test_disarmed_early:
+            return dict(self.arm_test_diagnostics)
+        # Simulate the FC disarming itself mid-window (e.g. an FC-side failsafe): the
+        # real drone.py breaks out of its poll loop the instant is_armed() goes False.
+        self._armed = False
+        return {**self.arm_test_diagnostics, "armed_throughout": False}
 
     # --- navigation ---
     def takeoff(self, altitude, timeout=30.0):
@@ -955,14 +983,64 @@ def test_every_milestone_is_a_coherent_stage():
 
     stages = {n: make_config(["main.py", "--milestone", str(n)]) for n in MILESTONES}
 
-    assert stages[1].hover_test_s > 0 and stages[1].camera_source == "none"
-    assert stages[2].hover_test_s > 0 and stages[2].camera_source == "real"
-    assert stages[3].hover_test_s == 0 and stages[3].camera_source == "none"
-    assert stages[4].camera_source == "real" and stages[4].skip_drop is True
-    assert stages[5].camera_source == "real" and stages[5].skip_drop is False
+    assert stages[1].arm_test_s > 0 and stages[1].hover_test_s == 0 and stages[1].camera_source == "none"
+    assert stages[2].hover_test_s > 0 and stages[2].camera_source == "none"
+    assert stages[3].hover_test_s > 0 and stages[3].camera_source == "real"
+    assert stages[4].hover_test_s == 0 and stages[4].camera_source == "none"
+    assert stages[5].camera_source == "real" and stages[5].skip_drop is True
+    assert stages[6].camera_source == "real" and stages[6].skip_drop is False
     # All of them stay on the real-aircraft profile.
     assert all(c.release_mechanism == "pi" for c in stages.values())
     assert all(c.milestone == n for n, c in stages.items())
+
+
+def test_ground_arm_test_arms_holds_and_disarms_without_taking_off():
+    """Milestone 1: prove arm/disarm works before ever risking a climb."""
+    config = Config.sitl()
+    config.arm_test_s = 5.0
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.state is State.DONE
+    assert mission.abort_reason is None
+    actions = drone.actions()
+    assert "arm" in actions
+    assert "disarm" in actions
+    assert "takeoff" not in actions          # the whole point of this milestone
+    assert actions.index("arm") < actions.index("disarm")
+    assert mission._ground_arm_test_active is False   # cleared once disarm is confirmed
+
+
+def test_ground_arm_test_reports_fc_disarming_itself_early():
+    """If the FC disarms on its own mid-window (an FC-side failsafe, say), the mission
+    must notice and name it, not wait out the timer and then fail to disarm an already
+    disarmed vehicle."""
+    config = Config.sitl()
+    config.arm_test_s = 5.0
+    drone = FakeDrone(config)
+    drone.arm_test_disarmed_early = True
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason == "ARM_TEST_DISARMED_EARLY"
+    assert "takeoff" not in drone.actions()
+    # The FC already disarmed itself - the mission must not claim a redundant disarm.
+    assert "disarm" not in drone.actions()[drone.actions().index("arm") + 1:]
+
+
+def test_ground_arm_test_disarm_failure_raises_instead_of_hiding_it():
+    """A disarm that the FC rejects must be loud, not swallowed - the drone may still
+    be armed and the operator needs to reach for the transmitter now."""
+    config = Config.sitl()
+    config.arm_test_s = 5.0
+    drone = FakeDrone(config, disarm_ok=False)
+    mission = _build_mission(drone, config)
+
+    with pytest.raises(RuntimeError, match="ARM_TEST_DISARM_FAILED"):
+        mission.run()
 
 
 def test_unknown_milestone_is_rejected_not_ignored():

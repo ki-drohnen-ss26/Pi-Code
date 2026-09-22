@@ -4,14 +4,14 @@
 WHY THIS SCRIPT EXISTS
 ----------------------
 Daniele's requirement (2026-08-24): SITL must test the SAME parameters we fly, and it
-must do so from ONE clean file derived from `flight_v2.param` — not a chain of overlays
-(phaseA -> phaseB -> gps_off -> mandate) that drifts out of sync with the flight set every
-time Mission Planner publishes a new version. This script is that derivation: read
-`flight_v2.param`, apply the split rule below, write `sitl_flight_v2.parm`.
+must do so from ONE clean file derived from the published flight set — not a chain of
+overlays (phaseA -> phaseB -> gps_off -> mandate) that drifts out of sync with the flight
+set every time Mission Planner publishes a new version. This script is that derivation:
+read `flight_v3.param`, apply the split rule below, write `sitl_flight_v3.parm`.
 
-WHY WE CANNOT JUST `param load flight_v2.param` INTO SITL
+WHY WE CANNOT JUST `param load flight_v3.param` INTO SITL
 --------------------------------------------------------
-`flight_v2.param` is a full 1159-parameter dump of the REAL aircraft. A pile of its values
+`flight_v3.param` is a full 1161-parameter dump of the REAL aircraft. A pile of its values
 are bound to the physical airframe and would break the simulator, not configure it. Three
 concrete examples (verified):
   * AHRS_ORIENTATION = 13 — the real board's mounting rotation. SITL's simulated IMU is
@@ -29,7 +29,7 @@ THE SPLIT RULE (implemented below as a blacklist)
 Everything in the flight set is mirrored EXCEPT the physical classes enumerated in
 EXCLUDE_PREFIXES / EXCLUDE_EXACT / the RC-calibration rule — each carries a one-line WHY.
 A blacklist (not a whitelist) is deliberate: a behavioural parameter that a future
-`flight_v3` adds is then mirrored automatically; only genuinely hardware-bound classes
+`flight_v4` adds is then mirrored automatically; only genuinely hardware-bound classes
 have to be named here. OVERRIDES then FORCE the values that must differ in sim — the SITL
 sensor backends + GPS off, plus the four evidence-backed sim-adaptations (RNGFND1_MIN_CM and
 the three battery voltages) that a validity floor / pack physics make wrong for the simulated
@@ -155,7 +155,7 @@ APPENDS: dict[str, tuple[str, str]] = {
 
 VERIFY_LINE = (
     "param show RNGFND1_MIN_CM RNGFND1_MAX_CM RNGFND1_GNDCLEAR EK3_SRC1_POSZ "
-    "FENCE_ENABLE WPNAV_SPEED ARMING_CHECK   ->   expected 0 / 800 / 10 / 2 / 0 / 100 / 41350"
+    "FENCE_ENABLE WPNAV_SPEED ARMING_CHECK   ->   expected 0 / 800 / 5 / 2 / 0 / 100 / 41346"
 )
 
 
@@ -232,7 +232,7 @@ def render_header(src: Path, date_str: str) -> list[str]:
     """The generated-file banner: provenance, split rule, double-load reason, verify."""
     lines = [
         "# ======================================================================================",
-        "# sitl_flight_v2.parm - the SITL MIRROR of the published flight set. GENERATED FILE.",
+        "# sitl_flight_v3.parm - the SITL MIRROR of the published flight set. GENERATED FILE.",
         "# ======================================================================================",
         "#",
         f"# Source:     params/{src.name}  (the published, Mission-Planner-owned flight set)",
@@ -256,9 +256,9 @@ def render_header(src: Path, date_str: str) -> list[str]:
         "# thresholds refuse arming / land constantly against SITL's ~12.6 V pack; ACTIONS stay mirrored).",
         "#",
         "# >>> LOAD THIS FILE TWICE, WITH A REBOOT EACH TIME <<<",
-        "#     param load params/sitl_flight_v2.parm",
+        "#     param load params/sitl_flight_v3.parm",
         "#     reboot",
-        "#     param load params/sitl_flight_v2.parm",
+        "#     param load params/sitl_flight_v3.parm",
         "#     reboot",
         "#   WHY TWICE: ArduPilot only creates the RNGFND1_* sub-parameters (MIN_CM/MAX_CM/GNDCLEAR/",
         "#   ORIENT) after RNGFND1_TYPE is set AND the FC reboots. This file is sorted alphabetically,",
@@ -280,8 +280,8 @@ def render_header(src: Path, date_str: str) -> list[str]:
 def main(argv: list[str]) -> int:
     here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description="Generate the SITL mirror of the flight set.")
-    ap.add_argument("--src", default=str(here / "flight_v2.param"), help="source flight set")
-    ap.add_argument("--out", default=str(here / "sitl_flight_v2.parm"), help="output SITL file")
+    ap.add_argument("--src", default=str(here / "flight_v3.param"), help="source flight set")
+    ap.add_argument("--out", default=str(here / "sitl_flight_v3.parm"), help="output SITL file")
     ap.add_argument(
         "--date",
         default=None,

@@ -207,18 +207,19 @@ stateDiagram-v2
 
 | Milestone | Command | Adds | Pass condition |
 |---|---|---|---|
-| 1 | `--milestone 1` | position hold | `[HOVER] Done. Worst horizontal drift: …` — tens of centimetres, not metres |
-| 2 | `--milestone 2` | the detector | `[HOVER] Camera sees the target: dx=… dy=…` with the right **sign** |
-| 3 | `--milestone 3` | search pattern | pattern flown to the end, `TARGET_NOT_FOUND` (no detector in the loop — that abort *is* the pass) |
-| 4 | `--milestone 4` | approach + centring | `[DROP] skip_drop is set — releasing NOTHING` |
-| 5 | `--milestone 5` | the release | `[DROP] Release confirmed` |
+| 1 | `--milestone 1` | arm + disarm on the ground only, no takeoff | `[ARM_TEST] PASS: automatic arm and disarm both confirmed` |
+| 2 | `--milestone 2` | position hold | `[HOVER] Done. Worst horizontal drift: …` — tens of centimetres, not metres |
+| 3 | `--milestone 3` | the detector | `[HOVER] Camera sees the target: dx=… dy=…` with the right **sign** |
+| 4 | `--milestone 4` | search pattern | pattern flown to the end, `TARGET_NOT_FOUND` (no detector in the loop — that abort *is* the pass) |
+| 5 | `--milestone 5` | approach + centring | `[DROP] skip_drop is set — releasing NOTHING` |
+| 6 | `--milestone 6` | the release | `[DROP] Release confirmed` |
 
 `--sim --milestone N` rehearses a stage in the simulator; the simulated detector is
 substituted for the IMX500 and the substitution is logged, so a rehearsal can never
-quietly use a different camera than the milestone names. A rehearsal of **milestone 2**,
+quietly use a different camera than the milestone names. A rehearsal of **milestone 3**,
 the one stage that both hovers and asks for the camera, additionally moves the simulated
 pad under the hover spot, because `SimCamera` only "sees" within `sim_fov_radius_m` of it.
-Before that, the pad sat out in the search area, a milestone-2 rehearsal detected nothing
+Before that, the pad sat out in the search area, a milestone-3 rehearsal detected nothing
 at all, and it exercised neither the detection path nor the log line the milestone exists
 to produce. The search milestones keep the offset pad, since finding it is the point
 there.
@@ -234,7 +235,7 @@ position controller then chases it at full throttle (see
   `max_position_radius_m`. It is the software stand-in for the horizontal fence that an
   altitude-only `FENCE_TYPE = 1` cannot give us.
 
-`mission.takeoff_altitude()` lets stage 1 fly lower than `search_altitude` via
+`mission.takeoff_altitude()` lets stage 2 fly lower than `search_altitude` via
 `hover_test_alt`, so a 1 m bring-up hover needs no other configuration change. Both
 switches are announced by `main.log_profile()` at startup for the same reason the
 simulation banner is: a mode that changes what the flight *does* must not be discoverable
@@ -272,7 +273,7 @@ sequenceDiagram
     FS-->>Mis: None or "LINK_LOSS"/"NO_TELEMETRY"/"LOW_BATTERY"/"TIMEOUT_x"
 
     note over Mis: IDLE
-    note over FS: TEAM DECISION 2026-08-24: the companion no longer WRITES FC flight/config parameters (fence, envelope, EKF sources). Mission Planner + params/flight_v2.param own them; the companion verifies read-only. The write/restore machinery was DELETED 2026-08-25. The one PARAM_SET below is FcServo's SITL-only SERVO9_FUNCTION=0 (servo-output setup, not flight config).
+    note over FS: TEAM DECISION 2026-08-24: the companion no longer WRITES FC flight/config parameters (fence, envelope, EKF sources). Mission Planner + params/flight_v3.param own them; the companion verifies read-only. The write/restore machinery was DELETED 2026-08-25. The one PARAM_SET below is FcServo's SITL-only SERVO9_FUNCTION=0 (servo-output setup, not flight config).
     Mis->>Mis: log "FC parameters are Mission-Planner-owned; the companion verifies read-only"
     Mis->>FS: verify_fence_disabled()
     FS->>Dr: read_param("FENCE_ENABLE")  (read-only stale-fence check)
@@ -367,7 +368,7 @@ sequenceDiagram
 > 2026-08-21 was exactly such an unrestored companion-written leftover — the reason the
 > whole write path was first made opt-in and then deleted. The three envelope limits it
 > used to write (`WPNAV_SPEED`, `WPNAV_SPEED_UP`, `RTL_ALT` — in **centimetres** on our
-> ArduCopter 4.6.3, renamed `RTL_ALT_M` in 4.7) now live only in `params/flight_v2.param`.
+> ArduCopter 4.6.3, renamed `RTL_ALT_M` in 4.7) now live only in `params/flight_v3.param`.
 >
 > Not drawn: `Drone.tick()`. It runs at the start of every `FailsafeMonitor.check()` and
 > inside every loop that waits on the aircraft — the `Drone` waiters
