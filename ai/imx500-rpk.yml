@@ -1,0 +1,76 @@
+# Packt packerOut.zip zu network.rpk auf einem echten aarch64-Linux.
+#
+# Warum ueberhaupt ein Workflow: der Paketierer aus imx500-tools
+# (rpk_packager, fpk2rpk) ist ein ARM-aarch64-Binary. Colab, jede x86-VM und
+# jeder Online-Distro-Dienst koennen ihn nicht ausfuehren. GitHub stellt seit
+# 2025 arm64-Runner bereit, fuer oeffentliche Repos kostenlos — damit geht der
+# Schritt ohne Raspberry Pi und ohne eigene Hardware.
+#
+# Ablauf:
+#   1. packerOut.zip (aus dem Colab-Export) hier ins Repo legen oder beim
+#      manuellen Start als Pfad angeben
+#   2. Actions -> "IMX500 .rpk bauen" -> Run workflow
+#   3. network.rpk unten als Artefakt herunterladen
+
+name: IMX500 .rpk bauen
+
+on:
+  workflow_dispatch:
+    inputs:
+      packer_zip:
+        description: "Pfad zur packerOut.zip im Repo"
+        default: "packerOut.zip"
+        required: true
+  push:
+    paths:
+      - "packerOut.zip"
+      - "**/packerOut.zip"
+
+jobs:
+  package:
+    # aarch64 — der entscheidende Punkt. ubuntu-latest (x86) schlaegt fehl.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Architektur pruefen
+        run: |
+          arch=$(uname -m)
+          echo "Runner-Architektur: $arch"
+          [ "$arch" = "aarch64" ] || { echo "::error::Kein aarch64-Runner"; exit 1; }
+
+      - name: imx500-tools installieren
+        run: |
+          sudo apt-get update
+          # Abhaengigkeiten laut Paket: libarchive13, libc6, libstdc++6, bc,
+          # default-jre-headless, jarwrapper, jq, unzip, zip
+          sudo apt-get install -y --no-install-recommends \
+            libarchive13 bc default-jre-headless jarwrapper jq unzip zip curl
+          POOL=http://archive.raspberrypi.com/debian/pool/main/i/imx500-tools/
+          DEB=$(curl -fsSL "$POOL" \
+                | grep -oE 'imx500-tools_[^"]*_arm64\.deb' | sort -V | tail -1)
+          echo "neuestes Paket: $DEB"
+          curl -fsSLO "$POOL$DEB"
+          sudo dpkg -i "$DEB" || sudo apt-get -y -f install
+          command -v imx500-package
+
+      - name: Paketieren
+        run: |
+          ZIP="${{ github.event.inputs.packer_zip || 'packerOut.zip' }}"
+          [ -f "$ZIP" ] || ZIP=$(find . -name packerOut.zip -print -quit)
+          [ -n "$ZIP" ] && [ -f "$ZIP" ] || { echo "::error::packerOut.zip nicht gefunden"; exit 1; }
+          echo "verwende: $ZIP"
+          mkdir -p out
+          imx500-package -i "$ZIP" -o out
+          ls -la out
+          test -f out/network.rpk
+
+      - name: Labels-Datei beilegen
+        run: printf 'landingPad\n' > out/labels.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imx500-rpk
+          path: out/
+          if-no-files-found: error
