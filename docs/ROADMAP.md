@@ -197,12 +197,12 @@ mission code is untouched.
 *Status:* `RealCamera` is written and wired in (`camera_source="real"`), the IMX500 is
 detected on the Pi (`imx500 [4056x3040]`), and the mounting calibration is exposed as
 `cam_swap_axes` / `cam_invert_x` / `cam_invert_y` so it needs no source edit between
-test flights. **Blocked on the model:** the trained pad detector exists only as
-`pad_320_int8.tflite` (YOLO11, 320 px, int8), and the IMX500 loads **only** Sony's
-`.rpk` format — a `.tflite` would have to run on the Pi's CPU, which a Zero 2 W cannot
-sustain alongside MAVLink. A re-export (`yolo export … format=imx` → `imx500-package`)
-is pending. Also still open: `imx500-all` is not installed on the Pi (needs internet),
-and the axis calibration itself must be flown.
+test flights. **The model blocker is resolved (2026-09-21):** the `.rpk` re-export
+(`yolo export … format=imx` → `imx500-package`) has landed, and object detection now
+works on the real aircraft. Still ahead: the companion's own autonomous `--milestone`
+bring-up flights with the real camera (milestones 2, 4 and 5) have not been flown yet,
+and the axis calibration (`cam_swap_axes`/`cam_invert_x`/`cam_invert_y`) still needs
+confirming in the air rather than only on the bench.
 
 ### Phase 5 — Pi provisioning & hardware-in-the-loop prep
 **Goal:** a reproducible Pi image and a configured flight controller.
@@ -267,8 +267,17 @@ the command line with `--milestone N` so no source is edited between flights.
   usable in the hall. The ranked options (field-mapping a stable takeoff zone, the
   colleague-team comparison, an `EK3_MAG_M_NSE` damping experiment, a hand-lift
   building-vs-self test, or escalation) live in `project-docs` → Problems → "Loiter drifts in
-  the hall"; until one lands there are no milestone-1 flights in the hall (GUIDED drifts like
-  Loiter), and the compass bit returns to `ARMING_CHECK` (41346 → 41350) when solved.
+  the hall"; the compass bit returns to `ARMING_CHECK` (41346 → 41350) once one of them
+  lands as a proper fix. **Update 2026-09-21:** a session flown deliberately in Stabilize
+  reproduced the identical signature (three sudden 30-44° EKF yaw resets, each logged
+  `ground mag anomaly, yaw re-aligned`), and confirmed a cheap mitigation in the meantime:
+  minimising ground dwell before climbing ("arm and go") measurably improves Loiter,
+  consistent with the field-state settling onto the hall's local distortion the longer the
+  aircraft sits still before the climb exposes the vertical gradient. With that procedure
+  **both AltHold and Loiter now fly on the real aircraft** — Loiter good in the lab, still
+  imperfect but flyable in the hall. Full mechanism and log evidence in `project-docs` →
+  Problems → [Loiter drifts in the hall](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/hall-magnetics.md).
+  Companion `--milestone` flights in the hall are the next step, not yet attempted.
 - **2026-09-21 (SITL sweep on ArduCopter 4.6.3): every `--milestone` stage is green IN
   SIMULATION.** Milestone 1: climb to 0.8 m, rangefinder track 0.84 m, 20 s hover, worst
   horizontal drift 0.04 to 0.06 m, LAND, disarm. Milestone 2: the same at 1.0 m, and the
@@ -280,8 +289,9 @@ the command line with `--milestone N` so no source is edited between flights.
   nudges, `[DROP] Release confirmed`, LAND. The full mission (`main.py --sim`, no milestone
   flag) is green too, and the pre-mission parameter check reports *"Flight parameters match
   sitl_flight_v2.parm"*. This validates the companion logic of every stage end to end. It
-  says nothing about the hall: the magnetic problem above still blocks every milestone
-  flight on the real aircraft.
+  says nothing about the hall on its own; see the 2026-09-21 update above for why manual
+  AltHold/Loiter now work there too, and companion `--milestone` flights are the step
+  that follows.
 
 Flyaway guards run throughout (`SIM_TO_REAL.md` §5b): the rangefinder must track altitude
 after the climb, the reported position must stay inside `max_position_radius_m`, and
@@ -369,10 +379,10 @@ firmware version, the autopilot's own messages and a named abort reason. ☑
 | 2     | GPS-denied nav + target search | ☑ done (SITL: optical-flow search→approach→drop verified; the approach loop's earth-frame/body-frame bug found and fixed 2026-09-21) |
 | 3     | GPS-denied real HW: origin, fence, TimedCamera | ☑ done (SITL on ArduCopter **4.6.3**: origin set + verified by the companion, GPS off, full indoor mission green) |
 | 3b    | Diagnostics & safety hardening | ☑ done (STATUSTEXT logging, companion heartbeat, verified origin/takeoff, mode monitoring, LAND instead of RTL, FC safety envelope) |
-| 4     | Real AI camera                 | ◑ `RealCamera` implemented + wired; IMX500 detected on the Pi. Blocked on an `.rpk` model (only `.tflite` exists) and `imx500-all` |
+| 4     | Real AI camera                 | ☑ `RealCamera` implemented + wired; IMX500 detected on the Pi. The `.rpk` re-export landed 2026-09-21, and **object detection now works on the real aircraft**. Open: fly the axis calibration (milestone 2), not yet confirmed in the air |
 | 5     | Pi provisioning & HIL prep     | ☑ Pi image, `mavlink-router` (systemd, `/dev/serial0` @ 921600 → `127.0.0.1:14550`), pymavlink, gpiozero/lgpio all **verified on hardware**. MTF-01P configured and streaming (see note below) |
 | 6     | Bench integration (no props)   | ◑ Companion↔FC link verified against the real FC (heartbeat, `--tele`, ArduPilot 4.6.3). Servo drop + arm/disarm still open |
-| 7     | Flight tests                   | ◑ **manual modes flying again on the real aircraft (2026-08-24 evening):** both **AltHold and Loiter** work with the chosen `EK3_SRC1_POSZ=2`; the v1→v2 oscillation was fixed by **halving `ATC_RAT_PIT`/`ATC_RAT_RLL` P/I (0.135→0.0675) and D (0.0036→0.0018)**. **All five `--milestone` stages and the full mission are green in SITL (2026-09-21, 4.6.3)**, so the companion logic is validated; on the real aircraft the hall's magnetic problem still blocks every companion milestone flight |
+| 7     | Flight tests                   | ◑ **manual modes flying on the real aircraft:** both **AltHold and Loiter** work with the chosen `EK3_SRC1_POSZ=2`; the v1→v2 oscillation was fixed by **halving `ATC_RAT_PIT`/`ATC_RAT_RLL` P/I (0.135→0.0675) and D (0.0036→0.0018)**. Loiter is good in the lab and, as of 2026-09-21, flyable (though still imperfect) in the hall too with an "arm and go" procedure that minimises ground dwell before climbing; see [project-docs → Problems → Loiter drifts in the hall](https://github.com/ki-drohnen-ss26/project-docs/blob/main/docs/problems/hall-magnetics.md) for the mechanism. **All five `--milestone` stages and the full mission are green in SITL (2026-09-21, 4.6.3)**, so the companion logic is validated; the companion's own autonomous `--milestone` flights (GUIDED, software controlled) have not been flown on the real aircraft yet, now that AltHold and Loiter work well enough to attempt them |
 | 8     | Documentation & deliverables   | ◑ Pi-Code docs current; project-docs (mkdocs site) being filled |
 
 > **MTF-01P history.** An earlier bench session found `RANGEFINDER` at a constant
@@ -457,8 +467,11 @@ estimate diverged: EKF3 never fused a height from the rangefinder, so it ran awa
 quadratically on the ground (−1070 m at arming, "climb rate" −12.6 m/s while stationary).
 So `POSZ = 2` stays, but as a decision we made and could still revisit, operated under a
 **safety protocol**. `params/fc_safe_overrides.parm` now sets `EK3_SRC1_POSZ = 2` and
-`RNGFND1_GNDCLEAR = 2` (the EKF's expected on-ground reading in cm; the default 10 did not
-match our ~2 cm mounting), loaded on top of the recovered baseline before the next flight.
+`RNGFND1_GNDCLEAR = 5` (the EKF's expected on-ground reading in cm; the default 10 did not
+match our ~2 cm mounting, but Mission Planner refused anything below 5 - the parameter's
+own minimum - when the team applied this on the real aircraft on 2026-09-21, so 5 is the
+closest achievable value, not the true mounting height), loaded on top of the recovered
+baseline before the next flight.
 
 *The protective net that makes `POSZ = 2` operable:*
 - `preflight.py` ground-drift verdict before **every** arming — drift on the ground is
@@ -542,8 +555,9 @@ only, per the ownership rule.
    defaults (Mission Planner shows `New mission / New rally / New fence`, battery
    monitor unconfigured). After returning to stock 4.6.3, reload the recovered baseline
    and then `params/fc_safe_overrides.parm` on top: `FENCE_ENABLE=0`, `EK3_SRC1_POSZ=2`
-   (the rangefinder height source the team chose) + `RNGFND1_GNDCLEAR=2`, arming checks on
-   (see `params/README.md`).
+   (the rangefinder height source the team chose) + `RNGFND1_GNDCLEAR=5` (the closest
+   achievable to the true ~2 cm mounting; the parameter refuses anything below 5),
+   arming checks on (see `params/README.md`).
 3. **`ARMING_CHECK = 0`** must be restored (1, or 786390 = everything except GPS lock)
    before any flight — the crash flight armed with an EKF vertical error of 1000 m that
    an enabled EKF pre-arm check would have refused.

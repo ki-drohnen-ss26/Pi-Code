@@ -162,9 +162,12 @@ def main() -> None:
     if to_stdout:
         print("\n".join(lines))
         return
-
-    with open(out_path, "w") as handle:
+    tmp_path = f"{out_path}.tmp"
+    with open(tmp_path, "w") as handle:
         handle.write("\n".join(lines) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, out_path)
     print(f"\nWrote {len(lines)} parameters to {out_path}")
     if not simulated:
         print("\nNext steps:")

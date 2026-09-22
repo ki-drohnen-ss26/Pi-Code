@@ -211,6 +211,15 @@ class FailsafeMonitor:
             )
             return None
 
+        if not expected:
+            log.warning(
+                f"[PREARM] {os.path.basename(path)} exists but contains no parameters - "
+                "likely an interrupted `dumpparams.py` run, not an empty publish. "
+                "Flying WITHOUT the parameter check. Re-run `python dumpparams.py` and "
+                "confirm the file is non-empty before trusting this gate again."
+            )
+            return None
+
         names = [name for name in paramcheck.VERIFIED_PARAMS if name in expected]
         log.info(f"[PREARM] Verifying {len(names)} parameters against "
                  f"{os.path.basename(path)} (read-only) ...")

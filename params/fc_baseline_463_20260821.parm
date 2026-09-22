@@ -6,7 +6,8 @@
 #
 # !! DO NOT load this file as-is: it still contains the CRASH configuration.
 # !! Load it, then IMMEDIATELY load fc_safe_overrides.parm on top (fence off,
-# !! RNGFND1_GNDCLEAR=2, arming checks on, sane battery failsafe), then reboot.
+# !! RNGFND1_GNDCLEAR=5 (the parameter's own minimum; true mounting is ~2 cm),
+# !! arming checks on, sane battery failsafe), then reboot.
 # See params/README.md ('Restoring the real FC after the wipe').
 ACRO_BAL_PITCH,1
 ACRO_BAL_ROLL,1

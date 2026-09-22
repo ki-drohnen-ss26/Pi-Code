@@ -1217,6 +1217,29 @@ def test_unreadable_parameter_does_not_ground_the_aircraft():
     assert "arm" in drone.actions()
 
 
+def test_empty_expected_params_file_fails_open_like_a_missing_one(tmp_path):
+    """A published file that EXISTS but parses to zero parameters must not be treated
+    as "verified, no differences" - it is a reference that says nothing.
+
+    Real incident (2026-08-22): a `dumpparams.py` run was interrupted (dropped SSH
+    session) between creating `flight_v1.param` and finishing the write, leaving a
+    0-byte file on disk. The mission then logged "Verifying 0 parameters ... match",
+    which reads exactly like a real pass. This must fail open (fly, do not ground the
+    aircraft over a corrupt reference file) exactly like a missing file does, not
+    silently claim a match."""
+    empty_file = tmp_path / "flight_v1.param"
+    empty_file.write_text("")
+    config = Config.sitl()
+    config.expected_params_path = str(empty_file)
+    drone = FakeDrone(config)
+    mission = _build_mission(drone, config)
+
+    mission.run()
+
+    assert mission.abort_reason != "FC_PARAMS_MISMATCH"
+    assert "arm" in drone.actions()
+
+
 def test_param_check_can_be_switched_off_entirely():
     """`param_check = "off"` must not even read the parameters - a bench session with
     no published set should not spend thirty seconds on requests it cannot use."""

@@ -271,7 +271,6 @@ def main():
         posz = read_param(master, "EK3_SRC1_POSZ", tries=3, timeout=1.5)
         if posz is not None and abs(posz - 2.0) < 0.1:
             print("\n  !! EK3_SRC1_POSZ = 2: the rangefinder is the EKF's ONLY height source.")
-            print("  !! This is OUR CONFIGURATION CHOICE, not an assignment requirement.")
             print("  !! The task asks for altitude hold using the LiDAR; which EKF source")
             print("  !! carries the height is ours to pick, and the barometer (POSZ = 1)")
             print("  !! stays available if we decide the evidence points that way. It")
@@ -285,7 +284,8 @@ def main():
             print("  !! fusing no height = DO NOT FLY. If it drifts, check RNGFND1_MIN_CM")
             print("  !! (the validity floor - the landed reading must clear it; SITL proved")
             print("  !! this, and ours clears a 0.01 m floor by only 1 cm) and")
-            print("  !! RNGFND1_GNDCLEAR (the expected on-ground reading in cm - ours is ~2),")
+            print("  !! RNGFND1_GNDCLEAR (the expected on-ground reading in cm - ours is 5,")
+            print("  !! the parameter's own minimum; the true mounting is ~2 cm),")
             print("  !! and run the parameter diff against the colleague team's working")
             print("  !! POSZ=2 aircraft. Before the first flight of a session, do the")
             print("  !! hand-lift test: the EKF altitude must follow a real lift (fclog.py")

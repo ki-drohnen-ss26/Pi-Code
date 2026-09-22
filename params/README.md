@@ -84,7 +84,7 @@ for a simulated run (`paramcheck.newest_flight_set()`). `preflight.py`'s hard-co
 |----------------|----------|---------------------------------------------------------|
 | `flight_v2.param` | 4.6.3 | **THE PUBLISHED FLIGHT SET — the single source of truth (2026-08-24).** Full 1159-parameter dump copied from the aircraft today, and the versioned set that now **owns** the FC configuration (see the ownership note below). Carries the deliberate team values: `ARMING_CHECK 41350`, `BATT_LOW_VOLT 12.4`, the halved `ATC_RAT_PIT`/`ATC_RAT_RLL` tune, `EK3_SRC1_POSZ 2`. `preflight.py` verifies the live FC against this file. **v3 with the `FLTMODE` switch mapping is expected next** (mapping is currently done transmitter-side). Owned by Mission Planner, not written by the companion. |
 | `fc_baseline_463_20260821.parm` | 4.6.3 | **REAL FC — forensic/rescue record.** Full baseline of the actual aircraft, recovered from the 2026-08-21 dataflash log (1154 parameters). Contains the CRASH configuration. Superseded as the live configuration by `flight_v2.param`; kept for the crash forensics and the post-wipe rescue path. |
-| `fc_safe_overrides.parm` | 4.6.3 | **RECOMMENDATION RECORD (no longer param-loaded wholesale, 2026-08-24).** The corrections proposed by the crash analysis. Several were **declined** by the team: `BATT_LOW_VOLT` (kept at `12.4`, not the suggested `12.8`) and `ARMING_CHECK` (kept at `41350`, the fuller mask declined). `RNGFND1_GNDCLEAR 2` is **still open**. Apply any adopted line **individually via Mission Planner** — do **not** load the whole file onto the FC any more; the live flight configuration is `flight_v2.param`. |
+| `fc_safe_overrides.parm` | 4.6.3 | **RECOMMENDATION RECORD (no longer param-loaded wholesale, 2026-08-24).** The corrections proposed by the crash analysis. Several were **declined** by the team: `BATT_LOW_VOLT` (kept at `12.4`, not the suggested `12.8`) and `ARMING_CHECK` (kept at `41350`, the fuller mask declined). `RNGFND1_GNDCLEAR` is **adopted at `5`** (2026-09-21): the true mounting is ~2 cm, but Mission Planner refuses anything below 5, the parameter's own minimum, so 5 is the closest achievable value, not a re-measurement. Apply any adopted line **individually via Mission Planner** — do **not** load the whole file onto the FC any more; the live flight configuration is `flight_v2.param`. |
 | `sitl_flight_v2.parm` | 4.6.3 | **THE SITL MIRROR OF THE FLIGHT SET — the one file for daily SITL use (2026-08-24).** Generated from `flight_v2.param` by `generate_sitl_flight_params.py`: the behavioural parameters mirrored 1:1, the physical ones dropped, the SITL sensor backends bolted on. **Start the simulator with it as a startup defaults file** (`python sitl.py`; see *SITL mirror of the flight set* below). Supersedes the step-by-step phase overlays for everyday work (they stay for the incremental sensor bring-up). **SITL only — never onto the real FC.** |
 | `generate_sitl_flight_params.py` | — | The generator for `sitl_flight_v2.parm`. Dependency-free; reads `flight_v2.param`, applies the split rule (see below), writes the mirror. Re-run it whenever a new `flight_vN` is published — edit the generator, never the generated `.parm`. |
 
@@ -156,7 +156,7 @@ removed on 2026-08-25; their hard-won lessons (`SIM_TERRAIN 0`, the choice of
 > overrides, then set up the manual-test modes:
 >
 > ```
-> 1. load  fc_safe_overrides.parm             # fence off, EK3_SRC1_POSZ 2 (our choice) + RNGFND1_GNDCLEAR 2, checks on, batt failsafe
+> 1. load  fc_safe_overrides.parm             # fence off, EK3_SRC1_POSZ 2 (our choice) + RNGFND1_GNDCLEAR 5, checks on, batt failsafe
 > 2. reboot
 > 3. python setparam.py FLTMODE4 2 FLTMODE6 5 # map the modes for the manual tests (4 = AltHold, 6 = Loiter)
 > 4. python preflight.py                      # sensor health + EKF-drift verdict
@@ -169,7 +169,8 @@ removed on 2026-08-25; their hard-won lessons (`SIM_TERRAIN 0`, the choice of
 > uncommanded-mode-change trap indoors, the **same class as the crash**, which the
 > overrides' `FENCE_ENABLE 0` currently neutralises; `BATT_FS_LOW_ACT 2` (RTL climbs
 > toward the ceiling indoors) and a late `BATT_LOW_VOLT 12.4` for a 4S Li-Ion;
-> `RNGFND1_GNDCLEAR 10` against the real ~2 cm mounting; and all six `FLTMODE`s at 0.
+> `RNGFND1_GNDCLEAR 10` against the real ~2 cm mounting (the closest settable value turned
+> out to be 5, not 2 - see the update below); and all six `FLTMODE`s at 0.
 >
 > `fc_baseline_463_20260821.parm` still earns its place for two things: **(a)** the
 > **forensic record** of the crash-day aircraft, and **(b)** the **rescue path after a
@@ -187,7 +188,7 @@ Parameter List → Load from file → Write params), or MAVProxy `param load`:
 
 ```
 1. load  fc_baseline_463_20260821.parm      # the aircraft as it was (incl. calibration)
-2. load  fc_safe_overrides.parm             # fence off, EK3_SRC1_POSZ 2 (our choice) + RNGFND1_GNDCLEAR 2, checks on
+2. load  fc_safe_overrides.parm             # fence off, EK3_SRC1_POSZ 2 (our choice) + RNGFND1_GNDCLEAR 5, checks on
 3. reboot
 4. python preflight.py                      # sensor health + EKF-drift verdict
 ```
@@ -294,15 +295,21 @@ one file; empty (the default) resolves the highest version, as described under *
 a new flight set* above. When the reference file is missing the check downgrades to "no
 verification" with a warning, never to "all good".
 
-> **Still open: `RNGFND1_GNDCLEAR` is `10` in the published set and `2` in the prose.**
-> `flight_v2.param` carries `RNGFND1_GNDCLEAR,10`, while `fc_safe_overrides.parm` and
-> several documents (including this one) say the MTF-01P's ~2 cm mounting wants `2`. The
-> check compares the live FC against the **published file**, so as long as v2 is the
-> published set it will keep reporting an aircraft at `10` as correct and an aircraft
-> corrected to `2` as a CRITICAL mismatch. Measure the real mounting clearance and settle
-> the value in the v3 decision; until then treat `10` as unconfirmed rather than agreed.
-> (`RNGFND1_GNDCLEAR` 10 vs 2 is also the second suspect in the crash-day divergence, see
-> *What the mirror taught us* below.)
+> **`RNGFND1_GNDCLEAR` is decided at `5`, and `flight_v2.param` needs a fresh capture to
+> say so.** The value was `10` in the published set, and this section used to say the
+> prose recommended `2` (the MTF-01P's true mounting height) with the decision still
+> open. It is now decided, but not at `2`: on 2026-09-21 the team tried to set the real
+> aircraft to `2` in Mission Planner and found the parameter refuses anything below `5`,
+> its own valid range floor. `5` is therefore the closest achievable value, not a
+> re-measurement of the mounting, which is still physically ~2 cm.
+>
+> Until someone runs `python dumpparams.py` against the aircraft to publish a
+> `flight_v3.param` that actually carries `5`, `flight_v2.param` still says `10`, so
+> the pre-mission parameter check and `preflight.py` will keep reporting the corrected
+> aircraft (now at `5`) as a **CRITICAL mismatch** against the stale `10`. That is the
+> check doing its job, not a bug: capture the new version to close it. (`RNGFND1_GNDCLEAR`
+> was also the second suspect in the crash-day divergence, see *What the mirror taught
+> us* below.)
 
 ## Reset SITL to firmware defaults (clean slate)
 
@@ -445,7 +452,9 @@ flow cannot be scaled, and no relative position (nor, under `POSZ 2`, any height
 initialises. Set `MIN_CM 0` and fusion comes up immediately under either height source. The
 real aircraft sits **1 cm above** the same floor (reads `0.02 m` with `MIN_CM 1`), so the same
 gate is the leading suspect for the crash-day divergence — to be checked against the colleague
-diff, with `RNGFND1_GNDCLEAR` (10 vs 2) a second suspect.
+diff, with `RNGFND1_GNDCLEAR` (10 vs 2, the value proposed at the time) a second suspect.
+(2026-09-21 update: `2` turned out not to be settable — the adopted value is `5`, the
+parameter's own minimum; see the note earlier in this file.)
 
 **Two more deviations the mirror generator now bakes in (each with its finding):**
 

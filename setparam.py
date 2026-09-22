@@ -4,14 +4,13 @@ setparam.py
 Set flight-controller parameters from the Pi, with read-back verification.
 
     python setparam.py LOG_DISARMED 1                      # e.g. capture a debugging session
-    python setparam.py RNGFND1_GNDCLEAR 2 LOG_DISARMED 1  # several at once
+    python setparam.py RNGFND1_GNDCLEAR 5 LOG_DISARMED 1  # several at once
     python setparam.py --show FENCE_ENABLE EK3_SRC1_POSZ  # read only, change nothing
     python setparam.py --reboot                            # reboot the FC, change nothing
-    python setparam.py RNGFND1_GNDCLEAR 2 --reboot         # set, verify, then reboot
+    python setparam.py RNGFND1_GNDCLEAR 5 --reboot         # set, verify, then reboot
     python setparam.py --sim ...                           # against SITL
 
-ROLE: this is a MANUAL OPERATOR tool - a human runs it from a shell as the GCS-equivalent,
-and the mission/companion code never imports or calls it. It is NOT the owner of the flight
+ROLE: this is a MANUAL OPERATOR tool GCS-equivalent, and the mission/companion code never imports or calls it. It is NOT the owner of the flight
 parameters either. Since the 2026-08-24 ownership decision Mission Planner and
 params/flight_v2.param are the single source of truth for what the aircraft flies, and the
 companion writes no FC parameter (the mission stack in drone.py/mission.py/failsafe.py issues

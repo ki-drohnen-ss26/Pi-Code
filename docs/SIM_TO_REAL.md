@@ -41,7 +41,7 @@ endpoint, and every deviation from reality lives in exactly one place, `Config.s
 |---|---|---|
 | `release_mechanism` | `"fc"` — servo on an FC output (there is no GPIO on a Mac), and SITL echoes the value back so the drop can be verified | `"pi"` — servo on a Pi GPIO pin |
 | `battery_min_voltage` | `10.8 V` — matches SITL's simulated ~12.6 V pack; the real threshold would abort on the first reading | `12.8 V` — our 4S Li-Ion (16.4 V full, 11.2 V empty) |
-| `camera_source` | `"auto"` — resolves to `SimCamera`/`MockCamera` | `"timed"` — honest camera-less default; `"real"` once an `.rpk` is on board |
+| `camera_source` | `"auto"` — resolves to `SimCamera`/`MockCamera` | `"timed"` — honest camera-less default; `"real"` now that the `.rpk` re-export has happened and `RealCamera` works on the aircraft |
 
 > **`Config.sitl()` also sets `is_simulation = True`.** That is not a fourth deviation but
 > the label on the other three: the profile banner, the fresh-SITL hint and the choice of
@@ -57,7 +57,7 @@ endpoint, and every deviation from reality lives in exactly one place, `Config.s
 | Mission logic | identical | identical |
 | Pre-arm | GPS/EKF converge in seconds; the parameter check compares against the SITL mirror | Flight set runs `ARMING_CHECK = 41350` (was `0` on the crash-day FC); the companion's `wait_ready_to_arm()` and its read-only parameter check are added gates (§2) |
 | Position source | simulated GPS | GPS (outdoor) **or** MTF-01P optical flow + LiDAR (indoor) |
-| Camera | Mock / Sim (`Config.sitl()` sets `"auto"`) | `TimedCamera` today (`camera_source="timed"` — no detection at all); `RealCamera` (IMX500, model on the sensor NPU, §3a) once an `.rpk` is aboard |
+| Camera | Mock / Sim (`Config.sitl()` sets `"auto"`) | `TimedCamera` by default (`camera_source="timed"`, no detection); `RealCamera` (IMX500, model on the sensor NPU, §3a) now works on the real aircraft since the `.rpk` re-export, selected via `camera_source="real"` |
 | Drop servo | `FcServo` (FC output, value echoed back) | `PiServo` (servo on Pi GPIO) — **calibrate PWM, test on bench** |
 
 ## 1. Physical connection
@@ -466,7 +466,8 @@ EKF3 never fused a height. The
 open investigation: a colleague team flies the **same** sensor with `POSZ = 2`
 successfully, so the next step is a full parameter diff against their aircraft — prime
 suspect `RNGFND1_GNDCLEAR` (the EKF's expected on-ground reading; ours was the default
-10 cm while the sensor sits ~2 cm up, now corrected to 2 in `fc_safe_overrides.parm`),
+10 cm while the sensor sits ~2 cm up, now set to 5 in `fc_safe_overrides.parm` — the
+parameter's own minimum, since 2 turned out not to be settable at all),
 plus `RNGFND1_MIN_CM` and `EK3_ALT_M_NSE` — weighed against the alternative that their
 EKF drifts on the ground too and nobody ever left it standing for minutes.
 
@@ -515,8 +516,9 @@ See [`ROADMAP.md`](ROADMAP.md) ("Incident 2026-08-21") for the decision tracking
 > the barometer as our independent altitude **witness** and lets stock 4.6.3 boot — it
 > does **not** change the EKF height source, which is the rangefinder
 > (`EK3_SRC1_POSZ = 2`) by our own configuration choice. Remaining before flight: reload
-> the recovered baseline + safe overrides (which now set `POSZ = 2` and `RNGFND1_GNDCLEAR = 2`,
-> `../params/README.md`), recalibrate the compass, run `python preflight.py` and clear
+> the recovered baseline + safe overrides (which now set `POSZ = 2` and `RNGFND1_GNDCLEAR = 5`,
+> the parameter's own minimum since 2 is not settable, `../params/README.md`), recalibrate
+> the compass, run `python preflight.py` and clear
 > its ground-drift gate, and do the hand-lift fusion test — then fly only under the
 > safety protocol above. Still open: the parameter diff against the colleague team's
 > working `POSZ = 2` aircraft (hot suspect `RNGFND1_GNDCLEAR`). The active path is this
