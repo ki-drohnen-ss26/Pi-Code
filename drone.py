@@ -396,6 +396,83 @@ class Drone:
             "flow_quality_max": max(flow_q) if flow_q else None,
         }
 
+    def read_arm_test_diagnostics(self, duration: float) -> dict:
+        """Record ground sensor/EKF behaviour while milestone 1 remains armed.
+
+        This is diagnostic only: missing data is reported to the operator but never
+        delays the disarm command beyond ``duration``. It cannot prove in-flight sensor
+        scaling; milestone 2 remains the test for that.
+        """
+        rng: list = []
+        flow_q: list = []
+        local: list = []
+        rel_alt: list = []
+        ekf_flags_last = None
+        ekf_pos_horiz_rel_seen = False
+        armed_throughout = True
+        deadline = time.time() + duration
+
+        wanted = [
+            "RANGEFINDER", "DISTANCE_SENSOR", "OPTICAL_FLOW", "OPTICAL_FLOW_RAD",
+            "EKF_STATUS_REPORT", "LOCAL_POSITION_NED", "GLOBAL_POSITION_INT",
+            "HEARTBEAT", "STATUSTEXT",
+        ]
+        while time.time() < deadline:
+            if time.time() - self._last_heartbeat_sent >= 1.0:
+                self.send_heartbeat()
+            msg = self.master.recv_match(type=wanted, blocking=True, timeout=0.5)
+            if msg is not None:
+                kind = msg.get_type()
+                if kind == "RANGEFINDER":
+                    rng.append(msg.distance)
+                elif kind == "DISTANCE_SENSOR":
+                    rng.append(msg.current_distance / 100.0)
+                elif kind in ("OPTICAL_FLOW", "OPTICAL_FLOW_RAD"):
+                    flow_q.append(getattr(msg, "quality", 0))
+                elif kind == "EKF_STATUS_REPORT":
+                    ekf_flags_last = msg.flags
+                    ekf_pos_horiz_rel_seen |= bool(msg.flags & 0x08)
+                elif kind == "LOCAL_POSITION_NED":
+                    local.append((msg.x, msg.y, msg.z))
+                elif kind == "GLOBAL_POSITION_INT":
+                    rel_alt.append(msg.relative_alt / 1000.0)
+                elif kind == "STATUSTEXT":
+                    self._log_statustext(msg)
+
+            if not self.is_armed():
+                armed_throughout = False
+                break
+
+        horizontal_drift_max = None
+        local_vertical_span = None
+        if local:
+            n0, e0, _ = local[0]
+            horizontal_drift_max = max(
+                math.hypot(north - n0, east - e0) for north, east, _ in local
+            )
+            local_vertical_span = max(down for _, _, down in local) - min(
+                down for _, _, down in local
+            )
+
+        return {
+            "armed_throughout": armed_throughout,
+            "rangefinder_samples": len(rng),
+            "rangefinder_min": min(rng) if rng else None,
+            "rangefinder_max": max(rng) if rng else None,
+            "flow_samples": len(flow_q),
+            "flow_quality_min": min(flow_q) if flow_q else None,
+            "flow_quality_max": max(flow_q) if flow_q else None,
+            "ekf_flags_last": ekf_flags_last,
+            "ekf_pos_horiz_rel_seen": ekf_pos_horiz_rel_seen,
+            "local_position_samples": len(local),
+            "horizontal_drift_max": horizontal_drift_max,
+            "local_vertical_span": local_vertical_span,
+            "relative_altitude_samples": len(rel_alt),
+            "relative_altitude_span": (
+                max(rel_alt) - min(rel_alt) if rel_alt else None
+            ),
+        }
+
     def get_rangefinder(self, timeout: float = 1.5) -> Optional[float]:
         """Latest raw rangefinder distance in METRES, or None if nothing arrives.
 
@@ -530,6 +607,37 @@ class Drone:
         log.warning("[ARM] Arming failed - see the [FC/...] messages above for the reason")
         return False
 
+    def disarm(self, timeout: float = 10.0, attempts: int = 3) -> bool:
+        """Command and verify a normal, non-forced disarm on the ground.
+
+        Only the ground arming milestone calls this. Airborne recovery deliberately
+        continues to use LAND and lets the flight controller disarm after touchdown.
+        """
+        if not self.is_armed():
+            log.info("[DISARM] Motors are already disarmed")
+            return True
+
+        for attempt in range(1, attempts + 1):
+            self._command_long(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0)
+            result = self._wait_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout)
+            self.tick()
+
+            if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1.0)
+                    if not self.is_armed():
+                        log.info("[DISARM] Motors are disarmed")
+                        return True
+            else:
+                log.warning(f"[DISARM] Attempt {attempt}/{attempts} rejected "
+                            f"(result={result}); waiting ...")
+            time.sleep(1.0)
+            self.tick()
+
+        log.warning("[DISARM] Disarming failed - vehicle may still be ARMED")
+        return False
+
     def takeoff(self, altitude: float, timeout: float = 30.0,
                 settle_s: float = 3.0, tolerance: float = 0.5) -> bool:
         """
@@ -548,7 +656,8 @@ class Drone:
         # contains the GROUND for low bring-up altitudes: for a 0.5 m takeoff the
         # band |alt-0.5| <= 0.5 accepts 0.0 m, so a vehicle that never lifted would
         # "reach" the target and could pass the settle window still sitting on the
-        # floor (found before the first 0.5 m milestone-1 flight on 2026-08-25).
+        # floor (found before the first 0.5 m position-hold flight, now milestone 2,
+        # on 2026-08-25).
         # eff_tol shrinks with altitude but never below 0.15 m (sensor noise floor)
         # and never above the passed tolerance: 0.5 m -> 0.2 m band, 1 m -> 0.4 m,
         # >= 1.25 m -> capped at `tolerance`.

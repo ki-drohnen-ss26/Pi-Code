@@ -275,7 +275,7 @@ def main():
             print("  !! The task asks for altitude hold using the LiDAR; which EKF source")
             print("  !! carries the height is ours to pick, and the barometer (POSZ = 1)")
             print("  !! stays available if we decide the evidence points that way. It")
-            print("  !! WORKS as configured: milestone 1 flew fully green under POSZ=2 in")
+            print("  !! WORKS as configured: milestone 2 flew fully green under POSZ=2 in")
             print("  !! SITL (2026-08-25). It was ALSO the configuration of the 2026-08-21")
             print("  !! crash (the EKF fused no height, the vertical estimate diverged on")
             print("  !! the ground, a fence-forced LAND went to full throttle) - but the")

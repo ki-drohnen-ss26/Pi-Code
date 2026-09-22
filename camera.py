@@ -100,7 +100,7 @@ class SimCamera:
     the test FakeDrone both provide them.
 
     THE BODY-FRAME ROTATION IS THE WHOLE POINT, and leaving it out cost us a full
-    milestone-5 SITL run on 2026-09-21. This class knows the target's position in the
+    milestone-6 SITL run on 2026-09-21. This class knows the target's position in the
     EARTH frame, but a downward-facing camera does not see the world that way: it sees
     the target somewhere in its IMAGE, and the image is bolted to the airframe, so it
     turns when the aircraft turns. Reporting the raw north/east error modelled a camera

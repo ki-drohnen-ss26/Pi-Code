@@ -13,6 +13,9 @@ config.gps_denied:
     Bring-up hover (config.hover_test_s > 0), short-circuits both:
         IDLE -> TAKEOFF -> HOVER -> RECOVER -> DONE
 
+    Ground arm test (config.arm_test_s > 0):
+        IDLE -> ARM_TEST -> DONE
+
 Each state does exactly one thing and returns the next state. The failsafe is
 checked before every step - if it fires, the machine jumps to ABORT.
 
@@ -44,6 +47,7 @@ log = logging.getLogger(__name__)
 
 class State(Enum):
     IDLE = auto()
+    ARM_TEST = auto()     # ground only: arm, wait briefly, disarm; never take off
     TAKEOFF = auto()
     HOVER = auto()        # bring-up: climb, hold still, come down (no search, no drop)
     SEARCH = auto()       # indoor: fly a pattern, look for the target
@@ -69,6 +73,9 @@ class DeliveryMission:
         # Did we ever get the motors running? An abort before arming must NOT command
         # a flight mode at a vehicle sitting on the ground.
         self._airborne = False
+        # True only between successful arming and confirmed disarming in milestone 1.
+        # Exception and abort handling use it for one final safe disarm attempt.
+        self._ground_arm_test_active = False
 
     # ------------------------------------------------------------------
     # Main loop
@@ -77,6 +84,7 @@ class DeliveryMission:
         log.info("\n=== MISSION START ===")
         dispatch = {
             State.IDLE: self._idle,
+            State.ARM_TEST: self._arm_test,
             State.TAKEOFF: self._takeoff,
             State.HOVER: self._hover,
             State.SEARCH: self._search,
@@ -113,6 +121,13 @@ class DeliveryMission:
 
     def _emergency_land(self) -> None:
         """Last-ditch attempt to get the aircraft down. Never raises."""
+        if self._ground_arm_test_active:
+            try:
+                if self.drone.disarm():
+                    self._ground_arm_test_active = False
+            except Exception:
+                log.exception("[MISSION] Could not disarm after ground arm-test error")
+            return
         if not self._airborne:
             return
         try:
@@ -164,6 +179,10 @@ class DeliveryMission:
         param_problem = self.failsafe.verify_flight_parameters()
         if param_problem:
             return self._fail(param_problem)
+
+        # Milestones 1 and 2 deliberately share the complete pre-arm path. This makes
+        # milestone 1 a ground rehearsal of the exact configuration and gates used by
+        # the first takeoff; they differ only after arming succeeds.
         self.release.setup()
         self.release.reset()
 
@@ -192,9 +211,80 @@ class DeliveryMission:
         if not self.drone.arm():
             return self._fail("ARMING_FAILED")
 
+        if self.config.arm_test_s > 0:
+            self._ground_arm_test_active = True
+            self.failsafe.start_phase("ARM_TEST", budget_s=self.config.arm_test_s + 30.0)
+            return State.ARM_TEST
+
         self._airborne = True
         self.failsafe.start_phase("TAKEOFF")
         return State.TAKEOFF
+
+    def _arm_test(self) -> State:
+        """Record ground diagnostics, then command and verify disarming."""
+        log.warning(f"[ARM_TEST] Armed on the ground; holding for "
+                    f"{self.config.arm_test_s:.0f} s. No takeoff command will be sent.")
+        diagnostics = self.drone.read_arm_test_diagnostics(self.config.arm_test_s)
+
+        if not diagnostics["armed_throughout"]:
+            self._ground_arm_test_active = False
+            self._log_arm_test_diagnostics(diagnostics)
+            return self._fail("ARM_TEST_DISARMED_EARLY")
+
+        log.info("[ARM_TEST] Commanding disarm")
+        if not self.drone.disarm():
+            log.critical("[ARM_TEST] DISARM FAILED - VEHICLE MAY STILL BE ARMED. "
+                         "Use the transmitter to disarm NOW.")
+            raise RuntimeError("ARM_TEST_DISARM_FAILED")
+
+        self._ground_arm_test_active = False
+        # Report only after the safety-critical disarm has been confirmed. Missing
+        # diagnostics are warnings, never a reason to postpone or skip disarming.
+        self._log_arm_test_diagnostics(diagnostics)
+        log.info("[ARM_TEST] PASS: automatic arm and disarm both confirmed")
+        return State.DONE
+
+    @staticmethod
+    def _log_arm_test_diagnostics(r: dict) -> None:
+        rng_min = r["rangefinder_min"]
+        rng_max = r["rangefinder_max"]
+        log.info(
+            f"[ARM_TEST/SENSORS] rangefinder: {r['rangefinder_samples']} samples, "
+            f"min={rng_min if rng_min is None else f'{rng_min:.2f}'} m, "
+            f"max={rng_max if rng_max is None else f'{rng_max:.2f}'} m"
+        )
+        log.info(
+            f"[ARM_TEST/SENSORS] optical flow: {r['flow_samples']} messages, "
+            f"quality min={r['flow_quality_min']}, max={r['flow_quality_max']}"
+        )
+
+        flags = r["ekf_flags_last"]
+        flags_text = "none" if flags is None else f"0x{flags:04x}"
+        log.info(
+            f"[ARM_TEST/EKF] last flags={flags_text}, POS_HORIZ_REL seen="
+            f"{'yes' if r['ekf_pos_horiz_rel_seen'] else 'no'}"
+        )
+
+        drift = r["horizontal_drift_max"]
+        vertical = r["local_vertical_span"]
+        log.info(
+            f"[ARM_TEST/POSITION] local samples={r['local_position_samples']}, "
+            f"max horizontal drift={drift if drift is None else f'{drift:.2f}'} m, "
+            f"vertical span={vertical if vertical is None else f'{vertical:.2f}'} m"
+        )
+        alt_span = r["relative_altitude_span"]
+        log.info(
+            f"[ARM_TEST/ALTITUDE] samples={r['relative_altitude_samples']}, "
+            f"span={alt_span if alt_span is None else f'{alt_span:.2f}'} m"
+        )
+
+        if r["rangefinder_samples"] == 0:
+            log.warning("[ARM_TEST/SENSORS] No rangefinder data during the armed window")
+        if r["flow_samples"] == 0:
+            log.warning("[ARM_TEST/SENSORS] No optical-flow data during the armed window")
+        if not r["ekf_pos_horiz_rel_seen"]:
+            log.warning("[ARM_TEST/EKF] POS_HORIZ_REL was not seen on the ground; this "
+                        "can be normal when the flow sensor is too close to the floor")
 
     def _wait_for_pilot(self) -> State:
         """Wait for the PILOT to arm and fly the aircraft up, then take over in GUIDED.
@@ -332,7 +422,7 @@ class DeliveryMission:
     def _hover(self) -> State:
         """Hold the takeoff position for `hover_test_s`, then land.
 
-        This is milestone 1 of hardware bring-up: it answers exactly one question — can
+        This is milestone 2 of hardware bring-up: it answers exactly one question — can
         the aircraft hold height and position on companion commands? — and answers it
         without a search pattern, a camera or a payload release in the way.
 
@@ -343,7 +433,7 @@ class DeliveryMission:
         aircraft is technically flying.
 
         The camera is polled too but never acted upon, so the same run doubles as
-        milestone 2 (does the detector see a pad directly below?) as soon as
+        milestone 3 (does the detector see a pad directly below?) as soon as
         camera_source is set to "real".
         """
         start = self.drone.get_local_position()
@@ -606,7 +696,7 @@ class DeliveryMission:
         """Perform the release and verify it (FC: servo read-back; Pi: open-loop).
 
         `config.skip_drop` runs the whole approach without actually releasing. That is
-        milestone 4 of bring-up: prove the drone finds the pad and centres over it,
+        milestone 5 of bring-up: prove the drone finds the pad and centres over it,
         while nothing can fall out of the aircraft and nothing needs the drop mechanism
         to be calibrated yet. The state machine is otherwise identical, so a green
         skip_drop run means only the release itself is still untested.
@@ -677,8 +767,22 @@ class DeliveryMission:
         """
         log.info(f"[ABORT] Reason: {self.abort_reason}")
 
+        if self._ground_arm_test_active:
+            log.warning("[ABORT] Ground arm test is still armed - commanding disarm")
+            if self.drone.disarm():
+                self._ground_arm_test_active = False
+                log.info("[ABORT] Ground arm test disarmed")
+            else:
+                log.critical("[ABORT] DISARM FAILED - VEHICLE MAY STILL BE ARMED. "
+                             "Use the transmitter to disarm NOW.")
+            return State.DONE
+
         if not self._airborne:
-            log.info("[ABORT] Never armed - nothing to recover")
+            if self.abort_reason == "ARM_TEST_DISARMED_EARLY":
+                log.warning("[ABORT] Arm test ended because the FC disarmed before the "
+                            "companion sent its disarm command")
+            else:
+                log.info("[ABORT] Never armed - nothing to recover")
             return State.DONE
 
         if self.abort_reason and self.abort_reason.startswith("MODE_CHANGED"):

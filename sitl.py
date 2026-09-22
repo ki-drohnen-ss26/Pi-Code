@@ -28,7 +28,7 @@ holds back defaults whose parameter does not exist yet and applies them when the
 creates it, so `RNGFND1_TYPE` and its `RNGFND1_MIN_CM` / `MAX_CM` / `GNDCLEAR` / `ORIENT`
 sub-parameters all land in the SAME boot. One start, no reboots, no second pass.
 Verified 2026-09-21: 1646 parameters, `EKF3 IMU0 fusing optical flow` in the banner, and
-milestone 1 green immediately afterwards.
+the position-hold milestone (now milestone 2) green immediately afterwards.
 
 WHAT IT PUTS ON THE COMMAND LINE, AND WHY EACH PIECE IS THERE
 -------------------------------------------------------------

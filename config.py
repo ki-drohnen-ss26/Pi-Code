@@ -226,18 +226,22 @@ class Config:
     # search pattern, detector and release. These two switches let you add them ONE at
     # a time, so a failure names its own cause instead of leaving you guessing.
     #
-    #   1. hover_test_s > 0                 -> climb, hold, land. Position hold only.
-    #   2. + camera_source = "real"         -> same flight, but log what the detector
+    #   1. arm_test_s > 0                   -> arm, hold on the ground, disarm. No takeoff.
+    #   2. hover_test_s > 0                 -> climb, hold, land. Position hold only.
+    #   3. + camera_source = "real"         -> same flight, but log what the detector
     #                                          sees directly below (it is not acted on).
-    #   3. hover_test_s = 0                 -> fly the search pattern.
-    #   4. + skip_drop = True               -> search, detect, centre - release nothing.
-    #   5. skip_drop = False                -> the full delivery.
+    #   4. hover_test_s = 0                 -> fly the search pattern.
+    #   5. + skip_drop = True               -> search, detect, centre - release nothing.
+    #   6. skip_drop = False                -> the full delivery.
     #
     # hover_test_s: seconds to hold position after takeoff before landing. 0 = off.
     hover_test_s: float = 0.0
     # Altitude for the hover test [m]. 0 = use the normal takeoff altitude. Set this to
     # fly the bring-up hover lower than the search altitude without touching the rest.
     hover_test_alt: float = 0.0
+    # Seconds to remain armed on the ground before commanding disarm. 0 = normal
+    # mission. This mode runs the normal pre-arm setup but never enters TAKEOFF.
+    arm_test_s: float = 0.0
     # Run the approach but do NOT release. The mission goes APPROACH -> RECOVER.
     skip_drop: bool = False
 
@@ -294,7 +298,7 @@ class Config:
     # ------------------------------------------------------------------
     # Deliberately NOT on a spiral corner. The pattern visits (2.0, 2.0) exactly, and
     # with the target there the drone arrives already centred: APPROACH returns DROP on
-    # its first frame and the visual-servoing loop - the whole point of the milestone-4
+    # its first frame and the visual-servoing loop - the whole point of the milestone-5
     # rehearsal - is never executed. Placed half a step off, the same run has to nudge
     # its way in. (The unit tests had picked these values for that reason long before
     # the SITL default caught up; found in a full milestone sweep on 2026-09-21.)
@@ -309,8 +313,8 @@ class Config:
     # "timed" = TimedCamera (finds the target after a set time, no real detection) to
     # flight-test the search pattern + drop without the AI camera (Phase 3);
     # "real" = RealCamera (Raspberry Pi AI Camera / IMX500, Phase 4);
-    # "none" = a camera that never detects anything - flies the pattern to the end
-    #          without ever triggering APPROACH (bring-up milestones 1 and 3).
+    # "none" = a camera that never detects anything. Used by the ground arm test,
+    #          position-hold test and pattern-only test (milestones 1, 2 and 4).
     #
     # DEFAULT = "timed", the honest camera-less default for the real aircraft. It must
     # NOT be "auto" here: on the drone "auto" resolves to SimCamera, which invents a
@@ -366,7 +370,7 @@ class Config:
     # sample convention; Ultralytics `format=imx` exports have been seen emitting
     # "xyxy" (and input-tensor PIXELS instead of 0..1 fractions - the pixel case is
     # normalised automatically, the order cannot be guessed and must be set here).
-    # Verify at milestone 2: hold the pad clearly to one side and check the logged
+    # Verify at milestone 3: hold the pad clearly to one side and check the logged
     # dx/dy signs - a wrong order shows up as swapped axes.
     cam_box_order: str = "yxyx"
 

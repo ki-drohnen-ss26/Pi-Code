@@ -11,11 +11,12 @@ Usage:
     python main.py --tele             # only print telemetry (no flight), any of the above
 
 Staged bring-up on a new aircraft - each stage adds exactly ONE unknown:
-    python main.py --milestone 1   # climb to 0.8m, hold, land        (position hold)
-    python main.py --milestone 2   # same + the detector, logging only (detector)
-    python main.py --milestone 3   # fly the search pattern            (pattern)
-    python main.py --milestone 4   # search + detect + centre, no drop (approach)
-    python main.py --milestone 5   # the full delivery                 (release)
+    python main.py --milestone 1   # arm, wait on ground, disarm        (arming)
+    python main.py --milestone 2   # climb to 0.8m, hold, land          (position hold)
+    python main.py --milestone 3   # same + the detector, logging only  (detector)
+    python main.py --milestone 4   # fly the search pattern             (pattern)
+    python main.py --milestone 5   # search + detect + centre, no drop  (approach)
+    python main.py --milestone 6   # the full delivery                  (release)
 
 Rehearse any of them in the simulator first with `--sim --milestone N`; the simulated
 detector is substituted for the IMX500 and the substitution is logged. Individual
@@ -66,9 +67,9 @@ def make_camera(config: Config, drone: Drone):
     if src == "mock":
         return MockCamera()
     if src == "none":
-        # Never detects. Milestone 1 and 3 fly without a detector in the loop, so the
-        # run tests position hold and the search pattern and nothing else. Expect the
-        # pattern to end in TARGET_NOT_FOUND - that IS the pass condition here.
+        # Never detects. Milestones 1, 2 and 4 operate without a detector in the loop.
+        # For milestone 4, expect the pattern to end in TARGET_NOT_FOUND - that IS the
+        # pass condition there.
         return MockCamera(detected=False)
     if src == "real":
         camera = RealCamera(config, drone)
@@ -117,15 +118,17 @@ def make_config(argv: list) -> Config:
 # failure names its own cause instead of leaving four candidates open. The numbers are
 # the flight-test order, not a preference - do not skip ahead.
 MILESTONES = {
-    1: dict(label="hover only — position hold",
+    1: dict(label="ground arm/disarm only",
+            arm_test_s=5.0, hover_test_s=0.0, camera_source="none"),
+    2: dict(label="hover only — position hold",
             hover_test_s=20.0, hover_test_alt=0.8, camera_source="none"),
-    2: dict(label="hover + detector (logs only, acts on nothing)",
+    3: dict(label="hover + detector (logs only, acts on nothing)",
             hover_test_s=20.0, hover_test_alt=1.0, camera_source="real"),
-    3: dict(label="search pattern, no detection",
+    4: dict(label="search pattern, no detection",
             hover_test_s=0.0, camera_source="none"),
-    4: dict(label="search + detect + centre, release nothing",
+    5: dict(label="search + detect + centre, release nothing",
             hover_test_s=0.0, camera_source="real", skip_drop=True),
-    5: dict(label="full delivery",
+    6: dict(label="full delivery",
             hover_test_s=0.0, camera_source="real", skip_drop=False),
 }
 
@@ -133,7 +136,7 @@ MILESTONES = {
 def _apply_bringup_flags(config: Config, argv: list) -> None:
     """Staged bring-up switches, so a first flight needs no source edit on the drone.
 
-        --milestone N   apply bring-up stage N (1-5), see MILESTONES above
+        --milestone N   apply bring-up stage N (1-6), see MILESTONES above
         --hover [s]     climb, hold for s seconds (default 20), land. No search, no drop.
         --alt [m]       takeoff altitude for that hover, overriding search_altitude.
         --no-drop       fly the full search + approach but release nothing.
@@ -141,7 +144,7 @@ def _apply_bringup_flags(config: Config, argv: list) -> None:
                         take over in GUIDED (see mission._wait_for_pilot)
 
     --milestone sets a whole coherent stage; the individual flags are applied AFTER it so
-    a single value can still be overridden (e.g. `--milestone 1 --alt 0.8`).
+    a single value can still be overridden (e.g. `--milestone 2 --alt 0.8`).
     """
     def _value_after(flag: str, default: float) -> float:
         i = argv.index(flag)
@@ -212,6 +215,9 @@ def log_profile(config: Config) -> None:
             config.search_altitude if config.gps_denied else config.cruise_alt)
         log.warning(f"[PROFILE] BRING-UP HOVER: climb to {alt} m, hold "
                     f"{config.hover_test_s:.0f} s, land. No search, no drop.")
+    if config.arm_test_s > 0:
+        log.warning(f"[PROFILE] ARM TEST: arm on the ground, wait "
+                    f"{config.arm_test_s:.0f} s, disarm. No takeoff.")
     if config.skip_drop:
         log.warning("[PROFILE] BRING-UP: skip_drop is set - the payload will NOT be released")
     if config.takeover_mode:
