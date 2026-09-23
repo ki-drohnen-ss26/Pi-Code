@@ -1,0 +1,16 @@
+91 pad-free crops, 16 real test images, inference at 320px
+
+F_neg_fpv_320   (highest confidence on a pad-free image: 0.66)
+  conf         0.25     0.40     0.50     0.60     0.70     0.80
+  FP/img       0.05     0.02     0.02     0.02     0.00     0.00
+  recall       1.00     1.00     1.00     1.00     1.00     0.88
+  rec x0.3     1.00     0.94     0.94     0.94     0.88     0.38
+
+WARNING ⚠️ Unable to automatically guess model task, assuming 'task=detect'. Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify', 'pose', 'obb' or 'semantic'.
+Loading runs/F_neg_fpv_320/weights/best_imx_model/model_imx.onnx for ONNX IMX inference...
+F_neg_fpv_320   (highest confidence on a pad-free image: 0.56)
+  conf         0.25     0.40     0.50     0.60     0.70     0.80
+  FP/img       0.03     0.03     0.02     0.00     0.00     0.00
+  recall       1.00     1.00     1.00     0.94     0.81     0.44
+  rec x0.3     0.94     0.88     0.88     0.75     0.56     0.00
+

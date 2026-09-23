@@ -1,0 +1,8 @@
+Re-measured 2026-08-24 with ultralytics 8.4.90, on pad-dataset test split (16 images),
+FP32, each checkpoint at its own training resolution.
+
+checkpoint                              imgsz    mAP50   mAP50-95
+------------------------------------------------------------------
+~/Downloads/best.pt            (May)      320    0.734      0.643
+~/Downloads/best-2.pt      (27 May)       416    0.799      0.647
+runs/detect/.../pad_v2/best.pt (24 Jun)   416    0.995      0.971
