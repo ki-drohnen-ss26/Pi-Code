@@ -20,6 +20,7 @@ confined to `Config.sitl()`.
 | `paramcheck.py`  | Shared, dependency-free parameter comparison: resolves the published set by version, parses it, splits the verified subset into flight-critical and informational. Used by the mission gate and by `preflight.py` |
 | `mission.py`     | State machine — GPS path + indoor SEARCH/APPROACH path      |
 | `release.py`     | Drop mechanism: `FcServo` (servo on FC) / `PiServo` (servo on Pi GPIO) |
+| `drop_test.py`   | Disarmed bench test: camera detection releases the Pi GPIO servo for 3 s, then resets it |
 | `search.py`      | Search patterns (expanding spiral / lawnmower) in local NED |
 | `logbook.py`     | Logging setup: console + timestamped file under `logs/`     |
 | `main.py`        | Entry point, wires everything together                      |

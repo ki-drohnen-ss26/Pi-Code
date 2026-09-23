@@ -360,6 +360,18 @@ Calibration (either path), on the **bench, no props**:
 - `"fc"` only: `SERVO9_FUNCTION = 0` keeps the FC output MAVLink-controlled (set
   automatically by `FcServo.setup()` → `configure_drop_servo()`). Not needed for `"pi"`.
 
+Camera-to-release integration (Pi GPIO path), still **on the bench with no props**:
+
+```bash
+python3 drop_test.py
+```
+
+This script never connects to the flight controller and never arms. It starts at
+neutral, waits up to 30 seconds for the IMX500 to recognise the configured target,
+reports every camera check at 0.5-second intervals, holds the release position for
+3 seconds, returns to neutral, and exits. Use `--timeout 0` to wait until detection
+or Ctrl-C.
+
 ## 5. Link loss: companion vs flight controller
 - Our **`LINK_LOSS`** = the **Pi stops receiving heartbeats from the FC** (UART dead /
   unplugged / baud mismatch). The companion notices and stops — but if the link is
